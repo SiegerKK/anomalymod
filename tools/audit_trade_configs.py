@@ -27,6 +27,7 @@ class Entry:
     value: str
     file: Path
     line: int
+    section: str
 
 @dataclass
 class Section:
@@ -78,7 +79,7 @@ def parse_file(path: Path) -> list[Section]:
         if current:
             kv = ITEM_RE.match(raw)
             if kv:
-                current.entries.append(Entry(kv.group(1).strip(), kv.group(2).strip(), src, lineno))
+                current.entries.append(Entry(kv.group(1).strip(), kv.group(2).strip(), src, lineno, current.name))
     return sections
 
 
@@ -89,19 +90,22 @@ def profile_name(path: Path) -> str:
     return stem
 
 
-def load_profiles(root: Path, source_root: Path | None) -> dict[str, Profile]:
+def load_profiles(root: Path, source_root: Path | None) -> tuple[dict[str, Profile], set[str]]:
     roots = []
     if source_root:
         roots.append(source_root / "gamedata/configs/items/trade")
         roots.append(source_root / "configs/items/trade")
     roots.append(root / "gamedata/configs/items/trade")
     profiles: dict[str, Profile] = {}
+    patched_profiles: set[str] = set()
     for trade_dir in roots:
         if not trade_dir.exists():
             continue
         files = sorted(set(trade_dir.glob("trade_*.ltx")) | set(trade_dir.glob("mod_trade_*.ltx")), key=lambda p: (p.name.startswith("mod_"), p.name))
         for path in files:
             name = profile_name(path)
+            if path.name.startswith("mod_trade_") and path.name.endswith("_weekly_stock.ltx"):
+                patched_profiles.add(name)
             prof = profiles.setdefault(name, Profile(name))
             prof.sources.append(path)
             for sec in parse_file(path):
@@ -113,7 +117,7 @@ def load_profiles(root: Path, source_root: Path | None) -> dict[str, Profile]:
                         target.parents = sec.parents
                 else:
                     prof.sections[sec.name] = sec
-    return profiles
+    return profiles, patched_profiles
 
 
 def resolve_section(prof: Profile, name: str, stack: tuple[str, ...] = ()) -> OrderedDict[str, Entry]:
@@ -159,10 +163,15 @@ def category(item: str) -> str:
     return "other"
 
 
-def audit(profiles: dict[str, Profile]):
+def audit(profiles: dict[str, Profile], patched_profiles: set[str] | None = None, all_profiles: bool = False):
     rows, errors = [], []
     audited = 0
-    for prof in sorted(profiles.values(), key=lambda p: p.name):
+    names = sorted(profiles) if all_profiles else sorted(patched_profiles or set())
+    for name in names:
+        prof = profiles.get(name)
+        if not prof:
+            errors.append(f"{name}: patched profile has no source profile")
+            continue
         if "trader" not in prof.sections:
             continue
         audited += 1
@@ -181,7 +190,8 @@ def audit(profiles: dict[str, Profile]):
             missing = [p for p in prof.sections[target].parents if p not in prof.sections]
             if missing:
                 errors.append(f"{prof.name}: supplies_weekly inherits missing section(s): {', '.join(missing)}")
-        item_sources = defaultdict(list)
+        item_sources = {}
+        declared_sections = {}
         value_chains = defaultdict(list)
         for tier in TIERS:
             if tier in prof.sections:
@@ -190,8 +200,11 @@ def audit(profiles: dict[str, Profile]):
                     if ent.key in direct_seen:
                         errors.append(f"{prof.name}: duplicate declaration for {ent.key} inside [{tier}] at {ent.file}:{ent.line}")
                     direct_seen.add(ent.key)
-                    item_sources[ent.key].append(tier)
                     value_chains[ent.key].append(f"{tier}={ent.value}")
+                for item, ent in resolve_section(prof, tier).items():
+                    if item not in item_sources:
+                        item_sources[item] = tier
+                        declared_sections[item] = ent.section
         try:
             effective = resolve_section(prof, target)
         except KeyError as exc:
@@ -203,8 +216,10 @@ def audit(profiles: dict[str, Profile]):
             qty, prob, parse_error = parse_qty_prob(ent.value)
             if parse_error:
                 errors.append(f"{prof.name}: {item}: {parse_error} at {ent.file}:{ent.line}")
-            tiers = item_sources.get(item) or [target]
-            rows.append({"trader": prof.name, "item": item, "quantity": qty if qty is not None else "", "probability": prob if prob is not None else "", "original_tiers": "+".join(tiers), "effective_section": target, "category": category(item)})
+            introduced = item_sources.get(item, target)
+            declared = declared_sections.get(item, ent.section)
+            original_tier = introduced if declared == introduced else f"{introduced} (inherited from {declared})"
+            rows.append({"trader": prof.name, "item": item, "quantity": qty if qty is not None else "", "probability": prob if prob is not None else "", "original_tiers": original_tier, "declared_section": declared, "introduced_at_tier": introduced, "effective_section": target, "category": category(item)})
     if audited == 0:
         errors.append("no trade profiles found")
     return rows, errors
@@ -216,20 +231,22 @@ def main() -> int:
     ap.add_argument("--source-root", type=Path, help="AOEngine/Anomaly 1.5.3 source root with gamedata or configs")
     ap.add_argument("--format", choices=("markdown", "csv"), default="markdown")
     ap.add_argument("--output", type=Path)
+    ap.add_argument("--all-profiles", action="store_true", help="audit every trade profile instead of only profiles with mod_trade_*_weekly_stock.ltx")
     args = ap.parse_args()
-    rows, errors = audit(load_profiles(args.root, args.source_root))
+    profiles, patched_profiles = load_profiles(args.root, args.source_root)
+    rows, errors = audit(profiles, patched_profiles, args.all_profiles)
     out = []
     if args.format == "csv":
         import io
         buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=["trader", "item", "quantity", "probability", "original_tiers", "effective_section", "category"])
+        writer = csv.DictWriter(buf, fieldnames=["trader", "item", "quantity", "probability", "original_tiers", "declared_section", "introduced_at_tier", "effective_section", "category"])
         writer.writeheader(); writer.writerows(rows)
         text = buf.getvalue()
     else:
-        out.append("| trader | item | quantity | probability | original_tiers | effective_section | category |")
-        out.append("| --- | --- | ---: | ---: | --- | --- | --- |")
+        out.append("| trader | item | quantity | probability | original_tiers | declared_section | introduced_at_tier | effective_section | category |")
+        out.append("| --- | --- | ---: | ---: | --- | --- | --- | --- | --- |")
         for r in rows:
-            out.append(f"| {r['trader']} | {r['item']} | {r['quantity']} | {r['probability']} | {r['original_tiers']} | {r['effective_section']} | {r['category']} |")
+            out.append(f"| {r['trader']} | {r['item']} | {r['quantity']} | {r['probability']} | {r['original_tiers']} | {r['declared_section']} | {r['introduced_at_tier']} | {r['effective_section']} | {r['category']} |")
         text = "\n".join(out) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True); args.output.write_text(text, encoding="utf-8")

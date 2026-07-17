@@ -495,34 +495,23 @@ function Patch()
         end
 
         local function host_create_ammo_checked(ammo_section, parent, count, created)
+            local box_size = SYS_GetParam(2, ammo_section, "box_size", 1)
+            local expected_boxes = math.ceil(count / math.max(box_size or 1, 1))
             local ok, result = pcall(create_ammo, ammo_section, parent:position(), parent:level_vertex_id(), parent:game_vertex_id(), parent:id(), count)
-            if not ok or result == nil then return false end
-            local function remember_created(obj)
-                if not obj then return end
-                local id = nil
-                if type(obj) == "number" then
-                    id = obj
-                else
-                    local field_ok, field_id = pcall(function() return obj.id end)
-                    if field_ok and field_id then id = field_id end
-                    if not id then
-                        local method_ok, method_id = pcall(function() return obj:id() end)
-                        if method_ok then id = method_id end
-                    end
-                end
-                if id then created[#created + 1] = id end
+            if not ok or type(result) ~= "table" then return false end
+            local created_before = #created
+            for _, obj in pairs(result) do
+                local id = obj and obj.id
+                if not id then return false end
+                created[#created + 1] = id
             end
-            if type(result) == "table" then
-                for _, obj in pairs(result) do remember_created(obj) end
-            else
-                remember_created(result)
-            end
-            return true
+            return (#created - created_before) == expected_boxes
         end
 
         local function host_actor_for_netid(netid)
+            if netid == GameManager:GetMySNETID() then return db.actor end
             if not (db and db.actors and netid) then return nil end
-            for _, actor in pairs(db.actors) do
+            for _, actor in pairs(db.actors or {}) do
                 if actor and actor.object and actor.netid == netid then return actor.object end
             end
             return nil

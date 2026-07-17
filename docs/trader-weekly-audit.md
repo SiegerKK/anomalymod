@@ -1,2 +1,2 @@
-| trader | item | quantity | probability | original_tiers | effective_section | category |
-| --- | --- | ---: | ---: | --- | --- | --- |
+| trader | item | quantity | probability | original_tiers | declared_section | introduced_at_tier | effective_section | category |
+| --- | --- | ---: | ---: | --- | --- | --- | --- | --- |
