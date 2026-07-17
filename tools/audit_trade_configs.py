@@ -58,7 +58,8 @@ def read_with_includes(path: Path, seen: set[Path] | None = None) -> list[tuple[
     for lineno, raw in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
         m = INCLUDE_RE.match(raw)
         if m:
-            inc = (path.parent / m.group(1)).resolve()
+            include_path = m.group(1).replace("\\", "/")
+            inc = (path.parent / include_path).resolve()
             rows.extend(read_with_includes(inc, seen))
         rows.append((path, lineno, raw))
     return rows
@@ -98,7 +99,7 @@ def load_profiles(root: Path, source_root: Path | None) -> dict[str, Profile]:
     for trade_dir in roots:
         if not trade_dir.exists():
             continue
-        files = sorted(set(trade_dir.glob("trade_*.ltx")) | set(trade_dir.glob("mod_trade_*.ltx")))
+        files = sorted(set(trade_dir.glob("trade_*.ltx")) | set(trade_dir.glob("mod_trade_*.ltx")), key=lambda p: (p.name.startswith("mod_"), p.name))
         for path in files:
             name = profile_name(path)
             prof = profiles.setdefault(name, Profile(name))
@@ -129,9 +130,23 @@ def resolve_section(prof: Profile, name: str, stack: tuple[str, ...] = ()) -> Or
     return out
 
 
-def parse_qty_prob(value: str) -> tuple[str, str]:
+def parse_qty_prob(value: str) -> tuple[float | None, float | None, str | None]:
     parts = [p.strip() for p in value.split(",")]
-    return (parts[0] if parts else "", parts[1] if len(parts) > 1 else "")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return None, None, f"malformed supply entry: {value}"
+    try:
+        qty = float(parts[0])
+    except ValueError:
+        return None, None, f"quantity is not numeric: {value}"
+    try:
+        prob = float(parts[1])
+    except ValueError:
+        return None, None, f"probability is not numeric: {value}"
+    if qty <= 0:
+        return qty, prob, f"quantity must be > 0: {value}"
+    if prob < 0 or prob > 1:
+        return qty, prob, f"probability must be between 0 and 1: {value}"
+    return qty, prob, None
 
 
 def category(item: str) -> str:
@@ -167,12 +182,16 @@ def audit(profiles: dict[str, Profile]):
             if missing:
                 errors.append(f"{prof.name}: supplies_weekly inherits missing section(s): {', '.join(missing)}")
         item_sources = defaultdict(list)
-        conflicts = defaultdict(set)
+        value_chains = defaultdict(list)
         for tier in TIERS:
             if tier in prof.sections:
-                for item, ent in resolve_section(prof, tier).items():
-                    item_sources[item].append(tier)
-                    conflicts[item].add(ent.value)
+                direct_seen = set()
+                for ent in prof.sections[tier].entries:
+                    if ent.key in direct_seen:
+                        errors.append(f"{prof.name}: duplicate declaration for {ent.key} inside [{tier}] at {ent.file}:{ent.line}")
+                    direct_seen.add(ent.key)
+                    item_sources[ent.key].append(tier)
+                    value_chains[ent.key].append(f"{tier}={ent.value}")
         try:
             effective = resolve_section(prof, target)
         except KeyError as exc:
@@ -181,11 +200,11 @@ def audit(profiles: dict[str, Profile]):
         for item, ent in effective.items():
             if item == "buy_supplies":
                 continue
-            qty, prob = parse_qty_prob(ent.value)
+            qty, prob, parse_error = parse_qty_prob(ent.value)
+            if parse_error:
+                errors.append(f"{prof.name}: {item}: {parse_error} at {ent.file}:{ent.line}")
             tiers = item_sources.get(item) or [target]
-            if len(conflicts.get(item, ())) > 1:
-                errors.append(f"{prof.name}: conflicting quantity/probability for {item}: {sorted(conflicts[item])}")
-            rows.append({"trader": prof.name, "item": item, "quantity": qty, "probability": prob, "original_tiers": "+".join(tiers), "effective_section": target, "category": category(item)})
+            rows.append({"trader": prof.name, "item": item, "quantity": qty if qty is not None else "", "probability": prob if prob is not None else "", "original_tiers": "+".join(tiers), "effective_section": target, "category": category(item)})
     if audited == 0:
         errors.append("no trade profiles found")
     return rows, errors

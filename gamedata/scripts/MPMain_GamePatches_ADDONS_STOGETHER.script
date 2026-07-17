@@ -488,16 +488,61 @@ function Patch()
             return (IIsHosted and IIsHosted()) or (IIsConnected and IIsConnected())
         end
 
-        local function host_create_ammo_checked(ammo_section, parent, count)
-            local ok, result = pcall(create_ammo, ammo_section, parent:position(), parent:level_vertex_id(), parent:game_vertex_id(), parent:id(), count)
-            return ok and result ~= nil
+        local function host_release_created_ammo(created)
+            for _, id in ipairs(created or {}) do
+                if id then alife_release_id(id, "magazines unload rollback") end
+            end
         end
 
-        local function host_unload_step(magazine, server_id, fast_mode, expected_parent_id)
+        local function host_create_ammo_checked(ammo_section, parent, count, created)
+            local ok, result = pcall(create_ammo, ammo_section, parent:position(), parent:level_vertex_id(), parent:game_vertex_id(), parent:id(), count)
+            if not ok or result == nil then return false end
+            local function remember_created(obj)
+                if not obj then return end
+                local id = nil
+                if type(obj) == "number" then
+                    id = obj
+                else
+                    local field_ok, field_id = pcall(function() return obj.id end)
+                    if field_ok and field_id then id = field_id end
+                    if not id then
+                        local method_ok, method_id = pcall(function() return obj:id() end)
+                        if method_ok then id = method_id end
+                    end
+                end
+                if id then created[#created + 1] = id end
+            end
+            if type(result) == "table" then
+                for _, obj in pairs(result) do remember_created(obj) end
+            else
+                remember_created(result)
+            end
+            return true
+        end
+
+        local function host_actor_for_netid(netid)
+            if not (db and db.actors and netid) then return nil end
+            for _, actor in pairs(db.actors) do
+                if actor and actor.object and actor.netid == netid then return actor.object end
+            end
+            return nil
+        end
+
+        local function host_parent_allowed(parent, requester_netid)
+            if not parent then return false end
+            local actor = host_actor_for_netid(requester_netid)
+            if actor and parent:id() == actor:id() then return true end
+            if IsInvbox(parent) then return true end
+            if IsStalker and IsStalker(parent) and not parent:alive() then return true end
+            return false
+        end
+
+        local function host_unload_step(magazine, server_id, fast_mode, expected_parent_id, requester_netid)
             if not (magazine and magazines.is_magazine(magazine)) then return true end
             local parent = magazine:parent()
             if not parent then return true end
             if expected_parent_id and GameManager:GetServerIDByLocalID(parent:id()) ~= expected_parent_id then return true end
+            if not host_parent_allowed(parent, requester_netid) then return true end
             local mag_data = magazines.get_mag_data(magazine:id())
             if not mag_data or not mag_data.loaded or #mag_data.loaded == 0 then return true end
             mags_mp_dbg("parent id=%s section=%s", tostring(parent:id()), tostring(parent:section()))
@@ -511,8 +556,10 @@ function Patch()
                 ammo_to_make[round] = (ammo_to_make[round] or 0) + 1
                 if not fast_mode then break end
             end
+            local created = {}
             for ammo_section, count in pairs(ammo_to_make) do
-                if not host_create_ammo_checked(ammo_section, parent, count) then
+                if not host_create_ammo_checked(ammo_section, parent, count, created) then
+                    host_release_created_ammo(created)
                     mag_data.loaded = original_loaded
                     magazines.set_mag_data(magazine:id(), mag_data)
                     magazines.send_mag_state(magazine:id())
@@ -534,6 +581,7 @@ function Patch()
             local server_id = data[1]
             local fast_mode = data[2] and true or false
             local expected_parent_id = data[3]
+            local requester_netid = data[4]
             mags_mp_dbg("unload request server=%s fast=%s", tostring(server_id), tostring(fast_mode))
             local local_id = GameManager:GetLocalIDByServerID(server_id)
             mags_mp_dbg("resolved server/local id %s/%s", tostring(server_id), tostring(local_id))
@@ -542,7 +590,7 @@ function Patch()
             local mag_data = magazines.get_mag_data(magazine:id())
             if not mag_data or not mag_data.loaded or #mag_data.loaded == 0 then return end
             if fast_mode then
-                host_unload_step(magazine, server_id, true, expected_parent_id)
+                host_unload_step(magazine, server_id, true, expected_parent_id, requester_netid)
                 return
             end
             local delay = magazines.get_mag_time(magazine:section(), true)
@@ -550,7 +598,7 @@ function Patch()
             RemoveTimeEvent("mag_redux", event_key)
             CreateTimeEvent("mag_redux", event_key, delay, function ()
                 local current = level.object_by_id(GameManager:GetLocalIDByServerID(server_id))
-                local done = host_unload_step(current, server_id, true, expected_parent_id)
+                local done = host_unload_step(current, server_id, true, expected_parent_id, requester_netid)
                 if not done then ResetTimeEvent("mag_redux", event_key, delay) end
                 return done
             end)
@@ -562,15 +610,15 @@ function Patch()
             if not mags_mp_active() then return OLDUNJECMAGS and OLDUNJECMAGS(obj) end
             local fast_mode = true -- multiplayer unload is temporarily atomic until a cancel RPC exists
             local parent_server_id = GameManager:GetServerIDByLocalID(mag_parent:id())
-            if not IIsHost() and (mag_parent:id() == db.actor:id() or IsInvbox(mag_parent)) then
+            if not IIsHost() then
                 local server_id = GameManager:GetServerIDByLocalID(obj:id())
-                local payload = { server_id, fast_mode, parent_server_id }
+                local payload = { server_id, fast_mode, parent_server_id, GameManager:GetMySNETID() }
                 mags_mp_dbg("unload request local=%s server=%s fast=%s", tostring(obj:id()), tostring(server_id), tostring(fast_mode))
                 GameManager:OnICustomScriptAction("magazines", "request_unload_magazine", serialize_table_simple(payload), true)
                 return
             end
             if IIsHost() then
-                magazines.request_unload_magazine({ GameManager:GetServerIDByLocalID(obj:id()), fast_mode, parent_server_id })
+                magazines.request_unload_magazine({ GameManager:GetServerIDByLocalID(obj:id()), fast_mode, parent_server_id, GameManager:GetMySNETID() })
                 return
             end
             return OLDUNJECMAGS and OLDUNJECMAGS(obj)

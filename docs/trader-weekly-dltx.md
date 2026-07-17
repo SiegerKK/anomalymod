@@ -70,7 +70,7 @@ The host remains the only authority that performs trader restock and MagsRedux s
 - Phase 1 is limited to **Remove merchandise progression gates**. The patch only combines the original commercial tiers that already exist in AOEngine/Anomaly 1.5.3; it does **not** claim seven-day quantities are balanced.
 - The intended DLTX form uses `![trader]` to override `buy_supplies` and `@[supplies_weekly]:...` to add a section with inheritance. The audit script now treats `[section]`, `![section]`, and `@[section]` as section declarations and validates inherited parents against the effective source tree.
 - Parent validation requires the real AOEngine/Anomaly 1.5.3 source tree. Run `tools/audit_trade_configs.py --source-root <aoengine-anomaly-1.5.3>` so the vanilla `trade_*.ltx` files are present beside these minimal `mod_trade_*_weekly_stock.ltx` patches.
-- No profile-specific missing tier exception is documented yet because this repository snapshot does not include the AOEngine 1.5.3 vanilla trade sources. If the audit reports a missing `supplies_N` for a specific profile when run with `--source-root`, remove that parent from that profile's `@[supplies_weekly]` line and add the exception here.
+- Known AOEngine/Anomaly 1.5.3 three-tier exceptions use `@[supplies_weekly]:supplies_3` and must not inherit missing `supplies_4` / `supplies_5`: `trade_stalker_basic`, `trade_isg_light`, and `trade_renegade`. Other covered profiles use a single accumulated top parent (`supplies_5`) rather than listing every tier.
 
 ## Smoke-test status
 
