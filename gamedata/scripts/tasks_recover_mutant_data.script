@@ -1,0 +1,96 @@
+local quest_item_sec = "recover_mutant_data_device"
+
+function check(pid, name)
+	local sfind = string.find
+	local monster = sfind(name, "simulation", 1, true) and sfind(pid, "monster", 1, true)
+	local special = sfind(pid, "night", 1, true) or sfind(pid, "zombied", 1, true) or sfind(pid, "special", 1, true)
+	return monster and not special
+end
+
+function xr_conditions.recover_mutant_data_precondition(a,b,c)
+	local sim = alife()
+	local task_id = c[1]
+	local temp = {}
+	for id in pairs(SIMBOARD.squads) do
+		local se_squad = sim:object(id)
+		if se_squad and check(se_squad.player_id, se_squad:name()) then
+			-- printf('valid %s',se_squad:name())
+			local id = nil
+			for k in se_squad:squad_members() do
+				id = k.id
+			end
+			-- Generate table
+			local target_level = alife():level_name(game_graph():vertex(se_squad.m_game_vertex_id):level_id())
+			temp[#temp+1] = { target_id = id, target_level = target_level, item_2_sec = quest_item_sec }
+		end
+	end
+	-- Generate data and save var
+	if #temp > 0 then
+		local data = temp[math.random(#temp)]
+		save_var(db.actor, task_id, data)
+		return data
+	end
+	return false
+end
+
+function xr_effects.recover_mutant_data_location(a,b,p)
+	CreateTimeEvent(0, "recover_mutant_data_location", 0, function()
+		local task_id = p[1]
+		local var = load_var(db.actor, task_id)
+		local news_caption = game.translate_string(task_manager.task_ini:r_string_ex(task_id, "title")) or "error"
+		local news_icon = task_manager.task_ini:r_string_ex(task_id, "icon") or "ui_inGame2_Poslednie_razrabotki"
+		local news_text = game.translate_string("st_location") .. " " .. game.translate_string(var and var.target_level or "")
+		db.actor:give_talk_message2(news_caption, news_text, news_icon, "iconed_answer_item")
+		return true
+	end)
+end
+
+function xr_effects.recover_mutant_data_unset(a,b,c)
+	local task_id = c[1]
+	local var = load_var(db.actor, task_id)
+	if not var then return end
+	local item = var.item_2_id and alife_object(var.item_2_id)
+	if item then alife_release(item) end
+	save_var(db.actor, task_id, nil)
+end
+
+task_status_functor.recover_mutant_data_status = function(tsk,task_id)
+	local actor = db.actor
+	if not (actor and tsk) then return end
+	local var = load_var(actor, task_id)
+	if not var then return end
+	-- Just task stage...
+	if tsk.stage == 0 then
+		tsk.stage = 1
+	end
+	local se_obj = alife_object(var.target_id)
+	if not var.item_2_id and se_obj then
+		if not (IsStalker(se_obj) or IsMonster(se_obj)) then return "fail" end
+		if not se_obj:alive() then
+			local se_item = alife_create(var.item_2_sec, se_obj, false)
+			if not se_item then return end
+			var.item_2_id = se_item.id
+		end
+	end
+	-- Exist item or not
+	if xr_conditions.actor_has_item(actor, actor, { var.item_2_sec }) then
+		tsk.stage = 2
+	else
+		tsk.stage = 1
+	end
+end
+
+task_functor.recover_mutant_data_target = function(task_id,field,p,tsk)
+	if not (db.actor and tsk) then return nil end
+	if not IIsHost() then return tsk.current_target or tsk.task_giver_id end
+	local var = load_var(db.actor, task_id)
+	if not var then return end
+	-- If we have item
+	if tsk.stage == 2 then return tsk.task_giver_id end
+	-- If no item return to target id ...
+	return var.item_2_id or var.target_id
+end
+
+function task_functor.recover_mutant_data_desc(task_id,field,p,tsk)
+	return "yan_stalker_sakharov_task_4_stage_"..tsk.stage
+end

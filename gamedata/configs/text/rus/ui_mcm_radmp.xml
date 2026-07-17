@@ -1,0 +1,120 @@
+<string_table>
+    <string id="ui_mcm_werasik2aa_show_marks">
+		<text>Показывать метки на игроках</text>
+	</string>
+    <string id="ui_mcm_werasik2aa_show_name">
+		<text>Показывать имена возле меток</text>
+	</string>
+    <string id="ui_mcm_werasik2aa_clear_inv">
+		<text>Очищать инвентарь после смерти</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_drop_inv">
+		<text>Сбрасывать вещи после смерти</text>
+	</string>
+    <string id="ui_mcm_werasik2aa_max_players">
+		<text>[Сервер] Максимальное колличество игроков</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_friendly_fire">
+		<text>[Сервер] Огонь по своим</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_transferalltolevel">
+		<text>[Сервер] Переносить игроков на другой уровень</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_steam_connects">
+		<text>[Сервер] Режим сервера LAN / Steam</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_resurrect_allow">
+		<text>Разрешить возрождение</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_revive_mode">
+		<text>Режим возрождения</text>
+	</string>
+	<string id="ui_mcm_lst_mp_manual_revive">
+		<text>Ручное возрождение</text>
+	</string>
+	<string id="ui_mcm_lst_mp_auto_revive">
+		<text>Автоматическое возрождение</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_resurrect_timeout">
+		<text>Время возрождения себя (Автоматическое возрождение)</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_time_to_revive_others">
+		<text>Время возрождения других (Ручное возрождение)</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_auto_revive_delay">
+		<text>Задержка автовозрождения себя (Ручное возрождение)</text>
+	</string>
+	<string id="st_mp_auto_reviving">
+		<text>Ранены - автовозрождение через %d секунд</text>
+	</string>
+	<string id="st_mp_dead_respawning">
+		<text>Критическое ранение - возрождение через %d сек.</text>
+	</string>
+	<string id="st_mp_reviving">
+		<text>Поднимаем %s через %d секунд</text>
+	</string>
+	<string id="st_mp_being_revived">
+		<text>%s поднимает вас (%d секунд)</text>
+	</string>
+	<string id="st_mp_revived">
+		<text>Вас подняли!</text>
+	</string>
+	<string id="st_mp_revive_tip">
+		<text>Нажмите [Использовать] для подъёма</text>
+	</string>
+	<string id="st_mp_player_down">
+		<text>%s тяжело ранен!</text>
+	</string>
+	<string id="st_mp_player_revived">
+		<text>%s поднят.</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_show_stats">
+		<text>Показывать статистику сети</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_sections_check">
+		<text>Игнорировать объекты с не установленного аддона</text>
+	</string>
+	<string id="ui_radmp_title">
+		<text>Anomaly Together 2.0</text>
+	</string>
+    <string id="ui_mcm_menu_werasik2aa">
+		<text>Anomaly Together</text>
+	</string>
+
+	<string id="mm_mp_host_port">
+		<text>Айпи сервера</text>
+	</string>
+	<string id="mm_mp_password">
+		<text>Стандартный порт 44139</text>
+	</string>
+    <string id="ui_mm_user_name">
+		<text>Никнейм:</text>
+	</string>
+	<string id="ui_mm_newgames">
+		<text>Новый профиль</text>
+	</string>
+	<string id="ui_mm_createserver">
+		<text>Выбор профиля</text>
+	</string>
+	<string id="ui_cons_failed">
+		<text>Не удалось подключиться к серверу, сервер не отправил пакеты за требуемое время. Timed Out</text>
+	</string>
+	<string id="ui_cons_failed_kick">
+		<text>Вас кикнули с сервера</text>
+	</string>
+	<string id="ui_mm_resc_con_game">
+		<text>Возродиться</text>
+	</string>
+	<string id="ui_mm_conn_to_game">
+		<text>Подключится по IP</text>
+	</string>
+	<string id="ui_mm_load_game">
+		<text>Выбор профиля</text>
+	</string>
+	<string id="ui_st_connecting_to_server">
+		<text>Пожалуйста подождите, идет подключение к серверу...</text>
+	</string>
+	<string id="ui_mm_ads_game">
+		<text>Наш дискорд</text>
+	</string>
+</string_table>

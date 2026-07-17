@@ -1,0 +1,29 @@
+function on_mcm_load()
+    -- All settings are always editable. (Mode-dependent ones are simply ignored when not
+    -- applicable; MCM can only HIDE via preconditions, which required a save/reload to
+    -- refresh and was unintuitive, so we keep them visible.)
+    return {
+        id = "werasik2aa", sh = true, gr = {
+            { id = "banner", type = "slide", text = "ui_radmp_title", size = { 512, 50 }, spacing = 20 },
+            { id = "friendly_fire", type = "check", val = 1, def = false},
+            { id = "transferalltolevel", type = "check", val = 1, def = true},
+            { id = "max_players", type = "track", val = 2, min = 1, max = 4, step = 1, def = 3 },
+            { id = "sections_check", type = "check", val = 1, def = false},
+            { id = "show_stats", type = "check", val = 1, def = false},
+			{ id = "show_marks", type = "check", val = 1, def = true},
+            { id = "show_name", type = "check", val = 1, def = true},
+            { id = "clear_inv", type = "check", val = 1, def = false},
+            { id = "drop_inv", type = "check", val = 1, def = false},
+            -- Master toggle (original id resurrect_allow): off = hardcore (reload on death). On = pick a revival mode.
+            { id = "resurrect_allow", type = "check", val = 1, def = true},
+            { id = "revive_mode", type = "list", val = 0, def = "manual_revive",
+                content = { {"manual_revive","mp_manual_revive"}, {"auto_revive","mp_auto_revive"} } },
+            -- Auto Revive: classic auto-respawn timer (original id resurrect_timeout).
+            { id = "resurrect_timeout", type = "track", val = 2, min = 1, max = 60, step = 1, def = 15 },
+            -- Manual Revive: how long a teammate must hold position to revive you.
+            { id = "time_to_revive_others", type = "track", val = 2, min = 1, max = 60, step = 1, def = 5 },
+            -- Manual Revive: lockout before an automatic revival occurs.
+            { id = "auto_revive_delay", type = "track", val = 2, min = 1, max = 600, step = 1, def = 120 },
+        }
+    }
+end

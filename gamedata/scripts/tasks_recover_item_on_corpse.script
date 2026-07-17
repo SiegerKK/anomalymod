@@ -1,0 +1,190 @@
+function split_tonumber(str)
+	local x = split(str)
+	for i, v in ipairs(x) do
+		x[i] = tonumber(v)
+	end
+	return x
+end
+
+local _splitcache = {}
+function split(str)
+	if not _splitcache[str] then
+		_splitcache[str] = {}
+		for x in string.gmatch(str, '([^,]+)') do
+			x = x:gsub(' ', '')
+			_splitcache[str][#_splitcache[str]+1] = x
+		end
+	end
+	return _splitcache[str]
+end
+
+function pick_random_array(arr)
+	return arr[math.random(#arr)]
+end
+
+function split_and_pick(str)
+	return pick_random_array(split(str))
+end
+
+function cleanup_recover_item_on_corpse(a, b, c)
+	local task_id = c[1]
+	local var = load_var(db.actor, task_id)
+	if not var then return end
+	-- Despawn our item
+	local se_item = var.item_2_id and alife_object(var.item_2_id)
+	if se_item then
+		if var.item_2_sec and db.actor:object(var.item_2_sec) then
+			news_manager.relocate_item(db.actor, "out", se_item:section_name())
+		end
+		alife_release(se_item)
+	end
+	-- Despawn bodyies
+	for _, v in ipairs(var.spawned_npcs or {}) do
+		local se_object = alife_object(v)
+		if se_object then alife_release(se_object) end
+	end
+	-- Unset data
+	save_var(db.actor, task_id, nil)
+end
+
+function section_from_critter_category(x)
+	if x == 'dogs' then
+		return split_and_pick('dog_normal_red,dog_normal_white,dog_normal_white,dog_normal_white,dog_normal_white,dog_normal_brown,dog_normal_bulterier')
+	end
+	if x == 'bloodsucker' then
+		return split_and_pick('bloodsucker_red_weak, bloodsucker_green_weak, bloodsucker_black_weak, bloodsucker_red_normal, bloodsucker_green_normal, bloodsucker_black_normal, bloodsucker_red_strong, bloodsucker_green_strong, bloodsucker_black_strong')
+	end
+end
+
+------------------------------------------------------------------------
+task_status_functor.recover_item_on_corpse_status_functor = function(tsk, task_id)
+	local actor = db.actor
+	if not (actor and tsk) then return end
+	-- Save var
+	local var = load_var(actor, task_id)
+	local pool = {}
+	local t_settings = {}
+	if not var then
+		t_settings = utils_data.parse_ini_section_to_array(task_manager.task_ini, task_id)
+		for k, v in pairs(t_settings) do
+			if string.find(k, '^coordinate_') then
+				pool[#pool+1] = v
+			end
+		end
+	end
+	-- load var
+	if not var then
+		local x = split_tonumber(pick_random_array(pool))
+		local mcom = t_settings.corpse_comm and split_and_pick(t_settings.corpse_comm) or 'stalker'
+		local pos = vector():set(x[1], x[2], x[3])
+		local rnd = math.random(0, 2)
+		local section_stalker = 'sim_default_' .. mcom .. '_' .. rnd
+
+		local var = {
+			item_2_sec = split_and_pick(t_settings.item_section),
+			spawned_npcs = {},
+			target_comm = mcom,
+			section = section_stalker
+		}
+
+		-- Create target stalker
+		local se_target = alife_create(section_stalker, pos, x[4], x[5])
+		if not se_target then
+			printe("! Task %s | ERROR tasks_recover_item_on_corpse | can't create %s corpse", task_id, section_stalker)
+			return
+		end
+		var.target_id = se_target.id
+
+		-- Perform adjustments like mutant or some stalks
+		var.spawned_npcs[#var.spawned_npcs+1] = se_target.id
+		if t_settings.critters then
+			local setnum = t_settings.critters_num and split_tonumber(t_settings.critters_num)
+			local num = setnum and math.random(setnum[1], setnum[2]) or math.random(0, 3)
+			for _ = 1, num do
+				local section_creature = section_from_critter_category(split_and_pick(t_settings.critters))
+				local se_creature = alife_create(section_creature, se_target, false)
+				if se_creature then
+					var.spawned_npcs[#var.spawned_npcs+1] = se_creature.id
+				else
+					printe("! Task %s | ERROR tasks_recover_item_on_corpse | can't create %s creature", task_id, section_creature)
+				end
+			end
+		end
+
+		-- Save vars
+		se_save_var(se_target.id, se_target:name(), "death_dropped", true)
+		save_var(actor, task_id, var)
+		return
+	end
+	-- Kill objects and targets
+	local target_obj = var.target_id and level.object_by_id(var.target_id)
+	if target_obj and not var.item_2_id then
+		for _, v in ipairs(var.spawned_npcs) do
+			local npc = level.object_by_id(v)
+			if npc then
+				if npc:alive() then npc:kill(npc) end
+				se_save_var(npc:id(), npc:name(), "death_dropped", true)
+			end
+		end
+		local se_item = alife_create_item(var.item_2_sec, target_obj)
+		if not se_item then
+			printe("! Task %s | ERROR tasks_recover_item_on_corpse | can't create %s item", task_id, var.item_2_sec)
+			return
+		end
+		var.item_2_id = se_item.id
+		return
+	end
+	if xr_conditions.actor_has_item(actor, actor, { var.item_2_sec }) then
+		tsk.stage = 1
+	else
+		tsk.stage = 0
+	end
+end
+
+task_functor.recover_item_on_corpse_target_functor = function(task_id, field, p, tsk)
+	if not (db.actor and tsk and field == "target") then return end
+	local var = load_var(db.actor, task_id)
+	if not var then return end
+	if tsk.stage == 1 then return tsk.task_giver_id end
+	return var.target_id
+end
+
+task_functor.recover_item_on_corpse_descr_functor = function(task_id, x, xx, tsk)
+	return game.translate_string(task_id .. '_' .. tsk.stage)
+end
+
+local pool_all = { 'agroprom', 'wt', 'garbage', 'pol', 'aw', 'trucc' }
+local M = {}
+
+-- preconditionss
+function precondition_corpse_task_sid(a, b, c)
+	local tss = game.get_game_time():diffSec(level.get_start_time())
+	local loca = c[1]
+	if not M[loca] then M[loca] = {} end
+	local var = M[loca]
+	if var.task_timeout and tss < var.task_timeout then
+		return
+	end
+	if not var.chosen_refresh or tss > var.chosen_refresh then
+		var.chosen = pick_random_array(pool_all)
+		var.chosen_refresh= tss + 60 * 60 * 24 * 2
+	end
+	return var.chosen == c[1]
+end
+precondition_corpse_task_petr = precondition_corpse_task_sid
+precondition_corpse_task_sak = precondition_corpse_task_sid
+
+function on_descr(a, b, c)
+	local function postpone_for_next_frame(x)
+		local news_caption = ''
+		local news_icon = 'ui_pda2_mtask_overlay'
+		local news_text = game.translate_string("st_location") .. " " .. game.translate_string(x)
+		db.actor:give_talk_message2(news_caption, news_text, news_icon, "iconed_answer_item")
+		return true
+	end
+	CreateTimeEvent(0, "on_descr_rioc", 0, postpone_for_next_frame, utils_data.read_from_ini(task_manager.task_ini, c[1], 'level_name', 'string'))
+end
+
+function reward(a, b, c)
+	xr_effects.reward_random_money(a, b, { "5000", "7500" })
+end

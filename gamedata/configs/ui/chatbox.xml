@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="windows-1251"?>
+<window>	
+	<main_chat x="10" y="450" width="300" height="300" stretch="1">
+		<frame_base x="0" y="0" width="300" height="300" stretch="1">
+			<texture r="0" g="0" b="0" a="150">ui_icons_PDA_tooltips</texture>
+		</frame_base>
+		<chat_txt x="10" y="10" width="300" height="20">
+			<text align="l" font="medium"/>
+		</chat_txt>
+		<chat_input x="0" y="270" width="300" height="30">
+			<text x="5" font="medium" vert_align="c" align="l"/>
+			<texture>ui_inGame2_edit_box_2</texture>
+		</chat_input>
+	</main_chat>
+</window>

@@ -1,0 +1,108 @@
+--[[
+[================]
+C++ Programmer & Author: Werasik2aa
+Project Creator: Monokit
+Description: Server Callbacks.
+[================]
+--]]
+local GameManager = SteamGameManager()
+local PlayerManager = GameManager:GetPlayerManager()
+function OnPlayerConnected(PlayerNetID, NickName)
+    log("[Server] On Player Connected")
+    log("[Server] PlayerID: "..tostring(PlayerNetID))
+    log("[Server] PlayerNA: "..tostring(NickName))
+    -- Begin
+    if PlayerNetID == GameManager:GetMySNETID() then return end
+
+    log("-[Server] Syncing emission data!")
+    local s = surge_manager and surge_manager.get_surge_manager()
+    local ps = psi_storm_manager and psi_storm_manager.get_psi_storm_manager()
+    PlayerManager:SyncEmissionPsy(PlayerNetID, false, s and s.started or false)
+    PlayerManager:SyncEmissionPsy(PlayerNetID, true, ps and ps.started or false)
+
+    log("-[Server] Syncing task data!")
+    local tm = task_manager.get_task_manager()
+    local SyncList = {}
+    for id, tma in pairs(tm.task_info) do
+        if tma.t then
+            PlayerManager:SyncTaskWith(PlayerNetID, tma.t, tma.task_giver_id or 65535, tma.stage)
+            MPMain_QuestPatches_STOGETHER.sync_task_variables(id, PlayerNetID)
+            CreateTimeEvent(id, "spawn_entities", 1, function ()
+                MPMain_QuestPatches_STOGETHER.PerformRespawnTaskObjects(tma, PlayerNetID)
+                return true
+            end)
+            SyncList[id] = true
+        end
+    end
+
+    log("-[Server] Syncing axr task data!")
+    GameManager:OnICustomScriptAction("dialogs", "remote_sync_ongoing_tasks", serialize_table_simple(axr_task_manager.ongoing_tasks), false, PlayerNetID)
+
+    CreateTimeEvent(0, "Sync_Difficulty_Economy", 0.5, function ()
+        log("-[Server] Syncing game_difficulties!")
+        local mdata = alife_storage_manager.get_state()
+        if mdata then
+            local payload = { mdata.diff_game, mdata.diff_eco }
+            GameManager:OnICustomScriptAction("game_difficulties", "sync_array_diffs", serialize_table_simple(payload), false, PlayerNetID)
+        end
+        return true
+    end)
+
+    CreateTimeEvent(0, "Sync_Spots", 1, function ()
+        log("-[Server] Syncing spots data!")
+        MPMain_SpotsSync_STOGETHER.sync_map_spots(PlayerNetID)
+        MPMain_SpotsSync_STOGETHER.sync_story_npc_markers(PlayerNetID)
+        return true
+    end)
+
+    CreateTimeEvent(0, "Sync_Stashes", 2, function ()
+        log("-[Server] Syncing treasure cache data!")
+        treasure_manager.sync_all_stashes(PlayerNetID)
+
+        log("-[Server] Syncing player stash cache data!")
+        item_backpack.sync_all_stashes(PlayerNetID)
+        return true
+    end)
+
+    CreateTimeEvent(0, "Sync_Tasks", 3, function ()
+        log("-[Server] Sending packet for verify task list!")
+        GameManager:OnICustomScriptAction("xr_effects", "clear_old_tasks", serialize_table_simple(SyncList), false, PlayerNetID)
+        return true
+    end)
+
+    -- Sync something
+    SendScriptCallback("onmp_player_connected_server", PlayerNetID, NickName)
+end
+
+function OnPlayerDisconnected(PlayerNetID, NickName)
+    log("[Server] On Player Disconnected")
+    log("[Server] PlayerID: "..tostring(PlayerNetID))
+    log("[Server] PlayerNA: "..tostring(NickName))
+    SendScriptCallback("onmp_player_disconnected_server", PlayerNetID, NickName)
+end
+
+function OnPlayerChatted(PlayerNetID, NickName, MSG)
+    -- Chat commands can be here too
+end
+
+function IsUsedStorage(npc)
+    if not npc then return false end
+    if IsStalker(npc) then
+        if npc:alive() then
+            trade_manager.update(npc, false)
+            return false
+        end
+        log("! [SERVER] PROCESSING INVENTORY->CORPSE STORAGE!")
+        death_manager.create_release_item(npc)
+        return not se_load_var(npc:id(), npc:name(), "death_dropped")
+    elseif IsInvbox(npc) then
+        local loot_dropped = se_load_var(npc:id(), npc:name(), "loot_dropped")
+        if not loot_dropped then
+            log("! [SERVER] PROCESSING INVENTORY->BOX STORAGE!")
+            treasure_manager.try_spawn_treasure(npc)
+            se_save_var(npc:id(), npc:name(), "loot_dropped", true)
+            return treasure_manager.caches[npc:id()]
+        end
+    end
+    return false
+end

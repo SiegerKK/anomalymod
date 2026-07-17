@@ -1,0 +1,2208 @@
+--[[
+[================]
+C++ Programmer & Author: Werasik2aa
+Project Creator: Monokit
+Modified by: Animor, Werasik2aa
+Description: Main game patches. Basic anomaly functions and other things.
+Used to patch anomaly 1.5.3 script files.
+[================]
+--]]
+local GameManager = SteamGameManager()
+local PlayerManager = GameManager:GetPlayerManager()
+local PATCOOPADDONS = mpmain_gamepatches_addons_stogether
+local OLDSURGESTART = surge_manager.CSurgeManager.start
+local OLDSURGESTOP = surge_manager.CSurgeManager.end_surge
+if not psi_storm_manager.CPsiStormManager then psi_storm_manager.CPsiStormManager = psi_storm_manager.PsiStormManager end
+local OLDPSISTART = psi_storm_manager and psi_storm_manager.CPsiStormManager.start
+local OLDPSISTOP = psi_storm_manager and psi_storm_manager.CPsiStormManager.finish
+local OLDAPRSSCH = xr_camper.action_patrol.reset_scheme
+
+
+-- SOUND
+local OLDSETSOUNDPLAY = xr_sound.set_sound_play
+local OLDSOUNDPLAY = xr_effects.play_sound
+
+-- SLEEP
+local OLDSLEEPSHIT = ui_sleep_dialog.UISleep.OnButtonSleep
+local snd_drop_item = sound_object([[interface\inv_drop]])
+
+-- BASE THING
+local OLDSAFEREL = safe_release_manager.release
+local OLDGRANK = ranks.get_obj_rank_name
+local OLDSRANK = ranks.get_se_obj_rank_name
+local OLDSYNCS = item_backpack.UICreateStash.OnAccept
+
+-- TREASURE MANAGER
+local OLDTCRRANDOMST = treasure_manager.create_random_stash
+local OLDTSETRNSTASH = treasure_manager.set_random_stash
+local OLDTTRYSPAWNIT = treasure_manager.try_spawn_treasure
+
+local OLDSENDTIP = news_manager.send_tip
+local OLD_DYN_SENDTIP = dynamic_news_helper.send_tip
+
+-- PDA RANKING
+local orig_coc_rankings_set_icon = pda.coc_rankings_set_icon
+local orig_coc_rankings_show_border = pda.coc_rankings_show_border
+local orig_coc_rankings_set_description = pda.coc_rankings_set_description
+local orig_coc_rankings_set_name = pda.coc_rankings_set_name
+local orig_calculate_rankings = pda.calculate_rankings
+local orig_coc_rankings_can_show = pda.coc_rankings_can_show
+local orig_use_view = ui_pda_npc_tab.use_view
+local orig_OnSelectMessage = ui_pda_npc_tab.pda_npc_tab.OnSelectMessage
+local orig_unlock_encrypted_pda = ui_pda_npc_tab.unlock_encrypted_pda
+
+-- OLD OTHER STUFF
+local OLDDISFUNC = item_parts.func_disassembly
+
+-- OLD UI WINDOW
+local OLDTRAVELE = ui_sr_teleport.msg_box_ui.OnMsgOk
+
+-- OLD UI LOOT
+local OLDLOOTALL = ui_mutant_loot.UIMutantLoot.Loot
+local OLDLOOTRST = ui_mutant_loot.UIMutantLoot.Reset
+
+function Patch()
+    log("[GameManager] Patching game scripts and other shit. For MultiPlayer actions sync")
+    function ui_sr_teleport.msg_box_ui:OnMsgOk()
+        if not IIsHost() then return self:OnMsgCancel() end
+        local hud = get_hud()
+        for _, p in pairs(db.actors) do
+            if p.object and p.object:position():distance_to(db.actor:position()) > 20 then
+                if hud then
+                    hud:AddCustomStatic("text_on_screen_center", true)
+                    local static = hud:GetCustomStatic("text_on_screen_center")
+                    if static then
+                        static:wnd():TextControl():SetText("For travel to another level, need all players near!")
+                        CreateTimeEvent(0, "remove_warn_travel", 3, function()
+                            hud:RemoveCustomStatic("text_on_screen_center")
+                            return true
+                        end)
+                    end
+                end
+                GameManager:OnIChatMSG(string.format("I want to travel to the [%s] level! For travel to another level, need all players near!", tostring(self.name or "FATAL")))
+                return
+            end
+        end
+        -- Call new teleport functions if was
+        if self.ModdedMPTeleport then return self:ModdedMPTeleport() end
+        return OLDTRAVELE(self)
+    end
+    ui_pda_npc_tab.remote_receive_pda_info = function(data)
+        local srv_id = data[1]
+        local info = data[2]
+        se_save_var(GameManager:GetLocalIDByServerID(srv_id), nil, "info", info)
+    end
+    ui_pda_npc_tab.use_view = function(obj)
+        if obj then
+            local id = obj:id()
+            local info = se_load_var(id, nil, "info")
+            if not info then
+                local contact = {
+                    name = game.translate_string("st_dyn_news_unknown_contact"),
+                    comm = "stalker",
+                    icon = "ui_inGame2_neutral_1",
+                    rank = "novice",
+                    repu = 0
+                }
+                local new_info = { state = "default", contact = contact, msg = {} }
+                se_save_var(id, nil, "info", new_info)
+            end
+        end
+        orig_use_view(obj)
+    end
+    ui_pda_npc_tab.pda_npc_tab.OnSelectMessage = function(self)
+        local item = self.message_list:GetSelectedItem()
+        if not item then return end
+        local indx = item.indx
+        local msg = self.msg[indx]
+        local needs_host = false
+        if msg.stash and not msg.stash_read then needs_host = true end
+        if msg.route and not msg.route_read then needs_host = true end
+        if not IIsHost() and needs_host then
+            local pda_id = nil
+            db.actor:iterate_inventory(function(_, obj)
+                if item_device.device_npc_pda[obj:section()] then
+                    local info = se_load_var(obj:id(), obj:name(), "info")
+                    if info and info.contact and info.contact.name == self.contact.name then
+                        pda_id = obj:id()
+                    end
+                end
+            end, db.actor)
+            if pda_id then
+                local srv_id = GameManager:GetServerIDByLocalID(pda_id)
+                GameManager:OnICustomScriptAction("ui_pda_npc_tab", "remote_process_pda_message", serialize_table_simple({srv_id, indx}), true)
+            end
+            local temp_stash = msg.stash
+            local temp_route = msg.route
+            msg.stash = nil
+            msg.route = nil
+            orig_OnSelectMessage(self)
+            msg.stash = temp_stash
+            msg.route = temp_route
+            if temp_stash then msg.stash_read = true end
+            if temp_route then msg.route_read = true end
+            return
+        end
+        orig_OnSelectMessage(self)
+        if IIsHost() and needs_host then
+            db.actor:iterate_inventory(function(_, obj)
+                if item_device.device_npc_pda[obj:section()] then
+                    local info = se_load_var(obj:id(), obj:name(), "info")
+                    if info and info.contact and info.contact.name == self.contact.name then
+                        local srv_id = GameManager:GetServerIDByLocalID(obj:id())
+                        local payload = { srv_id, se_load_var(srv_id, nil, "info") }
+                        GameManager:OnICustomScriptAction("ui_pda_npc_tab", "remote_receive_pda_info", serialize_table_simple(payload), false)
+                    end
+                end
+            end, db.actor)
+        end
+    end
+    ui_pda_npc_tab.remote_process_pda_message = function(data)
+        local srv_id = data[1]
+        local indx = data[2]
+        local info = se_load_var(srv_id, nil, "info")
+        if info and info.msg and info.msg[indx] then
+            local msg = info.msg[indx]
+            if msg.stash and not msg.stash_read then
+                local hint = "%c[255,255,160,0]" .. game.translate_string(msg.topic_title) .. "\\n%c[default]" .. "\\n%c[160,100,100,200]" .. game.translate_string("st_stash_of") .. " " .. info.contact.name
+                treasure_manager.set_random_stash( nil , hint , nil , msg.stash)
+                msg.stash_read = true
+                msg.topic[1] = msg.topic[1] or (game.translate_string("st_stash_of") .. " " .. info.contact.name)
+            end
+            if msg.route and not msg.route_read then
+                txr_routes.open_route(msg.route[1], msg.route[2])
+                msg.route_read = true
+                local route_payload = { msg.route[1], msg.route[2] }
+                GameManager:OnICustomScriptAction("ui_pda_npc_tab", "remote_sync_route", serialize_table_simple(route_payload), true)
+            end
+            local payload = { srv_id, info }
+            GameManager:OnICustomScriptAction("ui_pda_npc_tab", "remote_receive_pda_info", serialize_table_simple(payload), false)
+        end
+    end
+    ui_pda_npc_tab.remote_sync_route = function(data)
+        local mdata = alife_storage_manager.get_state()
+        if not mdata.discovered_routes then
+            mdata.discovered_routes = {}
+        end
+        local str1 = data[1] .. "_" .. data[2]
+        local str2 = data[2] .. "_" .. data[1]
+        mdata.discovered_routes[str1] = true
+        mdata.discovered_routes[str2] = true
+    end
+    ui_pda_npc_tab.unlock_encrypted_pda = function(first_speaker, second_speaker)
+        orig_unlock_encrypted_pda(first_speaker, second_speaker)
+        if not IIsHost() then
+            local payload_ids = {}
+            for k, v in ipairs(ui_pda_npc_tab.get_encrypted_pdas()) do
+                local info = se_load_var(v, nil, "info")
+                if info then info.state = "default" end
+                payload_ids[#payload_ids+1] = GameManager:GetServerIDByLocalID(v)
+            end
+            local payload_str = serialize_table_simple(payload_ids)
+            GameManager:OnICustomScriptAction("ui_pda_npc_tab", "remote_unlock_pdas", payload_str, true)
+        end
+    end
+    ui_pda_npc_tab.remote_unlock_pdas = function(data)
+        for k, v in ipairs(data) do
+            local info = se_load_var(v, nil, "info")
+            if info then info.state = "default" end
+        end
+        if not IIsHost() then return end
+        GameManager:OnICustomScriptAction("ui_pda_npc_tab", "remote_unlock_pdas", serialize_table_simple(data), false)
+    end
+    bind_stalker_ext.clear_death_logo = function ()
+        local hud = get_hud()
+        if hud then hud:RemoveCustomStatic("text_on_screen_center") end
+        level.remove_pp_effector(2001)
+        level.enable_input()
+    end
+    bind_stalker_ext.death_manager_mp = function (reload, show_message)
+      local actor = db.actor
+        level.disable_input()
+        local hud = get_hud()
+        if hud then hud:HidePdaMenu() end
+        -- Draw death message
+        if show_message then
+            level.add_pp_effector("deimos1.ppe", 2001, true)
+            local msg = game.translate_string("DR_DeathMSG")
+            if msg == "DR_DeathMSG" then msg = "CRITICAL MISSION FAILURE" end
+            if hud then
+                hud:AddCustomStatic("text_on_screen_center", true)
+                local static = hud:GetCustomStatic("text_on_screen_center")
+                if static then
+                    static:wnd():TextControl():SetText(msg)
+                    static:wnd():TextControl():SetTextColor(GetARGB(255, 255, 50, 50))
+                end
+            end
+        end
+        if not reload then
+            -- If show message it's mean wait for resurrecting
+            if show_message then return end
+            -- Resur
+            db.actor:set_health_ex(1)
+            actor.power = 1
+            actor.radiation = 0
+            actor.bleeding = 1
+            actor.satiety = 1
+            actor.psy_health = 1
+            if arszi_psy then arszi_psy.set_psy_health(1.0) end
+            if bind_stalker_ext then bind_stalker_ext.invulnerable_time = time_global() + 10000 end
+            -- Respawn on bases or turned on campfires...
+            -- Search smart for resurrection and ressurecting!
+            local acpos = db.actor:position()
+            local ndist = 9999
+            local ncpos = nil
+            local community = gameplay_disguise.get_default_comm()
+            for _, smart in pairs(SIMBOARD.smarts_by_names) do
+                if smart.is_on_actor_level and smart.props.base > 0 then
+                    local smart_coma = smart.props[community] or 0
+                    if smart_coma > 0 or smart.props.all > 0 then
+                        for _, faction in pairs(game_relations.factions_table) do
+                            local relation = relation_registry.community_relation(faction, community)
+                            local goodwill = relation_registry.community_goodwill(faction, db.actor:id())
+                            if relation + goodwill >= 0 then
+                                local mdist = smart.position:distance_to(acpos)
+                                if mdist < ndist then
+                                    ndist = mdist
+                                    ncpos = smart.position
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            -- Search campfire for resurrection!
+            for _, binder in pairs(bind_campfire.campfires_all) do
+                if binder and binder.object and binder.campfire and binder.campfire:is_on() then
+                    local mdist = binder.object:position():distance_to(acpos)
+                    if mdist < ndist then
+                        ndist = mdist
+                        ncpos = binder.object:position()
+                    end
+                end
+            end
+            -- Ressurect on nearest position campfires or smart zone
+            if ncpos then
+                printf("-[Client] Found safe campfire. ressurecting near it!")
+                bind_stalker_ext.clear_death_logo()
+                local cdir = device().cam_dir
+                -- STOGETHER respawn fix: build a fresh vector instead of ncpos:add(cdir).
+                -- vector:add mutates in place and ncpos may reference smart.position, so the old
+                -- code also silently shifted the smart's stored position on every base respawn.
+                -- Keep the ~1m horizontal nudge away from the fire (cdir.x/cdir.z) but set the spawn
+                -- HEIGHT to the actual AI-mesh floor under (x,z) + a small clearance, so the actor
+                -- materialises just above ground and settles onto it. A fixed offset above the base
+                -- origin is unreliable: the nudge lands on nearby terrain whose floor height differs
+                -- per base, so a downward camera pitch plus animation/collision mods (e.g. xrMPE) can
+                -- place the spawn below the floor mesh and drop the player through the world. Snapping
+                -- to the level vertex adapts automatically. level.vertex_id returns 4294967295 (or nil)
+                -- when (x,z) is off the AI mesh, so we guard and fall back to base_y + the fallback.
+                -- Tunables: RespawnYClearance (above the snapped floor) and RespawnYFallback (off-mesh).
+                local sx, sz = ncpos.x + cdir.x, ncpos.z + cdir.z
+                local clr = MPMain_STOGETHER.RespawnYClearance or 0.2
+                local fallback = MPMain_STOGETHER.RespawnYFallback or 1.0
+                local spos = vector():set(sx, ncpos.y + fallback, sz)   -- used as-is if (x,z) is off the AI mesh
+                local vid = level.vertex_id(spos)
+                if vid and vid < 4294967295 then
+                    spos:set(sx, level.vertex_position(vid).y + clr, sz)
+                end
+                db.actor:set_actor_position(spos)
+                return
+            end
+            -- Resurrect failed, no free bases. Kill our self
+            printf("-[Client] Can't find bases and campfires for resurrect place... Reloading save.")
+            MPMain_STOGETHER.ResurrectFallbackKill = true   -- tell the downed system this resurrect became a kill+reload
+            bind_stalker_ext.clear_death_logo()
+            bind_stalker_ext.death_manager_mp(true, true)
+            GameManager:OnICustomScriptAction("bind_stalker_ext", "death_manager_mp", "true, true", false)
+            db.actor:kill(actor, true)
+            return
+        end
+        -- Restart server. Delay of reload before
+        if IIsHost() then
+            CreateTimeEvent(0, "hc_reload_timer", MPMain_STOGETHER.TimeEResurrect, function()
+                level.remove_pp_effector(PPE_ID)
+                level.enable_input()
+                get_console():execute("reconnect")
+                return true
+            end)
+        end
+    end
+    bind_stalker_ext.actor_on_before_death = function(binder, whoID)
+        if MPMain_STOGETHER.IDead then return end
+        MPMain_STOGETHER.IDead = true
+        -- Why not...
+        local flags = { ret_value = false }
+        -- Master toggle OFF: hardcore. Death stays lethal (reload-on-death path below).
+        -- Master ON + Manual Revive: no outright death -- enter the downed state
+        -- (teammates revive, or an automatic revival after the lockout) and cancel death.
+        -- Master ON + Auto Revive: fall through to the classic auto-respawn path.
+        if MPMain_STOGETHER.AllowResurrect and MPMain_STOGETHER.ReviveMode == "manual_revive" then
+            if MPMain_Downed_STOGETHER and MPMain_Downed_STOGETHER.on_actor_downed() then
+                return
+            end
+        end
+        if not MPMain_STOGETHER.AllowResurrect then
+            SendScriptCallback("actor_on_before_death", whoID, flags)
+            -- Kill us if allowed
+            if not flags.ret_value then
+                bind_stalker_ext.death_manager_mp(true, true)
+                GameManager:OnICustomScriptAction("bind_stalker_ext", "death_manager_mp", "true, true", false)
+                db.actor:kill(db.actor, not raid_utils)
+            end
+            -- IDK WHY... BUT HERE MUST BE ANOTHER ADDON CALL THAT flags.
+            -- We cant go here because resurrect allow flag flase!
+            return
+        end
+        if MPMain_STOGETHER.DropInvOnDeath then
+            log("[MLEVELM] Dropping actor inventory. We dead")
+            alife_create_awaite(function(se_obj)
+                if se_obj then
+                    local m_data = alife_storage_manager.get_state()
+                    if not m_data.player_created_stashes then m_data.player_created_stashes = {} end
+                    m_data.player_created_stashes[se_obj.id] = "itm_backpack"
+                    level.map_add_object_spot_ser(se_obj.id, "treasure", "MYLOOT")
+                    local function drop_items(boxid)
+                        local obj = level.object_by_id(boxid)
+                        if obj then
+                            local function itr_inv(_, item)
+                                db.actor:transfer_item(item, obj)
+                                SendScriptCallback("actor_on_item_put_in_box", obj, item)
+                            end
+                            db.actor:iterate_ruck(itr_inv, nil)
+                            return true
+                        end
+                        return false
+                    end
+                    CreateTimeEvent(0, "actor_backpack", 0, drop_items, se_obj.id)
+                end
+            end, "inv_backpack", db.actor:position(), db.actor:level_vertex_id(), db.actor:game_vertex_id())
+        elseif MPMain_STOGETHER.ClearInvOnDeath then
+            log("[MLEVELM] Clearing actor inventory. We dead")
+            local function itr_inv(_, item)
+                alife_release_full(item)
+            end
+            db.actor:iterate_ruck(itr_inv, nil)
+        end
+        -- AUTO REVIVE AFTER DELAY (classic auto-respawn). Manual Revive uses the same lockout as the downed
+        -- auto-revival (AutoReviveDelay) so one timer governs both death states; Auto Revive keeps the
+        -- classic resurrect_timeout.
+        local manual_revive = (MPMain_STOGETHER.ReviveMode == "manual_revive")
+        local resur_delay   = manual_revive and MPMain_STOGETHER.AutoReviveDelay or MPMain_STOGETHER.TimeEResurrect
+        CreateTimeEvent(0, "resurrect_action", resur_delay, function()
+            bind_stalker_ext.death_manager_mp(false, false)
+            MPMain_STOGETHER.IDead = false
+            -- reset animation...
+            GameManager:OnICustomAnimation("waunded_1_idle_0", "", true, 1)
+            -- Check for heal possibles and take money now.
+            if db.actor:money() >= 4000 then
+                local AnyPlayer = db.actors[0] and db.actors[0].object
+                dialogs.heal_actor_injury(db.actor, AnyPlayer or db.actor)
+            else -- Set health not full
+                db.actor:set_health_ex(0.4)
+            end
+            return db.actor.health > 0.2
+        end)
+        -- Dead animation until we ressurecting...
+        GameManager:OnICustomAnimation("waunded_1_idle_0", "", true, 340000)
+        -- Show local picture and text
+        bind_stalker_ext.death_manager_mp(false, true)
+        -- Manual Revive: replace the static death text with a live countdown to the at-base respawn.
+        -- (Auto Revive keeps the classic static message.) Stops itself once resurrected -- the resurrect
+        -- path's clear_death_logo removes the text static.
+        if manual_revive then
+            local resur_at = time_global() + resur_delay * 1000
+            CreateTimeEvent(0, "resurrect_countdown", 0, function()
+                if not MPMain_STOGETHER.IDead then return true end
+                local remain = math.max(0, math.ceil((resur_at - time_global()) / 1000))
+                local hud = get_hud()
+                if hud then
+                    local st = hud:GetCustomStatic("text_on_screen_center")
+                    if st then
+                        local msg = game.translate_string("st_mp_dead_respawning")
+                        if msg == "st_mp_dead_respawning" then msg = "Critically injured - respawning in %d seconds" end
+                        st:wnd():TextControl():SetText(string.format(msg, remain))
+                    end
+                end
+                return false
+            end)
+        end
+    end
+    bind_campfire.campfire_go_off = function(cf, obj)
+        local dist_cf = 2
+        local cf = cf or bind_campfire.get_nearby_campfire(dist_cf, true)
+        if cf and (cf:is_on()) then
+            actor_effects.play_item_fx("matches_script")
+            cf:turn_off()
+            GameManager:OnIInteract(obj:id(), 0, false)
+        end
+    end
+    bind_campfire.campfire_go_on = function(obj, cf)
+        local dist_cf = 2
+        local cf = cf or bind_campfire.get_nearby_campfire(dist_cf, true)
+        if not cf then
+            return
+        end
+        if cf:is_on() then
+            return
+        end
+        if bind_campfire.rain_pass() then
+            actor_effects.play_item_fx("matches_script")
+            xr_sound.set_sound_play(obj:id(), "inv_matches")
+            cf:turn_on()
+            GameManager:OnIInteract(obj:id(), 0, true)
+        else
+            actor_effects.play_item_fx("matches_script")
+            actor_menu.set_msg(1, game.translate_string("st_fail"), 3)
+        end
+    end
+    bind_campfire.actor_on_item_use = function(obj, cfo, cf)
+        local sec = obj:section()
+        if (sec == "matches") or (sec == "box_matches") then
+            bind_campfire.campfire_go_on(cfo, cf)
+            utils_item.discharge(obj)
+        end
+    end
+    bind_campfire.use_campfire = function(actor, zone, p) -- called from game_tutorials.xml
+        local pos = db.actor:position()
+        for id, binder in pairs(bind_campfire.campfires_all) do
+            if (binder and binder.campfire) then
+                if (pos:distance_to_sqr(binder.object:position()) <= 2) then
+                    if (binder.campfire:is_on()) then
+                        bind_campfire.campfire_go_off(binder.campfire, binder.object)
+                    else
+                        local obj_item = db.actor:object("matches") or db.actor:object("box_matches")
+                        if obj_item then
+                            bind_campfire.actor_on_item_use(obj_item, binder.object, binder.campfire)
+                        else
+                            actor_menu.set_msg(1, game.translate_string("st_ui_campfire_prereq"), 3)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    itms_manager.use_guitar = function(obj)
+        local n = math.random(28)
+        local snd = sound_object("music\\guitar_" .. tostring(n))
+        if (not snd) then return end
+        local period = snd:length()
+        snd:play_no_feedback(db.actor, 0, 0, db.actor:position(), 1.0, 1.0)
+        actor_effects.play_continuous_effect(period)
+        GameManager:OnICustomAnimation("guitar_0", obj:section(), true, period / 1000, "music\\guitar_" .. tostring(n))
+    end
+    itms_manager.use_harmonica = function(obj)
+        local n = math.random(5)
+        local snd = sound_object("music\\harmonica_" .. tostring(n))
+        if (not snd) then return end
+        local period = snd:length()
+        snd:play_no_feedback(db.actor, 0, 0, db.actor:position(), 1.0, 1.0)
+        actor_effects.play_continuous_effect(period)
+        GameManager:OnICustomAnimation("harmonica_0", obj:section(), true, period / 1000,
+            "music\\harmonica_" .. tostring(n))
+    end
+    function ph_button.ph_button:__init(obj, storage)
+        self.object = obj
+        self.st = storage
+        storage.button_action = self
+    end
+    function ph_button.ph_button:use_callback(victim, who)
+        if not self.object then return end
+        GameManager:OnICustomAnimation("knopka_0", "", true, 1.7)
+        GameManager:OnIInteract(self.object:id(), 2, true)
+        self:try_switch()
+    end
+    function ui_debug_launcher.UIDebug_ObjSpawn:Spawn(section)
+        local sfind = string.find
+        -- Get group name
+        local obj_to_spawn_classes = {
+            -- kind
+            ["AI_STL_S"]     = "NPC (Stalker)",
+            ["AI_TRD_S"]     = "NPC (Stalker)",
+
+            ["SM_KAR"]       = "NPC (Mutant)",
+            ["SM_BLOOD"]     = "NPC (Mutant)",
+            ["SM_BOARW"]     = "NPC (Mutant)",
+            ["SM_BURER"]     = "NPC (Mutant)",
+            ["SM_CAT_S"]     = "NPC (Mutant)",
+            ["SM_CHIMS"]     = "NPC (Mutant)",
+            ["SM_CONTR"]     = "NPC (Mutant)",
+            ["SM_DOG_S"]     = "NPC (Mutant)",
+            ["SM_FLESH"]     = "NPC (Mutant)",
+            ["SM_IZLOM"]     = "NPC (Mutant)",
+            ["SM_GIANT"]     = "NPC (Mutant)",
+            ["SM_POLTR"]     = "NPC (Mutant)",
+            ["SM_P_DOG"]     = "NPC (Mutant)",
+            ["SM_DOG_P"]     = "NPC (Mutant)",
+            ["SM_DOG_F"]     = "NPC (Mutant)",
+            ["SM_SNORK"]     = "NPC (Mutant)",
+            ["SM_TUSHK"]     = "NPC (Mutant)",
+            ["SM_ZOMBI"]     = "NPC (Mutant)",
+            ["SM_RAT"]       = "NPC (Mutant)",
+            ["SM_KARLIK"]    = "NPC (Mutant)",
+            ["SM_LURKER"]    = "NPC (Mutant)",
+            ["SM_PSYSUCKER"] = "NPC (Mutant)",
+
+            ["C_HLCP_S"]     = "Vehicles",
+            ["C_NIVA"]       = "Vehicles",
+            ["SCRPTCAR"]     = "Vehicles",
+
+            ["ON_OFF_S"]     = "Squads",
+
+            ["O_PHYSIC"]     = "Physic (Misc.)",
+            ["O_DSTRBL"]     = "Physic (Misc.)",
+            ["P_DSTRBL"]     = "Physic (Misc.)",
+            ["O_PHYS_S"]     = "Physic (Misc.)",
+            ["O_DSTR_S"]     = "Physic (Misc.)",
+            ["S_INVBOX"]     = "Physic (Misc.)",
+            ["O_INVBOX"]     = "Physic (Misc.)",
+            ["S_EXPLO"]      = "Physic (Misc.)",
+            ["II_EXPLO"]     = "Physic (Misc.)",
+
+            ["ZS_MBALD"]     = "Anomaly",
+            ["ZS_GALAN"]     = "Anomaly",
+            ["ZS_MINCE"]     = "Anomaly",
+            ["ZS_RADIO"]     = "Anomaly",
+            ["ZS_TORRD"]     = "Anomaly",
+            ["ZS_NGRAV"]     = "Anomaly",
+            ["Z_MBALD"]      = "Anomaly",
+            ["Z_RADIO"]      = "Anomaly",
+            ["Z_CFIRE"]      = "Anomaly",
+            ["Z_NOGRAV"]     = "Anomaly",
+            ["Z_TORRID"]     = "Anomaly",
+            ["Z_RUSTYH"]     = "Anomaly",
+            ["ZS_BFUZZ"]     = "Anomaly",
+            ["ZS_AMEBA"]     = "Anomaly",
+
+            ["AI_PHANT"]     = "Phantom",
+        }
+        local class = ini_sys:r_string_ex(section, "class")
+        local kind = ini_sys:r_string_ex(section, "kind") -- special class name for the sake of correct listing
+        if kind then class = kind end
+        local group = obj_to_spawn_classes[class]
+        local ext = ""
+
+        -- Properties
+        local prop = {}
+        local is_squad = sfind(group, "Squad", 1, true)
+        local cant_spawn_actor = sfind(group, "NPC", 1, true) or sfind(group, "Physic", 1, true)
+        local is_veh = sfind(group, "Vehicles", 1, true)
+        local is_anom = sfind(group, "Anomaly", 1, true)
+        local is_phantom = sfind(group, "Phantom", 1, true)
+        if (is_squad) then
+            prop.no_id         = true
+            prop.squad         = true
+            prop.spawn_at_look = true
+        elseif (cant_spawn_actor) then
+            prop.no_id         = true
+            prop.spawn_at_look = true
+        elseif (is_veh) then
+            prop.no_id         = true
+            prop.spawn_at_look = true
+        elseif (is_anom) then
+            prop.no_id         = true
+            prop.spawn_at_look = true
+            prop.is_anom       = true
+        elseif (is_phantom) then
+            prop.no_id           = true
+            prop.spawn_at_look   = true
+            prop.use_level_spawn = true
+        end
+
+        -- checks
+        local chk_smart  = self.d14_chk_s:GetCheck()
+        local chk_point  = self.d15_chk_p:GetCheck()
+        local smart_name = string.sub(self.d14_list_smrt:GetText(), 1, -2)
+
+        if smart_name and (smart_name ~= "") and SIMBOARD.smarts_by_names[smart_name] then
+            chk_smart = chk_smart and true or false
+        else
+            chk_smart = false
+        end
+
+        -- Spawn
+        local pos, lvid, gvid
+        if chk_smart then
+            local smrt = SIMBOARD.smarts_by_names[smart_name]
+            local se_smart = alife_object(smrt.id)
+            if se_smart then
+                pos = se_smart.position
+                lvid = se_smart.m_level_vertex_id
+                gvid = se_smart.m_game_vertex_id
+                ext = strformat("at smart [%s]", smart_name)
+            end
+        elseif (prop.spawn_at_look) and chk_point then
+            gvid = db.actor:game_vertex_id()
+            local r = level.get_target_dist and level.get_target_dist() or 3
+            pos = vector():set(db.actor:position())
+            pos:add(device().cam_dir:mul(r))
+            pos = vector():set(pos.x, db.actor:position().y, pos.z)
+            lvid = level.vertex_id(pos)
+            ext = "at cursor"
+        else
+            pos = db.actor:position()
+            lvid = db.actor:level_vertex_id()
+            gvid = db.actor:game_vertex_id()
+            ext = "near actor"
+        end
+
+        if (prop.use_level_spawn) then
+            if (level.spawn_item) then
+                level.spawn_item(section, pos, lvid, 65535, false)
+                self:SetMsg(strformat("Spawned object [%s] using level spawn", section), "-")
+            end
+            return
+        end
+        local se_obj = section and alife_create_client(section, pos, lvid, gvid)
+        if se_obj then
+            if (prop.squad) then
+                local smrt
+                if (chk_smart) then
+                    smrt = SIMBOARD.smarts_by_names[smart_name]
+                    if smrt then
+                        se_obj:create_npc(smrt)
+                    end
+                else
+                    se_obj:create_npc(nil, pos, lvid, gvid)
+                end
+                local sim = alife()
+                for k in se_obj:squad_members() do
+                    local se_npc = k.object or k.id and sim:object(k.id)
+                    if (se_npc) then
+                        SIMBOARD:setup_squad_and_group(se_npc)
+                        SendScriptCallback("squad_on_npc_creation", se_obj, se_npc, smrt)
+                    end
+                end
+                self:SetMsg(strformat("Spawned squad [%s] (%s) %s", section, se_obj.id, ext), "-")
+            elseif (prop.is_anom) then
+                local data = utils_stpk.get_object_data(se_obj)
+                if (data) then
+                    data.object_flags = 31
+                    data.restrictor_type = 0
+                    data.shapes = {}
+                    data.shapes[1] = {}
+                    data.shapes[1].shtype = 0
+                    data.shapes[1].offset = VEC_ZERO
+                    data.shapes[1].radius = 10
+                    utils_stpk.set_object_data(data, se_obj)
+                end
+                self:SetMsg(strformat("Spawned anomaly [%s] (%s) %s", section, se_obj.id, ext), "-")
+            else
+                self:SetMsg(strformat("Spawned object [%s] (%s) %s", section, se_obj.id, ext), "-")
+            end
+        else
+            self:SetMsg(strformat("No server object made for [%s]", section), "!")
+        end
+    end
+    item_backpack.keep_items = {}
+    item_backpack.on_game_start = function()
+        RegisterScriptCallback("actor_on_item_take_from_box", item_backpack.actor_on_item_take_from_box)
+        RegisterScriptCallback("actor_on_item_use", item_backpack.actor_on_item_use)
+        local iniafile = ini_file("items\\settings\\backpack_stash.ltx")
+        item_backpack.keep_items = utils_data.collect_section(iniafile, "actor_backpack_keep_items", true)
+    end
+    item_backpack.actor_on_item_use = function(obj)
+        if obj and (obj:section() == "itm_actor_backpack") then
+            local backpack = db.actor:item_in_slot(13)
+            if backpack then
+                local actor = db.actor
+                alife_create_awaite(function(se_obj)
+                    if se_obj then
+                        local txt = strformat(game.translate_string("st_itm_stash_of_character"),
+                            db.actor:character_name())
+                        level.map_add_object_spot_ser(se_obj.id, "treasure", txt)
+                        actor_menu.set_msg(1, game.translate_string("st_stash_created"), 4)
+                        local m_data = alife_storage_manager.get_state()
+                        if not (m_data.player_created_stashes) then
+                            m_data.player_created_stashes = {}
+                        end
+                        m_data.player_created_stashes[se_obj.id] = backpack:section()
+                        local b_id = backpack:id()
+                        alife_release_full(backpack)
+                        local function transfer_items(id)
+                            local obj = level.object_by_id(id)
+                            if (obj) then
+                                local function itr_inv(temp, item)
+                                    if (item and item:id() ~= b_id and item_backpack.keep_items[item:section()] == nil) then
+                                        if (IsAmmo(item) ~= true) or (is_ammo_for_wpn(item:section()) ~= true) then
+                                            if (ini_sys:r_bool_ex(item:section(), "quest_item", false) == false) then
+                                                if (db.actor:is_on_belt(item) == false and item_backpack.is_in_slot(item) == false) then
+                                                    db.actor:transfer_item(item, obj)
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                                db.actor:iterate_inventory(itr_inv)
+                                return true
+                            end
+                            return false
+                        end
+                        CreateTimeEvent(0, "actor_backpack", 0, transfer_items, se_obj.id)
+                    end
+                end, "inv_backpack", actor:position(), actor:level_vertex_id(), actor:game_vertex_id())
+            else
+                actor_menu.set_msg(1, game.translate_string("st_stash_no_backpack_found"), 4)
+            end
+        end
+    end
+    item_backpack.actor_on_item_take_from_box = function(box, obj)
+        if box:section() == "inv_backpack" then
+            if box:is_inv_box_empty() then
+                hide_hud_inventory()
+                local data = {
+                    stash_id = box:id(),
+                    cancel = false,
+                }
+                SendScriptCallback("actor_on_stash_remove", data)
+                if data.cancel then
+                    return
+                end
+                local id = box:id()
+                level.map_remove_object_spot(id, "treasure")
+                local se_obj = alife_object(id)
+                if se_obj then
+                    alife_release_client(se_obj)
+                end
+                local m_data = alife_storage_manager.get_state()
+                if (m_data.player_created_stashes and m_data.player_created_stashes[id]) then
+                    local section = m_data.player_created_stashes[id]
+                    alife_create_item(section, db.actor)
+                    m_data.player_created_stashes[id] = nil
+                end
+            end
+        end
+    end
+    item_backpack.receive_backpacks_data = function (tbl_data)
+        local m_data = alife_storage_manager.get_state()
+        if not m_data then return end
+        if not m_data.player_created_stashes then m_data.player_created_stashes = {} end
+        for k, v in pairs(tbl_data) do
+            local local_id = GameManager:GetLocalIDByServerID(k)
+            m_data.player_created_stashes[local_id] = v
+            local obj = level.object_by_id(local_id)
+            if obj then
+                level.map_add_object_spot_ser(obj:id(), "treasure", "player stash")
+            end
+        end
+    end
+    item_backpack.sync_all_stashes = function (netid)
+        local m_data = alife_storage_manager.get_state()
+        if not m_data then return end
+        GameManager:OnICustomScriptAction("item_backpack", "receive_backpacks_data", serialize_table_simple(m_data.player_created_stashes or {}), false, netid)
+    end
+    item_backpack.remote_stash_create = function (tbl_data)
+        local txt = tbl_data[1]
+        local section = tbl_data[2]
+        local postbl = tbl_data[3]
+        local pos = vector():set(postbl[1], postbl[2], postbl[3])
+        local se_obj = alife_create("inv_backpack", pos, tbl_data[4], tbl_data[5])
+        if not se_obj then return end
+
+        local m_data = alife_storage_manager.get_state()
+        if not m_data then return end
+        if not m_data.player_created_stashes then m_data.player_created_stashes = {} end
+        level.map_add_object_spot_ser(se_obj.id, "treasure", txt)
+        -- Send callback if created stash...
+        local data = {
+            stash_id = se_obj.id,
+            stash_name = txt,
+            stash_section = section,
+        }
+        m_data.player_created_stashes[se_obj.id] = section
+        -- SendScriptCallback
+        SendScriptCallback("actor_on_stash_create", data)
+        -- Sync data
+        local payload = { [se_obj.id] = section }
+        GameManager:OnICustomScriptAction("item_backpack", "receive_backpacks_data", serialize_table_simple(payload), false)
+    end
+    function item_backpack.UICreateStash:OnAccept()
+        if IIsHost() then return OLDSYNCS(self) end
+        local txt = self.input:GetText()
+        txt = txt ~= "" and txt or strformat(game.translate_string("st_itm_stash_of_character"), db.actor:character_name())
+        actor_menu.set_msg(1, game.translate_string("st_stash_created"), 4)
+        local payload = { txt, self.section, db.actor:position(), db.actor:level_vertex_id(), db.actor:game_vertex_id() }
+        GameManager:OnICustomScriptAction("item_backpack", "remote_stash_create", serialize_table_simple(payload), true)
+        self:Close()
+    end
+    --BETTER to iterate the available objects
+    --TO anomaly devs. WTF are you doing? in original file
+    trans_outfit.transparent_gg = function()
+        if not (db.actor and trans_outfit.ReadOutfitBlindnessKoeff) then return end
+        local range1 = 80
+        local outfit_in_slot = db.actor:item_in_slot(7)
+        local koeff = outfit_in_slot and trans_outfit.ReadOutfitBlindnessKoeff(outfit_in_slot:section()) or 0
+        if koeff > 0.0 then range1 = koeff end
+        for _, t in pairs(db.storage) do
+            if t and t.object and IsStalker(t.object) and not IsActor(t.object) then
+                local dist_act_npc = db.actor:position():distance_to_sqr(t.object:position())
+                if dist_act_npc <= 120 then
+                    t.object:set_range(range1)
+                else
+                    t.object:set_range(80)
+                end
+            end
+        end
+    end
+    txr_mines.sync_bomb = function (tbl)
+        local local_id = GameManager:GetLocalIDByServerID(tbl[1])
+        local cache_tbl = tbl[2]
+        txr_mines._mines[local_id] = cache_tbl
+        printf("Synced bomb data - %s", table.concat(cache_tbl, " "))
+    end
+    txr_mines.remote_plant_bomb = function (tbl_data)
+        local EXPLOSIVE_SECTION_LOOKUP = {
+            ied_rpg_new = 'rpg_new_blow',
+            mine_new    = 'mine_new_blow',
+            ied_new     = 'ied_new_blow'
+        }
+        -- Read table
+        local section = tbl_data[1]
+        local mode = tbl_data[2]
+        local delay = tbl_data[3]
+        local position_tbl = tbl_data[4]
+        local LV = tbl_data[5]
+        local GV = tbl_data[6]
+        -- Vars that default
+        local MIN_FORGET_TIME = 60 * 10
+        local MAX_FORGET_TIME = 60 * 30
+        local FUSE_TIME = delay or 5
+        local now = txr_mines.tss()
+        local spawn_pos = type(tbl_data[4]) == "userdata" and tbl_data[4] or vector():set(position_tbl[1], position_tbl[2], position_tbl[3])
+        local planted_section = EXPLOSIVE_SECTION_LOOKUP[section]
+
+        printf('plant_bomb(%s,%s,%s,%s)', section, mode, delay, planted_section)
+        local se_planted = alife_create(planted_section, spawn_pos, LV, GV)
+        if not se_planted then
+            return false
+        end
+        -- Prepare cache
+        local cache = {
+            exp_time = now + FUSE_TIME * level.get_time_factor(),
+            mode = mode,
+            witnesses = {},
+            active = true
+        }
+        -- Fill witnesses
+        printf('check witnesses')
+        for k, _ in pairs(db.OnlineStalkers) do
+            local id = db.OnlineStalkers[k]
+            local npc = level.object_by_id(id)
+            if npc and IsStalker(npc) and npc:alive() then
+                if npc:see(db.actor) then
+                    printf('%s saw player plant %s', npc:name(), se_planted:name())
+                    cache.witnesses[id] = now + math.random(MIN_FORGET_TIME, MAX_FORGET_TIME) * level.get_time_factor()
+                end
+            end
+        end
+        txr_mines._mines[se_planted.id] = cache
+        GameManager:OnICustomScriptAction("txr_mines", "sync_bomb", serialize_table_simple({ se_planted.id, cache }), false)
+    end
+    function txr_mines.plant_bomb(obj, mode, delay)
+        printf('try FX')
+        local FX_BY_SECTION = {
+            ied_rpg_new = 'ied_rpg',
+            mine_new    = 'mine',
+            ied_new     = 'ied'
+        }
+        -- Play animation
+        local section = obj:section()
+        local SFX = FX_BY_SECTION[section]
+        if SFX then actor_effects.play_item_fx(SFX) end
+        -- Obtaining variables
+        local cd = device().cam_dir
+        local ap = db.actor:position()
+        local pos = vector():set(ap.x + cd.x, ap.y + 0.1, ap.z + cd.z)
+        local vid = level.vertex_id(pos)
+        local payload = { section, mode, delay, pos, vid, db.actor:game_vertex_id() }
+        -- Remove item from backpack
+        alife_release(obj)
+        -- Spawn on request spawn that boombox
+        if IIsHost() then return txr_mines.remote_plant_bomb(payload) end
+        GameManager:OnICustomScriptAction("txr_mines", "remote_plant_bomb", serialize_table_simple(payload), true)
+    end
+    level_input.action_quick_load = function(dik, bind)
+        return true -- No quick load
+    end
+    function xr_camper.action_patrol:reset_scheme()
+        --utils_data.debug_write("action_patrol:reset_scheme")
+        if not self.move_mgr then
+            self.move_mgr = move_mgr.move_mgr(self.object)
+        end
+        OLDAPRSSCH(self)
+    end
+    xr_effects.game_disconnect = function(actor, npc)
+        if IIsHost() then
+            MPMain_STOGETHER.ServerSOSOCK:CloseListenSocket()
+        else
+            MPMain_STOGETHER.ClientSocks:Disconnect()
+        end
+        exec_console_cmd("disconnect")
+    end
+    simulation_objects.get_server_entity = function(id)
+        for i = 1, simulation_objects.object_registry_size do
+            local se_obj = simulation_objects.object_registry[i]
+            if se_obj and se_obj.id == id then
+                return se_obj
+            end
+        end
+    end
+    function se_actor.se_actor:on_register()
+        cse_alife_creature_actor.on_register(self)
+        simulation_objects.register(self)
+        SendScriptCallback("server_entity_on_register", self, "se_actor")
+        self.m_registred = true
+        if self.id == 0 and not self.start_position_filled then
+            if IIsHost() then
+                SIMBOARD:fill_start_position()
+            end
+            self.start_position_filled = true
+        end
+    end
+    function ui_mutant_loot.UIMutantLoot:SetMutantImage()
+        local tostr = tostring
+        local killed_mutant_tbl = {
+            psysucker         = { file = "ui\\ui_actor_monsters_pda_3", x = "393", y = "0", type = "small" },
+            lurker            = { file = "ui\\ui_actor_monsters_pda_3", x = "0", y = "0", type = "small" },
+            karlik            = { file = "ui\\ui_actor_monsters_pda_3", x = "0", y = "200", type = "small" },
+            snork             = { file = "ui\\ui_actor_monsters_pda", x = "393", y = "0", type = "small" },
+            dog               = { file = "ui\\ui_actor_monsters_pda", x = "0", y = "800", type = "small" },
+            pseudodog         = { file = "ui\\ui_actor_monsters_pda", x = "393", y = "200", type = "small" },
+            psy_dog           = { file = "ui\\ui_actor_monsters_pda", x = "393", y = "200", type = "small" },
+            poltergeist       = { file = "ui\\ui_actor_monsters_pda", x = "0", y = "400", type = "small" },
+            bloodsucker       = { file = "ui\\ui_actor_monsters_pda", x = "393", y = "400", type = "human" },
+            controller        = { file = "ui\\ui_actor_monsters_pda", x = "393", y = "800", type = "human" },
+            chimera           = { file = "ui\\ui_actor_monsters_pda", x = "0", y = "600", type = "large" },
+            tushkano          = { file = "ui\\ui_actor_monsters_pda", x = "0", y = "0", type = "small" },
+            rat               = { file = "ui\\ui_actor_monsters_pda", x = "0", y = "0", type = "small" },
+            flesh             = { file = "ui\\ui_actor_monsters_pda", x = "393", y = "600", type = "large" },
+            tark              = { file = "ui\\ui_actor_monsters_pda_2", x = "0", y = "0", type = "human" },
+            rotan             = { file = "ui\\ui_actor_monsters_pda", x = "0", y = "0", type = "human" },
+            burer             = { file = "ui\\ui_actor_monsters_pda_1", x = "0", y = "0", type = "large" },
+            boar              = { file = "ui\\ui_actor_monsters_pda_1", x = "393", y = "0", type = "large" },
+            giant             = { file = "ui\\ui_actor_monsters_pda_1", x = "0", y = "200", type = "large" },
+            cat               = { file = "ui\\ui_actor_monsters_pda_2", x = "0", y = "0", type = "small" },
+            fracture          = { file = "ui\\ui_actor_monsters_pda_2", x = "393", y = "200", type = "human" },
+            bird              = { file = "ui\\ui_actor_monsters_pda_2", x = "393", y = "0", type = "small" },
+            zombie            = { file = "ui\\ui_actor_monsters_pda_2", x = "0", y = "200", type = "human" },
+            bloodsucker_arena = { file = "ui\\ui_actor_monsters_pda", x = "393", y = "400", type = "human" },
+            burer_arena       = { file = "ui\\ui_actor_monsters_pda_1", x = "0", y = "0", type = "large" },
+            pseudodog_arena   = { file = "ui\\ui_actor_monsters_pda", x = "393", y = "200", type = "small" },
+            snork_arena       = { file = "ui\\ui_actor_monsters_pda", x = "393", y = "0", type = "human" },
+        }
+        local kind_to_section = {
+            ["SM_KARLIK"]    = "karlik",
+            ["SM_PSYSUCKER"] = "psysucker",
+            ["SM_LURKER"]    = "lurker"
+        }
+        local mutant_id = game.translate_string(ini_sys:r_string_ex(self.section, "species") or "")
+        if not killed_mutant_tbl[mutant_id] then
+            return
+        end
+        local kind = ini_sys:r_string_ex(self.section, "kind") or "unknown"
+        mutant_id = kind_to_section[kind] or mutant_id
+        local mutant_f = "ui\\ui_actor_monsters_pda_1"
+        local mutant_x = ""
+        local mutant_y = ""
+        mutant_f = tostr(killed_mutant_tbl[mutant_id].file)
+        mutant_x = tostr(killed_mutant_tbl[mutant_id].x)
+        mutant_y = tostr(killed_mutant_tbl[mutant_id].y)
+        local x1 = mutant_x
+        local y1 = mutant_y
+        local mutant_width = 393
+        local mutant_height = 200
+        local x2 = x1 + mutant_width
+        local y2 = y1 + mutant_height
+        self.image:InitTexture(tostr(mutant_f))
+        self.image:SetTextureRect(Frect():set(x1, y1, x2, y2))
+        self.image:SetStretchTexture(true)
+    end
+    surge_manager.start_surge = function(pforce)
+        local s = surge_manager.get_surge_manager()
+        if s then
+            s:start(true, pforce)
+        end
+    end
+    surge_manager.stop_surge = function(pforce)
+        local s = surge_manager.get_surge_manager()
+        if s and s.started then
+            s:end_surge(true, pforce)
+        end
+    end
+    function surge_manager.CSurgeManager:start(manual, force)
+        if not IIsHost() and not force then return true end
+        OLDSURGESTART(self, manual, force)
+        GameManager:OnEmissionPsy(false, true)
+        return true
+    end
+    function surge_manager.CSurgeManager:end_surge(manual, force)
+        if not IIsHost() and not force then return true end
+        OLDSURGESTOP(self, manual, force)
+        GameManager:OnEmissionPsy(false, false)
+        return true
+    end
+    if psi_storm_manager then
+        psi_storm_manager.start_psi_storm = function(pforce)
+            local ps = psi_storm_manager.get_psi_storm_manager()
+            if ps then
+                ps:start(true, pforce)
+            end
+        end
+        psi_storm_manager.stop_psi_storm = function(pforce)
+            local ps = psi_storm_manager.get_psi_storm_manager()
+            if ps then
+                ps:finish(true, pforce)
+            end
+        end
+        function psi_storm_manager.CPsiStormManager:start(manual, force)
+            if not IIsHost() and not force then return true end
+            OLDPSISTART(self, manual, force)
+            GameManager:OnEmissionPsy(true, true)
+            return true
+        end
+        function psi_storm_manager.CPsiStormManager:finish(manual, force)
+            if not IIsHost() and not force then return true end
+            OLDPSISTOP(self, manual, force)
+            GameManager:OnEmissionPsy(true, false)
+            return true
+        end
+    end
+    xr_sound.set_sound_play = function(npc_id, sound, faction, point)
+        local data = OLDSETSOUNDPLAY(npc_id, sound, faction, point)
+        if IIsHost() then
+            local sobj = alife_object(npc_id) or alife():actor()
+            GameManager:OnCustomSound(sound, sobj and sobj.position or vector():set(0, 0, 0), sobj)
+        end
+        return data
+    end
+    xr_effects.play_sound = function(actor, obj, p)
+        OLDSOUNDPLAY(actor, obj, p)
+        local sobj = alife_object(obj:id()) or alife():actor()
+        if not IIsHost() then
+            GameManager:OnCustomSound(p[1], sobj and sobj.position or vector():set(0, 0, 0), sobj)
+        end
+    end
+    xr_sound.set_sound_play_client = function(npc_id, sound, faction, point)
+        return OLDSETSOUNDPLAY(npc_id, sound, faction, point)
+    end
+    xr_conditions.i_has_item = function(actor, npc, p)
+        return p[1] and actor and actor:object(p[1])
+    end
+    xr_conditions.is_enemy_actor = function(enemy, object)
+        return enemy and IsActor(enemy)
+    end
+    xr_conditions.has_actor_enemy = function(actor, npc)
+        local best_enemy = npc:best_enemy()
+        return best_enemy and IsActor(best_enemy)
+    end
+    xr_conditions.is_enemy_actor_or_companion = function(enemy, npc)
+        if (IsMonster(enemy)) then
+            return false
+        end
+        if not (npc:relation(enemy) >= game_object.enemy) then
+            return false
+        end
+        if xr_conditions.is_enemy_actor(enemy, npc) then
+            return true
+        end
+        if (alife():has_info(enemy:id(), "npcx_is_companion")) then
+            return true
+        end
+        return false
+    end
+    xr_conditions.fighting_actor = function(actor, npc)
+        local enemy_id = db.storage[npc:id()].enemy_id
+        local enemy = db.storage[enemy_id] and db.storage[enemy_id].object
+        return enemy and IsActor(enemy)
+    end
+    xr_conditions.killed_by_actor = function(actor, npc)
+        local t = db.storage[npc:id()] and db.storage[npc:id()].death
+        if t then
+            for key, _ in pairs(db.actors) do
+                if key == t.killer then
+                    return true
+                end
+            end
+        end
+        return t and t.killer == actor:id()
+    end
+    xr_conditions.actor_has_item = function(actor, npc, p)
+        if not p[1] then return end
+        if IIsHost() then
+            if PlayerManager:HasItem(p[1]) then
+                return true
+            end
+        end
+        return actor and actor:object(p[1])
+    end
+    xr_conditions.actor_in_zone = function(actor, npc, p)
+        if not (db.actor) then
+            return false
+        end
+        for i = 1, #p do
+            local zone = db.zone_by_name[p[i]]
+            if zone then
+                for _, v in pairs(db.actors) do
+                    if v and v.object and zone:inside(v.object:position()) then
+                        return true
+                    end
+                end
+                if zone:inside(db.actor:position()) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+    ui_sleep_dialog.get_ui_silent = function ()
+        if not ui_sleep_dialog.GUI then ui_sleep_dialog.GUI = ui_sleep_dialog.UISleep() end
+        if not ui_sleep_dialog.GUI then return end
+        return ui_sleep_dialog.GUI
+    end
+    function ui_sleep_dialog.UISleep:OnButtonSleep()
+        local hud = get_hud()
+        for _, p in pairs(db.actors) do
+            if p.object and p.object:position():distance_to_sqr(db.actor:position()) > 25 then
+                if hud then
+                    hud:AddCustomStatic("text_on_screen_center", true)
+                    local static = hud:GetCustomStatic("text_on_screen_center")
+                    if static then
+                        static:wnd():TextControl():SetText("For sleep here, need all players to be near with you")
+                        CreateTimeEvent(0, "remove_warn_travel", 3, function ()
+                            hud:RemoveCustomStatic("text_on_screen_center")
+                            return true
+                        end)
+                    end
+                end
+                return
+            end
+        end
+        GameManager:OnICustomScriptAction("ui_sleep_dialog", "remote_dream_exec", tostring(self.time_track:GetIValue()), false)
+        OLDSLEEPSHIT(self)
+        local SyncList = {}
+        local tm = task_manager.get_task_manager()
+        for id, tma in pairs(tm.task_info) do
+            if tma.t then
+                SyncList[#SyncList+1] = id
+            end
+        end
+        CreateTimeEvent(0, "Sync_Tasks", 3, function ()
+            log("-[Server] Sending packet for verify task list!")
+            GameManager:OnICustomScriptAction("xr_effects", "clear_old_tasks", serialize_table_simple(SyncList), false)
+            return true
+        end)
+    end
+    ui_sleep_dialog.remote_dream_exec = function(time)
+        local GUIS = ui_sleep_dialog.get_ui_silent()
+        if not GUIS then return end
+        printf("[Client] someone wants to call dream.")
+        -- TODO: Count dream requests...
+        GUIS.time_track:SetIValue(time)
+        OLDSLEEPSHIT(GUIS)
+    end
+    function ph_door.action_door:use_callback(door, actor)
+        if not self.object then return end
+        if self.st.locked then
+            if self.st.snd_open_start then
+                xr_sound.set_sound_play(self.object:id(), self.st.snd_open_start)
+            end
+        end
+        self:try_switch()
+        if actor and actor:id() == db.actor:id() then
+            GameManager:OnICustomAnimation("knopka_0", "", true, 1.7)
+        end
+        GameManager:OnIInteract(self.object:id(), 1, self.st.closed)
+    end
+    function ui_inventory.UIInventory:Action_Drop(obj, bag)
+        obj = self:CheckItem(obj, "Action_Drop")
+        db.actor:drop_item(obj)
+        self:PlaySND(snd_drop_item)
+        GameManager:OnIDrop(obj:id(), 65535)
+    end
+    ui_inventory.remote_unload_ammo = function (obj, id)
+        obj = obj or level.object_by_id(GameManager:GetLocalIDByServerID(id))
+        if not (obj and obj:parent() and obj.set_ammo_elapsed and obj.force_unload_magazine) then return end
+        if IIsHost() then obj:force_unload_magazine(true) else obj:set_ammo_elapsed(0) end
+    end
+    function ui_inventory.UIInventory:Action_Unload(obj, bag)
+        obj = self:CheckItem(obj, "Action_Unload")
+        if not (obj and obj:parent()) then return end
+        if obj:parent():id() == db.actor:id() then
+            obj:force_unload_magazine(true)
+            self:On_Item_Update()
+            return
+        end
+        -- Do something
+        ui_inventory.remote_unload_ammo(obj)
+        -- Send to host request
+        local srvid = GameManager:GetServerIDByLocalID(obj:id())
+        GameManager:OnICustomScriptAction("ui_inventory", "remote_unload_ammo", "nil, "..tostring(srvid), false)
+        obj:set_ammo_elapsed(0)
+    end
+    function ui_inventory.UIInventory:Action_Drop_All(obj, bag)
+        obj = self:CheckItem(obj, "Action_Drop_All")
+        local ci = self.CC[bag]:GetCell_ID(obj:id())
+        for id, _ in pairs(ci.childs) do
+            local obj_c = level.object_by_id(id)
+            if obj_c then
+                db.actor:drop_item(obj_c)
+                GameManager:OnIDrop(obj_c:id(), 65535)
+            end
+        end
+        db.actor:drop_item(obj)
+        self:PlaySND(snd_drop_item)
+        GameManager:OnIDrop(obj:id(), 65535)
+    end
+    function axr_radio_in_heli.action_radio_in_heli:execute()
+        action_base.execute(self)
+        local be = self.object:best_enemy()
+        if not be then
+            return
+        end
+    end
+    safe_release_manager.release = function(se_obj)
+        if type(se_obj) == "number" then
+            se_obj = alife_object(se_obj)
+        end
+        if not se_obj or not se_obj.id then return end      -- no object check
+        if se_obj.clsid and IsActor(se_obj) then return end -- Prevent release actor
+        OLDSAFEREL(se_obj)
+    end
+    ranks.get_obj_rank_name = function(obj)
+        if not obj then return "novice" end
+        return OLDGRANK(obj)
+    end
+    ranks.get_se_obj_rank_name = function(obj)
+        if not obj then return "novice" end
+        return OLDSRANK(obj)
+    end
+    ph_door.try_to_open_door = function(npc, opened_doors)
+        local npc_position = npc:position()
+        for id, position in pairs(db.level_doors) do
+            local t = db.storage[id]
+            if t and t.ph_door and npc_position:distance_to_sqr(position) <= 3 then
+                local action = t.ph_door.door_action
+                if action.st.not_for_npc == false and action.st.closed == true then
+                    action:use_callback()
+                    opened_doors[id] = true
+                end
+            end
+        end
+    end
+    ph_door.try_to_close_door = function(npc, doors)
+        local npc_position = npc:position()
+        for id, v in pairs(doors) do
+            local t = db.storage[id]
+            if t and t.ph_door then
+                if npc_position:distance_to_sqr(db.level_doors[id]) > 3 then
+                    local action = db.storage[id].ph_door.door_action
+                    if not action.st.not_for_npc and not action.st.closed then
+                        action:use_callback()
+                        doors[id] = nil
+                    else
+                        doors[id] = nil
+                    end
+                end
+            else
+                doors[id] = nil
+            end
+        end
+    end
+    ui_pda_npc_tab.generate_date = function(last_msg_date)
+        local Y1, M1, D1 = 0, 0, 0
+        local Y, M, D, h, m, s, ms = 0, 0, 0, 0, 0, 0, 0
+        if last_msg_date then
+            Y, M, D = string.match(last_msg_date, "(%d+)/(%d+)/(%d+)")
+            Y = tonumber(Y)
+            M = tonumber(M)
+            D = tonumber(D)
+        else
+            Y, M, D, h, m, s, ms = game.get_game_time():get(Y, M, D, h, m, s, ms)
+        end
+        if not Y or not M or not D or not h or not m or not s or not ms then return "ERROR" end
+        local diff = D - math.random(1, 30)
+        D1 = diff >= 1 and diff or (diff + 29)
+        M1 = D1 > D and M - 1 or M
+        Y1 = M1 > M and Y - 1 or Y
+        return strformat("%s/%s/%s", tostring(Y1), tostring(M1), tostring(D1))
+    end
+    xr_logic.see_actor = function(npc)
+        if not npc or not npc:alive() then return false end
+        for _, v in pairs(db.actors) do
+            if v.object and npc:see(v.object) then return true end
+        end
+        return npc:see(db.actor)
+    end
+    itms_manager.use_place = function (obj)
+        local p = obj:parent()
+        if not (db.actor and p and p:id() == db.actor:id()) then return end
+        local section = obj:section()
+        alife_release_id(obj:id())    
+        local pos = db.actor:position()
+        pos:add(device().cam_dir:mul(1.2))
+        pos.y = pos.y + 1
+        alife_create_special_awaite(function (se_obj)
+            printf("Spawned object: %s !", section)
+        end, function (se_obj)
+            printf("Spawning object: %s !", section)
+            local rot = device().cam_dir:getH()
+            se_obj.angle = vector():set(0,rot,0)
+        end, section, pos, db.actor:level_vertex_id(), db.actor:game_vertex_id())
+    end
+    treasure_manager.sync_all_stashes = function (PlayerNetID)
+        local tbl = {}
+        for k, v in pairs(treasure_manager.caches) do
+            local se_box = alife_object(k)
+            local se_spot = treasure_manager.get_stash_spot_type(k)
+            tbl[k] = { v, se_box and se_spot and { se_box.id, se_box.position, se_box.m_level_vertex_id, se_box.m_game_vertex_id, se_spot } or nil }
+        end
+        GameManager:OnICustomScriptAction("treasure_manager", "remote_sync_treasure_caches", serialize_table_simple(tbl), false, PlayerNetID or 0)
+    end
+    treasure_manager.remote_sync_treasure_caches = function (table)
+        for k, v in pairs(table) do
+            local mlink = GameManager:GetLocalIDByServerID(k)
+            treasure_manager.caches[mlink] = v[1]
+            if v[1] and v[2] then
+                treasure_manager.remote_add_map_spot(v[2])
+            end
+        end
+    end
+    treasure_manager.create_random_stash = function(...)
+        if IIsHost() then return OLDTCRRANDOMST(...) end
+        GameManager:OnICustomScriptAction("treasure_manager", "remote_create_random_stash", serialize_table_simple({ ... }), true)
+    end
+    treasure_manager.remote_create_random_stash = function(p)
+        treasure_manager.create_random_stash(p[1], p[2], p[3], p[4], p[5])
+    end
+    treasure_manager.set_random_stash = function(no_spot, hint, bonus_items, id, dbg)
+        local result = OLDTSETRNSTASH(no_spot, hint, bonus_items, id, dbg)
+        local cachevar = treasure_manager.caches[id]
+        local se_box = id and alife_object(id)
+        if IIsHost() and se_box and not dbg and type(cachevar) == "string" then
+            local payload = { se_box.id, se_box.position, se_box.m_level_vertex_id, se_box.m_game_vertex_id, treasure_manager.get_stash_spot_type(se_box.id) }
+            GameManager:OnICustomScriptAction("treasure_manager", "remote_add_map_spot", serialize_table_simple(payload), false)
+        end
+        return result
+    end
+    treasure_manager.remote_add_map_spot = function(p)
+        local real_id = GameManager:GetLocalIDByServerID(p[1])
+        local postable = p[2]
+        local pos = vector():set(postable[1], postable[2], postable[3])
+        pos.y = pos.y - 90
+        local lvid = p[3]
+        local gvid = p[4]
+        local spot_type = p[5]
+        local target = alife_object(real_id) or alife_create_local("inv_backpack", pos, lvid, gvid)
+
+        if target and not IsInvbox(target) then
+            target = alife_create_local("inv_backpack", pos, lvid, gvid)
+        end
+
+        if target and spot_type and level.map_has_object_spot(target.id, spot_type) == 0 then
+            local desc_text = game.translate_string("st_ui_pda_secret")
+            level.map_add_object_spot(target.id, spot_type, desc_text)
+            treasure_manager.caches[real_id] = true
+        end
+    end
+    treasure_manager.remote_client_clear_treasure = function(srv_id)
+        local target_id = GameManager:GetLocalIDByServerID(srv_id)
+        if treasure_manager.caches[target_id] then
+            level.map_remove_object_spot(target_id, "treasure")
+		    level.map_remove_object_spot(target_id, "treasure_searched")
+		    level.map_remove_object_spot(target_id, "treasure_unique")
+            game_statistics.increment_statistic("stashes_found")
+            news_manager.send_treasure(1)
+		    local se_stash = alife_object(target_id)
+            if not se_stash then return end
+		    local lvl = alife():level_name(game_graph():vertex(se_stash.m_game_vertex_id):level_id())
+            item_radio.clear_stash(lvl, target_id)
+        end
+    end
+    treasure_manager.try_spawn_treasure = function (box)
+        if not box then return end
+        if IIsHost() then return OLDTTRYSPAWNIT(box) end
+        local local_id = GameManager:GetServerIDByLocalID(box:id())
+        GameManager:OnICustomScriptAction("treasure_manager", "try_spawn_treasure", "level.object_by_id("..tostring(local_id)..")", true)
+    end
+    function ui_workshop.UIWorkshopCraft:Craft()
+        -- CHECK BEHAVIOUR
+        if not (self.craft_allow_r and db.actor) then return end
+
+        -- Check addons craft logic if it was present...
+        if self.addoned_uicraft and self:addoned_uicraft() then return end
+
+        -- This array will contain the craft items to despawn haha.
+        local payload = {}
+
+        -- Check condition and other parameters
+        local maxcond = 0
+        for i = 1, #self.craft_item do
+            -- Calc craft item to be in list it;s easier sync instead of other...
+            if #self.craft_item[i] > 0 then
+                for j = 1, #self.craft_item[i] do
+                    local item_id = self.craft_item[i][j]
+                    local obj = level.object_by_id(item_id)
+                    local obj_p = obj and obj:parent()
+                    if obj_p then
+                        if obj_p:id() == db.actor:id() or IIsHost() then
+                            alife_release(obj)
+                        elseif obj_p:id() ~= 0 then
+                            payload[#payload+1] = GameManager:GetServerIDByLocalID(item_id)
+                        end
+                        local kindergarden = SYS_GetParam(0, obj:section(), "kind")
+			            if (kindergarden == "i_arty" or kindergarden == "i_arty_cont") and maxcond < obj:condition() then
+                            maxcond = obj:condition()
+                        end
+                    end
+                end
+            end
+
+            -- Perform special sync when discharge tools...
+            local remain = self.craft_item_remain[i]
+            if remain and remain.id and remain.cnt then
+                local obj_itm = level.object_by_id(remain.id)
+                if obj_itm then
+                    if utils_item.discharge(obj_itm, remain.cnt) ~= 0 then
+                        engine_perform_special_sync(remain.id)
+                    else
+                        payload[#payload+1] = GameManager:GetServerIDByLocalID(remain.id)
+                    end
+                end
+            end
+        end
+
+        -- Increase Statistic
+        game_statistics.increment_statistic("items_crafted")
+
+        -- Effect
+        actor_effects.play_item_fx("craft_dummy")
+
+        -- Craft item that we decide
+        local crafto = self.craft_item_r[1]
+        local params = self.craft_item_r[2]
+        if IsItem("ammo", crafto) then
+            alife_create_item(crafto, db.actor, { ammo = params })
+        else
+            for _ = 1, params do
+                local kind = SYS_GetParam(0, crafto, "kind")
+			    if kind == "i_arty" or kind == "i_arty_cont" then
+                    alife_create_item(crafto, db.actor, { cond = maxcond })
+                else
+                    alife_create_item(crafto, db.actor)
+                end
+            end
+        end
+
+        -- Sending to clients request to clear that items in ui or host do releasing
+        GameManager:OnICustomScriptAction("ui_workshop", "silent_craft_item", serialize_table_simple(payload), false)
+
+        -- LOST MODDED BEHAVIOUR AND STFU IT
+        if self.last_cont and self.last_idx and self.UpdateUi then
+            self.btn_craft:Enable(false)
+            CreateTimeEvent("totally_not_random_event" .. time_global(), "update_ui_delay" .. time_global(), 0.1, self.UpdateUi, self, self.last_cont, self.last_idx)
+        else
+            self.btn_craft:Enable(false)
+        end
+    end
+    function ui_workshop.UIWorkshopRepair:Repair()
+        local obj = self.CC["inventory"]:GetCell_Selected(true)
+        if not (db.actor and obj) then return end
+
+        local tot_con = 0
+	    local cnt = 0
+        local payload = {}
+        if is_empty(self.new_con) then
+            printf("! UIWorkshopRepair:Repair() | no new parts have been replaced")
+            return
+        end
+
+        -- Replace parts
+        for i = 1, 6 do
+            if self.parts[i] and self.parts[i].sec and (self.parts[i].sec ~= "na") then
+                if self.new_con[i] and self.new_con[i].id then
+                    self.parts[i].con = self.new_con[i].con
+                    printf(
+                    "- UIWorkshopRepair:Repair() | replaced part spotted | part: %s - condition: %s - order: %s - id: %s",
+                        self.parts[i].sec, self.new_con[i].con, i, self.new_con[i].id)
+
+                    -- Release replacement parts
+                    local item_id = self.new_con[i].id
+                    local se_obj = alife_object(item_id)
+                    if se_obj then
+                        if se_obj.parent_id == db.actor:id() or IIsHost() then
+                            alife_release(se_obj)
+                        else
+                            payload[#payload+1] = GameManager:GetServerIDByLocalID(item_id)
+                        end
+                    end
+                end
+
+                tot_con = tot_con + self.parts[i].con
+                cnt = cnt + 1
+                printf("/ UIWorkshopRepair:Repair() | total condition calculation | part: %s - condition: %s - order: %s - total sum: %s",
+                    self.parts[i].sec, self.parts[i].con, i, tot_con)
+            end
+        end
+
+        -- Discharge tools
+        for i=1,#self.toolkit_pick do
+            local toolid = self.toolkit_pick[i]
+            local obj_tool = level.object_by_id(toolid)
+            if obj_tool then
+                if utils_item.discharge(obj_tool) ~= 0 then
+                    engine_perform_special_sync(toolid)
+                else
+                    payload[#payload+1] = GameManager:GetServerIDByLocalID(toolid)
+                end
+                printf("/ UIWorkshopRepair:Repair() | discharged toolkit (%s)", self.toolkit_pick[i])
+            else
+                printe("!ERROR UIWorkshopRepair:Repair() | can't discharge toolkit with id (%s). Object not found!", self.toolkit_pick[i])
+            end
+        end
+
+        -- Apply condition changes
+        local id = obj:id()
+        local sec = obj:section()
+        sec = ini_sys:r_string_ex(sec,"parent_section") or sec -- for weapons with scopes
+
+        local final_con = cnt > 0 and (clamp(math.ceil(tot_con / cnt), 1, 100) / 100)
+        if final_con and final_con >= 0 and final_con <= 1 then
+            obj:set_condition(final_con)
+            printf("- UIWorkshopRepair:Repair() | object with id (%s) is set to a new condition: %s", id, final_con)
+        else
+            printe("! UIWorkshopRepair:Repair() | object with id (%s) is either not found. Or didn't register new condition (%s)!", id, final_con)
+        end
+
+        local result_part_tbl = {}
+        result_part_tbl[sec] = math.ceil(tot_con/cnt)
+        for i=1,#self.parts do
+            result_part_tbl[self.parts[i].sec] = self.parts[i].con
+        end
+        item_parts.set_parts_con(id, result_part_tbl)
+
+        for k,v in pairs(result_part_tbl) do
+            printf("~ UIWorkshopRepair:Repair() | item's new part table [%s] = %s", k, v)
+        end
+
+        -- Effect
+        actor_effects.play_item_fx("craft_dummy")
+
+        -- Dirty hack to avoid sync items... Just get to pocket...
+        local obj_p = obj:parent()
+        if obj_p and obj_p:id() ~= db.actor:id() then
+            obj_p:transfer_item(obj, db.actor)
+        end
+
+        -- Sending to clients request to clear that items in ui or host do releasing
+        GameManager:OnICustomScriptAction("ui_workshop", "silent_craft_item", serialize_table_simple(payload), false)
+
+        -- Update ui
+        if self.last_cont and self.last_idx and self.UpdateUi then
+            -- LOST MODDED BEHAVIOUR AND STFU IT
+            self.btn_repair:Enable(false)
+            CreateTimeEvent("totally_not_random_event" .. time_global(), "update_ui_delay" .. time_global(), 0.1, self.UpdateUi, self, self.last_cont, self.last_idx)
+        else
+            self:Close()
+        end
+    end
+    ui_workshop.silent_craft_item = function (tbl)
+        if IIsHost() then
+            for _, id in ipairs(tbl) do
+                alife_release_id(id)
+            end
+        end
+        local mui = ui_workshop.GUI and (ui_workshop.GUI.dlg_craft or ui_workshop.GUI.dlg_repair)
+        if mui and mui.last_cont and mui.last_idx and mui.UpdateUi then
+            mui.btn_craft:Enable(false)
+            CreateTimeEvent("totally_not_random_event" .. time_global(), "update_ui_delay" .. time_global(), 0.1, mui.UpdateUi, mui, mui.last_cont, mui.last_idx)
+        end
+    end
+    pda.calculate_rankings = function()
+        if IIsHost() then
+            orig_calculate_rankings()
+        else
+            local tg = time_global()
+            local coc_ranking_list = pda.get_coc_ranking_list()
+            coc_ranking_list[pda.get_rankings_array_size() + 1] = 0
+            local my_netid = GameManager:GetMySNETID()
+            local my_rank = db.actor:character_rank()
+            local payload = { netid = my_netid, rank = my_rank }
+            GameManager:OnICustomScriptAction("pda", "host_request_ranking", serialize_table_simple(payload), true)
+        end
+    end
+    pda.host_request_ranking = function(data)
+        if not IIsHost() then return end
+        local netid = tonumber(data.netid)
+        local client_rank = tonumber(data.rank) or 0
+        orig_calculate_rankings()
+        local list = pda.get_coc_ranking_list()
+        local coc_ranking_array_size = pda.get_rankings_array_size()
+        local client_place = 1
+        local sim = alife()
+        if db.actor and db.actor:character_rank() > client_rank then
+            client_place = client_place + 1
+        end
+        if db.actors then
+            for n_id, c_data in pairs(db.actors) do
+                if n_id ~= netid and c_data.object then
+                    if c_data.object:character_rank() > client_rank then
+                        client_place = client_place + 1
+                    end
+                end
+            end
+        end
+        for i = 1, 65534 do
+            local se_obj = sim:object(i)
+            if se_obj and IsStalker(nil, se_obj:clsid()) and se_obj:alive() then
+                local comm = se_obj:community()
+                if comm ~= "zombied" and comm ~= "trader" and comm ~= "arena_enemy" then
+                    local sid = get_object_story_id(i) 
+                    if not sid then
+                        if se_obj:rank() > client_rank then
+                            client_place = client_place + 1
+                        end
+                    end
+                end
+            end
+        end
+        local network_top = {}
+        local MAX_TOP = coc_ranking_array_size or 100
+        
+        for i = 1, MAX_TOP do
+            local id = list[i]
+            if not id then break end
+            if id == 0 then
+                network_top[#network_top+1] = {
+                    netid = 0,
+                    name = db.actor:character_name(),
+                    rank = db.actor:character_rank(),
+                    comm = db.actor:character_community(), 
+                    rep = db.actor:character_reputation(),
+                    icon = db.actor:character_icon() or "ui\\ui_noise",
+                    rank_name = ranks.get_obj_rank_name(db.actor),
+                    rep_name = string.gsub(utils_obj.get_reputation_name(db.actor:character_reputation()), "st_reputation_", "")
+                }
+            else
+                local c_netid = nil
+                local is_requester = false
+                if db.actors then
+                    for n_id, c_data in pairs(db.actors) do
+                        if c_data.object and c_data.object:id() == id then
+                            c_netid = n_id
+                            if n_id == netid then is_requester = true end
+                            break
+                        end
+                    end
+                end
+                
+                local se_obj = sim:object(id)
+                if se_obj then
+                    network_top[#network_top+1] = {
+                        netid = c_netid,
+                        name = se_obj:character_name(),
+                        rank = is_requester and client_rank or se_obj:rank(),
+                        comm = se_obj:community(),
+                        rep = se_obj:reputation(),
+                        icon = se_obj:character_icon() or "ui\\ui_noise",
+                        rank_name = ranks.get_se_obj_rank_name(se_obj),
+                        rep_name = string.gsub(utils_obj.get_reputation_name(se_obj:reputation()), "st_reputation_", "")
+                    }
+                end
+            end
+        end
+        
+        local payload = {
+            top = network_top,
+            place = client_place
+        }
+        GameManager:OnICustomScriptAction("pda", "client_receive_ranking", serialize_table_simple(payload), false, netid)
+    end
+    pda.client_receive_ranking = function(payload)
+        if IIsHost() then return end
+        local network_top = payload.top
+        local client_place = tonumber(payload.place) or 9999
+        local my_netid = GameManager:GetMySNETID()
+
+        pda.coc_ranking_list = {}
+        pda.network_ranking_top = {}
+        pda.actor_rank_place = client_place
+
+        local in_top = false
+        for i, entry in ipairs(network_top) do
+            if entry.netid == my_netid then
+                pda.coc_ranking_list[i] = 0
+                pda.network_ranking_top[0] = entry
+                in_top = true
+            else
+                local pseudo_id = 65535 + i 
+                pda.coc_ranking_list[i] = pseudo_id
+                pda.network_ranking_top[pseudo_id] = entry
+            end
+        end
+        if not in_top then
+            pda.network_ranking_top[0] = {
+                name = db.actor:character_name(),
+                rank = db.actor:character_rank(),
+                comm = db.actor:character_community(),
+                rep = db.actor:character_reputation(),
+                icon = db.actor:character_icon() or "ui\\ui_noise",
+                rank_name = ranks.get_obj_rank_name(db.actor),
+                rep_name = string.gsub(utils_obj.get_reputation_name(db.actor:character_reputation()), "st_reputation_", "")
+            }
+        end
+        pda.coc_ranking_list[pda.get_rankings_array_size() + 1] = 0
+    end
+    pda.coc_rankings_can_show = function(index)
+        if IIsHost() then return orig_coc_rankings_can_show(index) end
+        if has_alife_info("ui_pda_hide") then return false end
+        if not pda.coc_ranking_list then return false end
+        local id = pda.coc_ranking_list[index]
+        return id and pda.network_ranking_top and pda.network_ranking_top[id] ~= nil
+    end
+    pda.coc_rankings_set_name = function(index)
+        if IIsHost() then return orig_coc_rankings_set_name(index) end
+        if not pda.coc_ranking_list then return "" end
+        local id = pda.coc_ranking_list[index]
+        local entry = id and pda.network_ranking_top and pda.network_ranking_top[id]
+        if entry then
+            return strformat("%s. %s", id == 0 and pda.actor_rank_place or index, entry.name)
+        end
+        return ""
+    end
+    pda.coc_rankings_set_description = function(index)
+        if IIsHost() then return orig_coc_rankings_set_description(index) end
+        if not pda.coc_ranking_list then return "" end
+        local id = pda.coc_ranking_list[index]
+        local entry = id and pda.network_ranking_top and pda.network_ranking_top[id]
+        if entry then
+            if id == 0 and db.actor then
+                entry.rank = db.actor:character_rank()
+                entry.rank_name = ranks.get_obj_rank_name(db.actor)
+                entry.rep = db.actor:character_reputation()
+                entry.rep_name = string.gsub(utils_obj.get_reputation_name(db.actor:character_reputation()), "st_reputation_", "")
+                entry.comm = db.actor:character_community()
+            end
+
+            local faction_color = "%c[255,255,255,1]"
+            if (game_relations.is_factions_enemies(db.actor:character_community(), entry.comm)) then
+                faction_color = "%c[255,255,1,1]"
+            elseif (game_relations.is_factions_friends(db.actor:character_community(), entry.comm)) then
+                faction_color = "%c[255,1,255,1]"
+            end
+
+            local repu_color = "%c[255,255,255,1]"
+            if (entry.rep <= -500) then repu_color = "%c[255,255,1,1]"
+            elseif (entry.rep >= 500) then repu_color = "%c[255,1,255,1]" end
+
+            local faction_str = game.translate_string("ui_st_community") .. ": " .. faction_color .. game.translate_string(entry.comm) .. "%c[default]"
+            local rank_str = game.translate_string("ui_st_rank") .. ": " .. "%c[255,215,215,215]" .. game.translate_string("st_rank_" .. entry.rank_name) .. " %c[255,110,110,255]" .. entry.rank .. "%c[default]"
+            local repu_str = game.translate_string("ui_st_reputation") .. ": " .. repu_color .. game.translate_string("st_reputation_" .. entry.rep_name) .. "%c[default]"
+
+            return strformat([[ %s \n %s \n %s]], faction_str, rank_str, repu_str)
+        end
+        return ""
+    end
+    pda.coc_rankings_set_icon = function(index)
+        if IIsHost() then return orig_coc_rankings_set_icon(index) end
+        if not pda.coc_ranking_list then return "ui\\ui_noise" end
+        local id = pda.coc_ranking_list[index]
+        local entry = id and pda.network_ranking_top and pda.network_ranking_top[id]
+        if entry then
+            if id == 0 then return db.actor:character_icon() end
+            return entry.icon or "ui\\ui_noise"
+        end
+        return "ui\\ui_noise"
+    end
+    pda.coc_rankings_show_border = function(index)
+        if IIsHost() then return orig_coc_rankings_show_border(index) end
+        if not pda.coc_ranking_list then return false end
+        local id = pda.coc_ranking_list[index]
+        return id == 0
+    end
+    news_manager.send_tip_client = function(data)
+        if not db.actor then return end
+        if type(data[3]) == "number" then
+            local local_id = GameManager:GetLocalIDByServerID(data[3])
+            data[3] = level.object_by_id(local_id)
+        end
+        OLDSENDTIP(db.actor, data[1], data[2], data[3], data[4], data[5])
+    end
+    news_manager.send_tip = function(actor, news_id, timeout, sender, showtime, sender_id, IsGlobal)
+        if not actor then return end
+        OLDSENDTIP(actor, news_id, timeout, sender, showtime, sender_id)
+        if IsGlobal then
+            if type(sender) == "userdata" and sender.id then
+                sender = GameManager:GetServerIDByLocalID(sender:id())
+            end
+            GameManager:OnICustomScriptAction("news_manager", "send_tip_client", serialize_table_simple({ news_id, timeout, sender, showtime, sender_id }), false)
+        end
+    end
+    dynamic_news_helper.send_tip_client = function(data)
+        OLD_DYN_SENDTIP(data[1], data[2], data[3], data[4], data[5], data[6], data[7], true)
+    end
+    dynamic_news_helper.send_tip = function(...)
+        if IIsHost() then
+            OLD_DYN_SENDTIP(...)
+            GameManager:OnICustomScriptAction("dynamic_news_helper", "send_tip_client", serialize_table_simple({ ... }), false)
+        end
+    end
+    xr_effects.reward_random_money = function(actor, npc, p)
+        local multi = game_difficulties.get_eco_factor("rewards") or 1
+        local min_val = ( (tonumber(p[1]) or 500) * multi ) / 50
+        local max_val = ( (tonumber(p[2]) or (min_val + 1000)) * multi ) / 50
+        local money = math.random( math.ceil(min_val), math.ceil(max_val) ) * 50
+        db.actor:give_money(money)
+	    news_manager.relocate_money(db.actor, "in", money)
+        -- Sync random reward_random_money
+        local cmd = string.format("db.actor:give_money(%d); news_manager.relocate_money(db.actor, 'in', %d)", money, money)
+        GameManager:OnICustomScriptAction(cmd, false)
+    end
+    xr_effects.reward_random_money_by_dist = function(actor,npc, p)
+        local var = load_var(db.actor, p[1])
+        local lvl_task = var and var.lvl_task or level.name()
+        local lvl_target = var and var.lvl_target
+        local n = lvl_task and lvl_target and txr_routes.get_shortest_path_num(lvl_task, lvl_target) or 1
+        local multi = game_difficulties.get_eco_factor("rewards") or 1
+        local min_val = (tonumber(p[2]) or 500) * multi / 50
+        local max_val = (tonumber(p[3]) or (min_val + 1000)) * multi / 50
+        local money = math.random( math.ceil(min_val), math.ceil(max_val) ) * 50
+        local sweets = math.ceil(n * money * tonumber(p[4] or 0.2))
+        local total = money + sweets
+        db.actor:give_money(total)
+	    news_manager.relocate_money(db.actor, "in", total)
+        -- Reward reward_random_money_by_dist
+        local cmd = string.format("db.actor:give_money(%d); news_manager.relocate_money(db.actor, 'in', %d)", total, total)
+        GameManager:OnICustomScriptAction(cmd, false)
+    end
+    xr_effects.reward_item = function(actor, npc, p)
+        if not (p and p[1]) then return end
+        local section_d = p[1]
+        local section, uses = utils_item.get_defined_uses(section_d)
+        if section == "" or not ini_sys:section_exist(section) then
+            printe("!ERROR reward_item | section[%s] doesn't exist", section)
+            return
+        end
+        local cond = nil
+        local cls = ini_sys:r_string_ex(section, "class")
+        if cls and string.find(cls, "WP_", 1, true) and cls ~= "WP_KNIFE" then
+            cond = math.random(70, 90) / 100
+        elseif IsItem("multiuse", section) then
+            if not uses then
+                local max_uses = ini_sys:r_float_ex(section, "max_uses") or 1
+                uses = math.random(1, max_uses)
+            end
+        end
+        local params = { }
+        if cond then params.cond = cond end
+        if uses then params.uses = uses end
+        -- Sync reward item
+        alife_create_item(section, db.actor, params)
+        news_manager.relocate_item(db.actor, 'in', section, 1)
+        local cmd = string.format("alife_create_item(%q, db.actor, %s); news_manager.relocate_item(db.actor, 'in', %q, 1)", section, serialize_table_simple(params), section)
+        GameManager:OnICustomScriptAction(cmd, false)
+    end
+    xr_effects.drx_sl_reward_random_artefact = function(actor, npc, p)
+        if not p or not p[1] or not p[2] then return end
+        	local reward_items = {
+            -- Tier 1
+            "af_itcher",
+            "af_blood",
+            "af_electra_sparkler",
+            "af_cristall_flower",
+            "af_medusa",
+            "af_night_star",
+            "af_dummy_glassbeads",
+            "af_dummy_battery",
+            "af_soul",
+            -- Tier 2
+            "af_pin",
+            "af_mincer_meat",
+            "af_sponge",
+            "af_lobster_eyes",
+            "af_vyvert",
+            "af_cristall",
+            "af_bracelet",
+            "af_ring",
+            "af_electra_moonlight",
+            "af_empty",
+            "af_gravi",
+            "af_eye",
+            "af_dummy_dummy",
+            "af_fuzz_kolobok",
+            -- Tier 3
+            "af_fireball",
+            "af_baloon",
+            "af_electra_flash",
+            "af_black_spray",
+            "af_full_empty",
+            "af_gold_fish",
+            "af_fire",
+            "af_ice",
+            "af_glass",
+        }
+
+        local reward_tbl = {
+            [4000] = 5,
+            [5000] = 9,
+            [6000] = 14,
+            [7000] = 15,
+            [9000] = 19,
+            [10000] = 20,
+            [15000] = 23,
+            [20000] = 27,
+            [25000] = 32,
+        }
+        -- Min
+        local min_reward_value = tonumber(p[1])
+        local min_reward_no = 1
+        for val, no in spairs(reward_tbl, function(t,a,b) return a < b end) do
+            if min_reward_value >= val then
+                min_reward_no = no
+            end
+        end
+        -- Max
+        local max_reward_value = tonumber(p[2])
+        local max_reward_no = 24
+        for val, no in spairs(reward_tbl, function(t,a,b) return a > b end) do
+            if max_reward_value < val then
+                max_reward_no = no - 1
+            end
+        end
+        -- Syncling things
+        local section = reward_items[math.random(min_reward_no, max_reward_no)]
+        alife_create_item(section, db.actor)
+        news_manager.relocate_item(db.actor, 'in', section, 1)
+        local cmd = string.format("alife_create_item(%q, db.actor, %s); news_manager.relocate_item(db.actor, 'in', %q, 1)", section, "{}", section)
+        GameManager:OnICustomScriptAction(cmd, false)
+    end
+    level_input.flags = {}
+    level_input.action_quick_save = function(...)
+    local dev = device()
+        if not (db.actor:alive() and actor_menu.is_hud_free()) then
+            return false
+        end
+        if level.present() then
+            level_input.flags.ret = false
+            SendScriptCallback("on_before_save_input", level_input.flags, 2, game.translate_string("st_ui_save"))
+            if level_input.flags.ret then
+                return true
+            end
+        end
+        if not dev:is_paused() then
+            dev:pause(true)
+        end
+        local hours = level.get_time_hours()
+        local mins = level.get_time_minutes()
+        local htag = IIsHost() and "_host" or "_client"
+        exec_console_cmd("save " .. tostring(level.name()) .. " " .. tostring(hours) .. "-" .. tostring(mins) .. htag)
+        if dev:is_paused() then
+            dev:pause(false)
+        end
+        return true
+    end
+    xr_effects.anim_obj_forward = function(actor, npc, p)
+        for _, v in pairs(p) do
+            local obj = v and db.anim_obj_by_name[v]
+            if obj then obj:anim_forward() end
+        end
+    end
+    -- We can send dissasembly ping to host, but it's need to rewrite logic of this script. Better here
+    item_parts.func_disassembly = function (obj, obj_d)
+        local hparent = obj:parent()
+        if not IIsHost() and hparent and hparent:id() ~= db.actor:id() then
+            hparent:transfer_item(obj, db.actor)
+            CreateTimeEvent(0, "client_disa_"..tostring(obj:id()), 0.2, function ()
+                OLDDISFUNC(obj, obj_d)
+                return true
+            end)
+            return true
+        end
+        return OLDDISFUNC(obj, obj_d)
+    end
+    ui_mutant_loot.remote_monster_looted = function(packet)
+        local id = GameManager:GetLocalIDByServerID(packet[1])
+        local obj = level.object_by_id(id)
+        local flag = packet[3]
+        if not obj then return end
+        -- Save loot table for property
+        save_var(obj, "loot", packet[2])
+        -- Block loot if we have looted all...
+        se_save_var(id, obj:name(), "looted", flag)
+        -- NPC can do something
+        xr_corpse_detection.set_valuable_loot(id, not flag)
+        if ui_mutant_loot.GUI and ui_mutant_loot.GUI:IsShown() and ui_mutant_loot.GUI.id == id then
+            --ui_mutant_loot.GUI:SetMutantState()
+            ui_mutant_loot.GUI:HideDialog()
+            Unregister_UI("UIMutantLoot")
+        end
+    end
+    function ui_mutant_loot.UIMutantLoot:Reset(...)
+        OLDLOOTRST(self, ...)
+        -- Send sync list that's in monster blyat
+        local payload = { GameManager:GetServerIDByLocalID(self.id), self.loot, false }
+        GameManager:OnICustomScriptAction("ui_mutant_loot", "remote_monster_looted", serialize_table_simple(payload), false)
+    end
+    function ui_mutant_loot.UIMutantLoot:Loot(...)
+        OLDLOOTALL(self, ...)
+        -- Send to all that we looted this fucking shit meat!
+        local payload = { GameManager:GetServerIDByLocalID(self.id), self.loot, ... }
+        GameManager:OnICustomScriptAction("ui_mutant_loot", "remote_monster_looted", serialize_table_simple(payload), false)
+    end
+    bind_awr.request_access_acept = function ()
+        local workshop_ui_ref = ui_workshop.get_workshop_ui(GUI, nil, {false, false, false, false, false}, true)
+        if not workshop_ui_ref then return end
+        workshop_ui_ref:ShowDialog(true)
+    end
+    bind_awr.request_access_tiski = function (data)
+        local obj = level.object_by_id(data[1])
+        if not (obj and string.match(obj:name(), "awr_tiski") and bind_awr.access(obj)) then
+            return
+        end
+        -- Send response
+        GameManager:OnICustomScriptAction("bind_awr.request_access_acept()", false, data[2])
+    end
+    _G.alife_object = function(id)
+        return type(id) == "number" and id ~= 65535 and alife():object(id) or nil
+    end
+    MPMain_QuestPatches_STOGETHER.Patch()
+    -- End of basic game fixes!
+    -- Begin of patches for addons and other shit
+    if PATCOOPADDONS then PATCOOPADDONS.Patch() end
+end
+
+treasure_manager.get_stash_spot_type = function(id)
+    if level.map_has_object_spot(id, "treasure_unique") ~= 0 then
+        return "treasure_unique"
+    elseif level.map_has_object_spot(id, "treasure_searched") ~= 0 then
+        return "treasure_searched"
+    elseif level.map_has_object_spot(id, "treasure") ~= 0 then
+        return "treasure"
+    end
+    return nil
+end
+
+function receive_special_sync(item_parts_data, usables, conditions)
+    local obtained_id_from = (item_parts_data and item_parts_data[1]) or (usables and usables[1]) or (conditions and conditions[1])
+    local obtained_var_from = (item_parts_data and item_parts_data[2]) or (usables and usables[2]) or (conditions and conditions[2])
+	if not (obtained_id_from and obtained_var_from) then return end
+    local id = GameManager:GetLocalIDByServerID(obtained_id_from)
+    CreateTimeEvent(id, "receive_special_sync", 0.1, function ()
+        local obj = level.object_by_id(id)
+        if not obj then return false end
+        local IsUsables = usables and obj:get_remaining_uses() ~= obtained_var_from
+        local IsCondata = conditions and obj:condition() ~= obtained_var_from
+        log("Overwritting remain uses data for object ID: " .. tostring(id))
+        if IsUsables then
+            log("Overwritting remain uses data for object ID: " .. tostring(id))
+            obj:set_remaining_uses(obtained_var_from)
+        elseif IsCondata then
+            log("Overwritting conditions data for object ID: " .. tostring(id))
+            obj:set_condition(obtained_var_from)
+        elseif item_parts_data then
+            log("Overwritting parts data for object ID: " .. tostring(id))
+            item_parts.set_parts_con(id, obtained_var_from)
+        end
+        return true
+    end)
+end
+
+function engine_perform_special_sync(id, ToPlayerNetID)
+    CreateTimeEvent(id, "send_special_sync", 0.1, function ()
+        local obj = level.object_by_id(id)
+        local srv_id = GameManager:GetServerIDByLocalID(id)
+        if not obj then return false end
+        -- Sync pda info on tranfer or spawn...
+        local info = se_load_var(id, nil, "info")
+        if info then
+            log("Obtaining pda info data! object ID: " .. tostring(id))
+            local payload = { srv_id, info }
+            GameManager:OnICustomScriptAction("ui_pda_npc_tab", "remote_receive_pda_info", serialize_table_simple(payload), false)
+        -- Sync item/outfit/headgear condition
+        elseif IsWeapon(obj) or IsOutfit(obj) or IsHeadgear(obj) then
+            log("Obtaining weapon/armour parts data! object ID: " .. tostring(id))
+            local payload = serialize_table_simple({ srv_id, item_parts.get_parts_con(obj, id, true) }) .. ", nil, nil"
+            GameManager:OnICustomScriptAction("MPMain_GamePatches_STOGETHER", "receive_special_sync", payload, false, ToPlayerNetID or 0)
+        -- Sync item uses remain
+        elseif IsItem("multiuse", obj:section()) and obj:get_remaining_uses() ~= obj:get_max_uses() then
+            log("Obtaining multiuse data! object ID: " .. tostring(id))
+            local payload = "nil, " .. serialize_table_simple({ srv_id, obj:get_remaining_uses() }) .. ", nil"
+            GameManager:OnICustomScriptAction("MPMain_GamePatches_STOGETHER", "receive_special_sync", payload, false, ToPlayerNetID or 0)
+        -- Sync item condition %
+        elseif utils_item.is_degradable(obj, obj:section()) and obj:condition() ~= 1 then
+            log("Obtaining degradable data! object ID: " .. tostring(id))
+            local payload = "nil, nil, " .. serialize_table_simple({ srv_id, obj:condition() })
+            GameManager:OnICustomScriptAction("MPMain_GamePatches_STOGETHER", "receive_special_sync", payload, false, ToPlayerNetID or 0)
+        end
+        return true
+    end)
+    -- Perform special sync of addons data
+    if PATCOOPADDONS then PATCOOPADDONS.engine_perform_special_addon_sync(id, ToPlayerNetID) end
+end
+
+function remote_sync_rank(tbl)
+    if not db.actor then return end
+    local netid = tbl[3]
+    local rank = tbl[2]
+    local local_id = GameManager:GetLocalIDByServerID(tbl[1])
+    if tbl[3] then
+        -- Players
+        if netid == GameManager:GetMySNETID() then
+            db.actor:set_character_rank(tbl[2])
+            game_statistics.increment_statistic(tbl[4] and "killed_monsters" or "killed_stalkers")
+        else
+            for _, v in pairs(db.actors) do
+                if v and v.object and v.snetid == netid then
+                    v.object:set_character_rank(rank)
+                    break
+                end
+            end
+        end
+    else -- Other people and objects...
+        local obj = level.object_by_id(local_id)
+        if not obj or not IsStalker(obj) then return end
+        obj:set_character_rank(rank)
+    end
+end
+
+function on_entity_death(victim, killer)
+    if not (victim and killer) then return end
+    if IIsHost() then
+        local payload = { killer:id(), killer:character_rank(), IsActor(killer) and killer:GetNetID() or false, IsMonster(victim) }
+        GameManager:OnICustomScriptAction("MPMain_GamePatches_STOGETHER", "remote_sync_rank", serialize_table_simple(payload), false)
+        for slot = 1, 4 do
+            local weapon = victim:item_in_slot(slot) or victim:active_item()
+            if weapon then
+                CreateTimeEvent(weapon:id(), "transfer_item_mp", 0.1, function (weapon_id)
+                    local nweapon = level.object_by_id(weapon_id)
+                    if not nweapon then return true end
+                    if not nweapon:parent() then victim:transfer_item(nweapon, victim) end
+                    return nweapon:parent()
+                end, weapon:id())
+            end
+        end
+    end
+    if IsMonster(victim) or IIsHost() then return end
+    -- ==== Idea of `EnotPenetrator` about how to fix weapon drop in npc ===
+    -- Werasik2aa: Reworked code. To remove useless thing
+    -- Place all from slot to inventory or if client releases that item what was. IDK why it's full condition and remains still.
+    CreateTimeEvent(victim:id(), "transfer_item_mp", 0.1, function (weapon_id)
+        victim:iterate_inventory(function(_, obj)
+            if obj and IsWeapon(obj) then
+                alife_release(obj)
+            end
+        end, victim)
+        return true
+    end)
+end
+
+function on_game_start()
+    -- Treasure manager take action sync
+    RegisterScriptCallback("actor_on_item_take_from_box", function (box, itm)
+        if treasure_manager.caches[box:id()] then
+            GameManager:OnICustomScriptAction("treasure_manager", "remote_client_clear_treasure", tostring(GameManager:GetServerIDByLocalID(box:id())), false)
+        end
+    end)
+    -- Ranking sync...
+    RegisterScriptCallback("npc_on_death_callback", on_entity_death)
+    RegisterScriptCallback("monster_on_death_callback", on_entity_death)
+end

@@ -1,0 +1,298 @@
+local client_tracked_spots = {}
+local GameManager = SteamGameManager()
+local faction_spots = {
+    ["stalker"]  = "warfare_stalker_spot",
+    ["bandit"]   = "warfare_bandit_spot",
+    ["csky"]     = "warfare_csky_spot",
+    ["army"]     = "warfare_army_spot",
+    ["freedom"]  = "warfare_freedom_spot",
+    ["dolg"]     = "warfare_duty_spot",
+    ["ecolog"]   = "warfare_ecolog_spot",
+    ["killer"]   = "warfare_killer_spot",
+    ["monolith"] = "warfare_monolith_spot",
+    ["renegade"] = "warfare_renegade_spot",
+    ["greh"]     = "warfare_greh_spot",
+    ["isg"]      = "warfare_isg_spot",
+    ["zombied"]  = "warfare_zombied_spot"
+}
+
+local id_to_fac = {
+    [1] = "stalker",
+    [2] = "bandit",
+    [3] = "csky",
+    [4] = "army",
+    [5] = "freedom",
+    [6] = "dolg",
+    [7] = "ecolog",
+    [8] = "killer",
+    [9] = "monolith",
+    [10] = "greh",
+    [11] = "renegade",
+    [12] = "isg",
+    [13] = "zombied",
+    [14] = "monster"
+}
+
+local fac_to_id = {}
+for k, v in pairs(id_to_fac) do fac_to_id[v] = k end
+local important_spots = {
+    "ui_pda2_trader_location",
+    "ui_pda2_mechanic_location",
+    "ui_pda2_medic_location",
+    "ui_pda2_barman_location",
+    "ui_pda2_quest_npc_location",
+    "ui_pda2_special_location",
+    "ui_pda2_scout_location"
+}
+local idx_to_spot = {
+    [1] = "ui_pda2_trader_location",
+    [2] = "ui_pda2_mechanic_location",
+    [3] = "ui_pda2_medic_location",
+    [4] = "ui_pda2_barman_location",
+    [5] = "ui_pda2_quest_npc_location",
+    [6] = "ui_pda2_special_location",
+    [7] = "ui_pda2_scout_location"
+}
+
+-- ======================================================================
+-- СЕТЕВАЯ СИНХРОНИЗАЦИЯ МЕТОК
+-- ======================================================================
+
+function sync_story_npc_markers(SNETID)
+    if not IIsHost() then return end
+    local important_spots = {
+        "ui_pda2_trader_location",
+        "ui_pda2_mechanic_location",
+        "ui_pda2_medic_location",
+        "ui_pda2_barman_location",
+        "ui_pda2_quest_npc_location",
+        "ui_pda2_special_location",
+        "ui_pda2_scout_location"
+    }
+
+    local marker_list = {}
+    local sim = alife()
+    for i = 1, 65534 do
+        local se_obj = sim:object(i)
+        if se_obj and IsStalker(se_obj) then
+            for _, spot in ipairs(important_spots) do
+                if level.map_has_object_spot(i, spot) ~= 0 then
+                    marker_list[#marker_list + 1] = { i, spot }
+                end
+            end
+        end
+    end
+
+    GameManager:OnICustomScriptAction("MPMain_SpotsSync_STOGETHER", "rcm", serialize_table_simple(marker_list), true, SNETID)
+end
+
+function sync_map_spots(SNETID)
+    if not IIsHost() then return end
+
+    local squads_data = {}
+    local gg = game_graph()
+    local host_level_id = gg:vertex(db.actor:game_vertex_id()):level_id()
+    local actor_comm = get_actor_true_community()
+
+    local sim = alife()
+    for id, _ in pairs(SIMBOARD.squads) do
+        local squad = sim:object(id)
+        if squad and IsSquad(squad) and squad:npc_count() > 0 then
+            if squad.player_id ~= "monster" and squad.player_id ~= "zombied" and not is_squad_monster[squad.player_id] then
+                local squad_lvl_id = gg:vertex(squad.m_game_vertex_id):level_id()
+                if squad_lvl_id == host_level_id and not game_relations.is_factions_enemies(actor_comm, squad.player_id) then
+                    squads_data[#squads_data + 1] = { id, fac_to_id[squad.player_id] or 1, squad:commander_id() or 0 }
+                end
+            end
+        end
+    end
+
+    if #squads_data == 0 then return end
+    GameManager:OnICustomScriptAction("MPMain_SpotsSync_STOGETHER", "remote_map_spots", serialize_table_simple(squads_data), true, SNETID)
+end
+
+function remote_map_spots(t)
+    if IIsHost() then return end
+
+    printf("[PDA_LOG] Received packet with %s entries", #t)
+
+    for _, entry in ipairs(t) do
+        local srv_id = entry[1]
+        local fac_id = entry[2]
+        local srv_comm_id = entry[3] -- Мы добавили это в sync_map_spots
+
+        if srv_id and fac_id then
+            local loc_id = GameManager:GetLocalIDByServerID(srv_comm_id or srv_id)
+            if loc_id and loc_id ~= 65535 then
+                printf("[PDA_LOG] Mapped SrvID: %s to LocID: %s (%s)", srv_id, loc_id, id_to_fac[fac_id])
+                client_tracked_spots[loc_id] = {
+                    fac = id_to_fac[fac_id] or "stalker",
+                    spot = "none",
+                    last_seen = time_global()
+                }
+            else
+                -- Если это происходит, значит клиент еще "не знает" об этом объекте
+                printf("[PDA_LOG] Failed to map SrvID:%s (Object not synced yet)", srv_id)
+            end
+        end
+    end
+end
+
+function rcm(clean_payload)
+    if IIsHost() then return end
+    -- Разбиваем чанк на отдельные записи (ID:Тип_Метки)
+    for _, marker_data in ipairs(clean_payload) do
+        local srv_id = marker_data[1]
+        local spot_type = marker_data[2] -- тут приходит строка "ui_pda2_trader_location"
+
+        if srv_id and spot_type then
+            -- МАГИЯ ID: превращаем ID Хоста в локальный ID Клиента
+            -- Если метки еще нет — ставим
+            local loc_id = GameManager:GetLocalIDByServerID(srv_id)
+            if loc_id ~= 65535 and level.map_has_object_spot(loc_id, spot_type) == 0 then
+                local se_obj = alife_object(loc_id)
+                local name = se_obj and se_obj:character_name() or ""
+                level.map_add_object_spot(loc_id, spot_type, name)
+            end
+        end
+    end
+end
+
+function rsm(srv_id, spot_idx)
+    if IIsHost() then return end
+    if srv_id and spot_idx then
+        local loc_id = GameManager:GetLocalIDByServerID(srv_id)
+        local spot_type = idx_to_spot[spot_idx]
+
+        if loc_id and loc_id ~= 65535 and spot_type then
+            if level.map_has_object_spot(loc_id, spot_type) == 0 then
+                local se_obj = alife_object(loc_id)
+                level.map_add_object_spot(loc_id, spot_type, se_obj and se_obj:character_name() or "")
+            end
+        end
+    end
+end
+
+function force_clear_dynamic_spots()
+    if IIsHost() then return end
+    for srv_id, info in pairs(client_tracked_spots) do
+        local loc_id = GameManager:GetLocalIDByServerID(srv_id)
+        local id_to_remove = (loc_id and loc_id ~= 65535) and loc_id or info.last_loc_id
+        if id_to_remove then
+            for fac_name, spot_type in pairs(faction_spots) do
+                level.map_remove_object_spot(id_to_remove, spot_type)
+            end
+            printf("[PDA-SYSTEM] Hard cleared all dynamic spots from npc %s", id_to_remove)
+        end
+        info.spot = "none"
+    end
+end
+
+function render_pda_spots()
+    if IIsHost() then return end
+    if not db.actor then return end
+
+    local pda_obj = db.actor:item_in_slot(8)
+    local has_pda = pda_obj ~= nil
+    local pda_sec = has_pda and pda_obj:section() or "none"
+    local my_level = level.name()
+    local my_comm = get_actor_true_community()
+
+    local can_see_friends = (pda_sec == "device_pda_2" or pda_sec == "device_pda_3")
+    local can_see_neutrals = (pda_sec == "device_pda_3")
+
+    for srv_id, info in pairs(client_tracked_spots) do
+        local target_spot = "none"
+        local loc_id = GameManager:GetLocalIDByServerID(srv_id)
+
+        if has_pda and loc_id and loc_id ~= 65535 then
+            local se_obj = alife_object(loc_id)
+            if se_obj and alife():level_name(game_graph():vertex(se_obj.m_game_vertex_id):level_id()) == my_level then
+                local has_important_spot = false
+                for _, spot_name in ipairs(important_spots) do
+                    if level.map_has_object_spot(loc_id, spot_name) ~= 0 then
+                        has_important_spot = true
+                        break
+                    end
+                end
+                if not has_important_spot then
+                    local is_friend = (my_comm == info.fac) or game_relations.is_factions_friends(my_comm, info.fac)
+                    local is_enemy = game_relations.is_factions_enemies(my_comm, info.fac)
+
+                    if (is_friend and can_see_friends) or (not is_friend and not is_enemy and can_see_neutrals) then
+                        target_spot = faction_spots[info.fac] or "warfare_stalker_spot"
+                    end
+                end
+            end
+        end
+        if target_spot ~= info.spot then
+            local id_to_remove = (loc_id and loc_id ~= 65535) and loc_id or info.last_loc_id
+            if id_to_remove and info.spot ~= "none" then
+                level.map_remove_object_spot(id_to_remove, info.spot)
+            end
+            if target_spot ~= "none" and loc_id then
+                level.map_add_object_spot(loc_id, target_spot, game.translate_string(info.fac))
+                info.last_loc_id = loc_id
+            end
+            info.spot = target_spot
+        end
+    end
+end
+
+-- КЛИЕНТ: Мгновенное удаление при смерти
+function on_client_object_death(obj)
+    if IIsHost() or not obj then return end
+    local id = obj:id()
+    local info = client_tracked_spots[id]
+    if info and info.spot ~= "none" then
+        level.map_remove_object_spot(id, info.spot)
+        client_tracked_spots[id] = nil
+    end
+end
+
+function cleanup_stale_spots()
+    if IIsHost() then return end
+    local tg = time_global()
+    local TTL_LIMIT = 60000
+    for srv_id, info in pairs(client_tracked_spots) do
+        if info.last_seen and (tg - info.last_seen) > TTL_LIMIT then
+            if info.last_loc_id and info.spot ~= "none" then
+                level.map_remove_object_spot(info.last_loc_id, info.spot)
+            end
+            client_tracked_spots[srv_id] = nil
+            printf("[PDA-CLEANUP] Deleted ghost squad srv_id:%s (TTL Expired)", srv_id)
+        end
+    end
+end
+
+function on_item_to_ruck(obj)
+    if IIsHost() or not (obj and db.actor) then return end
+
+    if string.find(obj:section(), "device_pda", 1, true) then
+        printf("[PDA-SYSTEM] PDA removed. Clearing dynamic spots...")
+        force_clear_dynamic_spots()
+    end
+end
+
+function on_item_to_slot(obj)
+    if IIsHost() or not (obj and db.actor) then return end
+
+    if string.find(obj:section(), "device_pda", 1, true) then
+        printf("[PDA-SYSTEM] PDA equipped. Refreshing spots...")
+        force_clear_dynamic_spots()
+        CreateTimeEvent(0, "pda_refresh_delay", 0.1, function()
+            render_pda_spots()
+            return true
+        end)
+    end
+end
+
+function on_game_load()
+end
+
+function on_game_start()
+    RegisterScriptCallback("on_game_load", on_game_load)
+    RegisterScriptCallback("npc_on_death_callback", on_client_object_death)
+    RegisterScriptCallback("actor_item_to_slot", on_item_to_slot)
+    RegisterScriptCallback("actor_item_to_ruck", on_item_to_ruck)
+end

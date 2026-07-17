@@ -1,0 +1,110 @@
+function actor_init(npc)
+	npc:bind_object(actor_binder_mp(npc))
+end
+----------------------------------------------------------------------------------------------------------------------
+class "actor_binder_mp" (object_binder)
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:__init (obj) super(obj)
+end
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:net_spawn(se_abstract)
+	if not object_binder.net_spawn(self, se_abstract) then
+		return false
+	end
+	
+    log("Adding map point. Adding to list for player marks handler")
+    level.map_add_object_spot(self.object:id(), "green_spot", tostring(self.object:character_name()))
+	self.object:set_callback(callback.hit, self.mpactor_on_hit_callback, self)
+	self.object:set_callback(callback.item_to_ruck, self.mpactor_item_to_ruck, self)
+	self.object:set_callback(callback.on_item_take, self.mpactor_item_take, self)
+	self.object:set_callback(callback.take_item_from_box, self.mpactor_on_item_take_from_box, self)
+	self.object:set_callback(callback.on_item_drop, self.mpactor_on_item_drop, self)
+	self.object:set_callback(callback.weapon_fired, self.mpactor_on_weapon_fired, self)
+	self.object:set_callback(callback.weapon_no_ammo, self.mpactor_on_weapon_no_ammo, self)
+	self.object:set_callback(callback.use_object, self.mpactor_on_item_use, self)
+	self.object:set_callback(callback.item_to_slot, self.mpactor_item_to_slot, self)
+	db.actors[self.object:id()] = { object = self.object, st = self, netid = self.object:GetNetID() }
+	--db.storage[self.object:id()] = {}
+	--db.storage[self.object:id()].binder = self
+	--db.add_obj(self.object)
+	return true
+end
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:net_destroy()
+	log("[Client] On Player Disconnected")
+	local mss = "Player "..tostring(self.object:name()).." disconnected"
+	if db.actor then news_manager.send_tip(db.actor, mss, nil, "nano", 20000) end
+
+	-- Removing useless sht
+	log("Removing map point callback")
+
+	self.object:set_callback(callback.hit, nil)
+	self.object:set_callback(callback.item_to_ruck, nil)
+	self.object:set_callback(callback.on_item_drop, nil)
+	self.object:set_callback(callback.on_item_take, nil)
+	self.object:set_callback(callback.take_item_from_box, nil)
+	self.object:set_callback(callback.weapon_fired, nil)
+	self.object:set_callback(callback.weapon_no_ammo, nil)
+	self.object:set_callback(callback.use_object, nil)
+	self.object:set_callback(callback.item_to_slot, nil)
+	db.actors[self.object:id()] = nil
+	-- Downed/revival: forget a disconnecting peer so it can't deadlock the
+	-- all-players-downed failure check.
+	if MPMain_Downed_STOGETHER then MPMain_Downed_STOGETHER.on_peer_removed(self.object:GetNetID()) end
+	--db.del_obj(self.object)
+	object_binder.net_destroy(self)
+end
+function actor_binder_mp:mpactor_item_to_slot(item)
+	--SendScriptCallback("mpactor_item_to_slot",obj)
+end
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:mpactor_on_item_use(item)
+--SendScriptCallback("mpactor_on_item_use", self.object, item)
+end
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:mpactor_on_item_take_from_box(item)
+	--SendScriptCallback("mpactor_on_item_take_from_box", self.object, item)
+end
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:mpactor_item_take(item)
+	--SendScriptCallback("mpactor_on_item_take", self.object, item)
+
+end
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:mpactor_item_to_ruck(item)
+	--SendScriptCallback("mpactor_item_to_ruck", self.object, item)
+end
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:mpactor_on_item_drop(item)
+end
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:mpactor_on_weapon_fired(item1, item2, ammo_elapsed, grenade_elapsed, ammo_type, grenade_type)
+	--SendScriptCallback("mpactor_on_weapon_fired", self.object, item1, item2, ammo_elapsed, grenade_elapsed, ammo_type, grenade_type)
+end
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:mpactor_on_weapon_no_ammo(item, cammp)
+	--SendScriptCallback("mpactor_on_weapon_fired", self.object, item)
+end
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:mpactor_on_hit_callback(obj, amount, local_direction, who, bone_index)
+	--SendScriptCallback("mpactor_on_hit_callback", self.object, obj, amount, local_direction, who, bone_index)
+end
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:update(delta)
+	object_binder.update(self, delta)
+	--SendScriptCallback("mpactor_on_update", self.object)
+end
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:save(packet)
+	object_binder.save(self, packet)
+	-- HACKS.  Œ—“€À‹
+	MPMain_STOGETHER.GlobalLastPosition = db.actor:position()
+end
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:load(reader)
+	object_binder.load(self, reader)
+end
+----------------------------------------------------------------------------------------------------------------------
+function actor_binder_mp:reinit()
+	object_binder.reinit(self)
+end

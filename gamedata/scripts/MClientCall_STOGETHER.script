@@ -1,0 +1,195 @@
+--[[
+[================]
+C++ Programmer & Author: Werasik2aa
+Project Creator: Monokit
+Description: Client Callbacks.
+[================]
+--]]
+function OnConnected(state)
+    local mss = "Connected to server as"
+    local ass = state and "host!" or "client!"
+    if level.present() then
+        news_manager.send_tip(db.actor, mss.." "..ass, nil, "nano", 20000)
+        SendScriptCallback("onmp_connected", state)
+    elseif not MPMain_STOGETHER.GameLoaded then
+        local new_game_dlg = ui_mm_faction_select.UINewGame(ui_main_menu.INSTANCE)
+        new_game_dlg:ShowDialog(true)
+	end
+end
+
+function OnPlayerConnected(PlayerNetID, NickName)
+    local tostr = tostring
+    log("[Server] On Player Connected")
+    log("[Server] PlayerID: "..tostr(PlayerNetID))
+    log("[Server] PlayerNA: "..tostr(NickName))
+    if db.actor then
+        local mss = "Player "..tostr(NickName).." connected to level: "..tostr(level.name())
+        news_manager.send_tip(db.actor, mss, nil, "nano", 20000)
+    end
+    SendScriptCallback("onmp_player_connected", PlayerNetID, NickName)
+end
+
+function OnPlayerChangedLevel(PlayerNetID, SE_OBJ, NickName)
+    if not SE_OBJ then return end
+    log("[Client] On Player Changed Level")
+    log("[Client] NetID: "..tostring(PlayerNetID))
+    if db.actor then
+        local mss = "Player "..tostring(NickName).." changing level"
+        news_manager.send_tip(db.actor, mss, nil, "nano", 20000)
+    end
+    SendScriptCallback("onmp_player_changed_level", PlayerNetID, SE_OBJ, NickName)
+end
+
+function OnPlayerChatted(PlayerNetID, NickName, MSG)
+    local mss = NickName.."> "..tostring(MSG)
+    if db.actor then news_manager.send_tip(db.actor, mss, nil, "freedom2", 20000) end
+    local mchatclass = MChatbox_STOGETHER.GetChatBox()
+    if mchatclass then
+        mchatclass:AddMessage(mss)
+    end
+    SendScriptCallback("onmp_player_chatted_message", PlayerNetID, NickName, MSG)
+end
+
+function OnPlayerChangedVisual(PlayerNetID, SV_NAME)
+    SendScriptCallback("onmp_player_changed_visual", PlayerNetID, SV_NAME)
+end
+
+function OnPlayerInfoPortion(PlayerNetID, info_id, state)
+    SendScriptCallback("onmp_player_info_portion", PlayerNetID, info_id, state)
+end
+
+function OnEntitySpawned(se_obj)
+    if not se_obj then return end
+    MPMain_STOGETHER.AwaitThing = se_obj
+    SendScriptCallback("onmp_entity_spawned", se_obj)
+end
+
+function OnPlayerTask(PlayerNetID, TaskID, TaskGIVER, TaskMID, TaskSTATE, TaskStage)
+    local tostr = tostring
+    log("-[Client] ~~~ On Player Task Give ~~~")
+    log("[Client] PlayerID: "..tostr(PlayerNetID))
+    log("[Client] TaskID: "..tostr(TaskID))
+    log("[Client] Giver_ID: "..tostr(TaskGIVER))
+    log("[Client] MapObject_ID: "..tostr(TaskMID))
+    log("[Client] Task_State: "..tostr(TaskSTATE))
+    log("[Client] Task_Stage: "..tostr(TaskStage))
+    local tm = task_manager.get_task_manager()
+    -- UPDATE TASK
+    local tsk = tm.task_info[TaskID]
+    if tm and tsk then
+        tsk.current_target = TaskMID
+        if TaskSTATE == task.completed then
+            tsk.forced_status = "complete"
+            tsk.last_check_task = "complete"
+        elseif TaskSTATE == task.fail then
+            tsk.forced_status = "fail"
+            tsk.last_check_task = "fail"
+        end
+        tsk.stage = TaskStage
+        tsk.task_giver_id = TaskGIVER
+        if tsk.t then tsk.t:change_map_location(tsk.spot, TaskMID) end
+    elseif tm then -- GIVE TASK
+        tm:give_task_client(TaskID, TaskGIVER < 65535 and TaskGIVER or nil, PlayerNetID)
+    end
+    SendScriptCallback("onmp_player_task_data", PlayerNetID, TaskID, TaskGIVER, TaskMID, TaskSTATE, TaskStage)
+end
+
+function OnForcedTaskState(PlayerNetID, TaskID, TaskState)
+    local type_ = type
+    printf("-[Client] ~~~ On Forced Task State ~~~ \nPlayer: %s, \nTask: %s", PlayerNetID, TaskID)
+    local tm = task_manager.get_task_manager()
+    local tsk = tm.task_info[TaskID]
+    if not tsk then return end
+    tsk.forced_status = TaskState
+    tsk.last_check_task = TaskState
+    if TaskState ~= "complete" or type_(tsk.on_complete) ~= "table" then return end
+    -- Remove keys i find them
+    for i, cond_block in pairs(tsk.on_complete) do
+        if type_(cond_block) == "table" then
+            for j, effects_list in pairs(cond_block) do
+                if type_(effects_list) == "table" then
+                    for k = #effects_list, 1, -1 do
+                        local action = effects_list[k]
+                        if type_(action) == "table" and type_(action[1]) == "string" and MPMain_QuestPatches_STOGETHER.TaskBadFuncs[action[1]] then
+                            printf("-[Client] ---> REMOVED: %s", action[1])
+                            table.remove(effects_list, k)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+function OnPlayerInteracted(PlayerNetID, typea, ObjID, State)
+    local obj = level.object_by_id(ObjID)
+    if not obj then return end
+    if typea == 0 then
+        local cf = obj.get_campfire and obj:get_campfire()
+        if not cf then return end
+        if State and not cf:is_on() then
+            cf:turn_on()
+        elseif not State and cf:is_on() then
+            cf:turn_off()
+        else
+            log("!Man wtf about doying")
+        end
+    elseif typea == 1 then
+        OnPlayerOpenDoor(PlayerNetID, ObjID, State)
+    elseif typea == 2 then
+        OnPlayerSwitchButton(PlayerNetID, ObjID, State)
+    end
+    SendScriptCallback("onmp_player_interact", PlayerNetID, typea, ObjID, State)
+end
+
+function OnPlayerOpenDoor(PlayerNetID, DoorID, State)
+    local to = db.storage[DoorID]
+    local door = to and to.ph_door and to.ph_door.door_action
+    if not door or not door.open_door or not door.close_door then
+        callstack()
+        log("[Client] THIS DOOR DOESN'T EXIST")
+        return
+    end
+    -- get_wrapper of furniture? Just use this callback
+    log("[Client] Player with NetID "..tostring(PlayerNetID).." Used doorID"..tostring(DoorID))
+    if State then
+        door:close_door(false)
+    else
+        door:open_door(false)
+    end
+end
+
+function OnPlayerSwitchButton(PlayerNetID, ButtonID, state)
+    local to = db.storage[ButtonID]
+    local button = to and to.ph_button and to.ph_button.button_action
+    if not button or not button.use_callback then
+        callstack()
+        log("[Client] THIS BUTTON DOESN'T EXIST")
+        return
+    end
+    log("[Client] Player with NetID "..tostring(PlayerNetID).." Used buttonID"..tostring(ButtonID))
+    button:try_switch()
+end
+
+function OnPlaySound(Sound_Name, Position, NPID)
+    local obj = NPID ~= 65535 and level.object_by_id(NPID)
+    if not getFS():exist("$game_sounds$", Sound_Name..".ogg") then
+        if obj then
+            xr_sound.set_sound_play_client(NPID, Sound_Name, "stalker", sound_object.s2d)
+        else
+            xr_sound.set_sound_play_client(0, Sound_Name, "stalker", sound_object.s2d)
+        end
+        return
+    end
+    local snd = sound_object(Sound_Name)
+    if not snd then
+        log("![Client] Failed to play sound by path: "..tostring(Sound_Name))
+        return
+    end
+    log("[Client] Playing sound: "..tostring(Sound_Name))
+    if obj then
+        snd:play_no_feedback(obj, 0, 0, Position, 1.0, 1.0)
+    else
+        snd:play_no_feedback(db.actor, 0, 0, Position, 1.0, 1.0)
+    end
+end

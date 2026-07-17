@@ -1,0 +1,38 @@
+local loggi = false
+
+function get_log()
+    if not loggi and dph_debug_log then
+        local log_config = {
+            ["file"] = "dph_zcp.log",
+            ["targets"] = {
+          --      ["log"]     = 1,
+                ["gamelog"] = 1,
+            }
+        }
+        local modules = {
+            "loot",
+            "integration",
+            "population",
+            "civilwar",
+            "smart",
+            "simboard",
+            "anomalies"
+        }
+        loggi = dph_debug_log.new(log_config, modules)
+        if (smr_amain_mcm.get_config("smr_debug_log")) then
+            loggi.enable()
+        end
+    end
+    return loggi
+end
+
+function on_option_change()
+    if not loggi then return end
+	if smr_amain_mcm.get_config("smr_debug_log") then
+		loggi.enable()
+    else
+        loggi.disable()
+    end
+end
+
+RegisterScriptCallback("on_option_change", on_option_change)

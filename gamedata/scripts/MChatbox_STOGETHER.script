@@ -1,0 +1,93 @@
+--[[
+[================]
+C++ Programmer & Author: Werasik2aa
+Project Creator: Monokit
+Description: ChatBox. Open it to write text to players.
+[================]
+--]]
+GUI = nil
+function OpenClose()
+    GUI = GetChatBox()
+    if GUI then
+        if GUI:IsShown() then
+            GUI:Close()
+        else
+            GUI:Open(true)
+        end
+    end
+end
+function GetChatBox()
+    return GUI or ChatBox()
+end
+class "ChatBox" (CUIScriptWnd)
+function ChatBox:__init() super()
+    self.lines = {}
+    self:SetAutoDelete(true)
+    self:SetWndRect(Frect():set(0, 0, 1024, 768))
+    self.xml = CScriptXmlInit()
+    self.xml:ParseFile("chatbox.xml")
+    self.focus = false
+    self.showed = false
+    self.chat       = self.xml:InitStatic("main_chat", self)
+	self.chat_frame = self.xml:InitFrame("main_chat:frame_base", self.chat)
+	self.chat_input = self.xml:InitEditBox("main_chat:chat_input", self.chat)
+	self:Register(self.chat_input, "chat_input")
+    self.max_lines = 12
+    for i = 0, self.max_lines do
+        local txt = self.xml:InitTextWnd("main_chat:chat_txt", self.chat)
+        local V2 = txt:GetWndPos()
+        V2.y = V2.y + 20 * i
+        txt:SetWndPos(V2)
+        self.lines[i] = txt
+    end
+end
+function ChatBox:OnKeyboard(dik, keyboard_action)
+    local ret = CUIScriptWnd.OnKeyboard(self, dik, keyboard_action)
+    if keyboard_action == ui_events.WINDOW_KEY_PRESSED then
+        if dik == DIK_keys.DIK_RETURN or dik == DIK_keys.DIK_NUMPADENTER then
+            self:Send()
+        elseif dik == DIK_keys.DIK_ESCAPE then
+            self:Close()
+        end
+    end
+    return true
+end
+function ChatBox:Send()
+    local input = self.chat_input:GetText()
+    if input and input ~= "" and input ~= " " then
+        MPMain_STOGETHER.GameManager:OnIChatMSG(input)
+        self.chat_input:SetText("")
+    end
+    self:Close()
+end
+function ChatBox:IsShown()
+    return self.showed
+end
+function ChatBox:AddMessage(TEXT)
+    for n=1, #self.lines-1, 1 do
+		local s = self.lines[n+1]:GetText()
+		local clr = self.lines[n+1]:GetTextColor()
+		self.lines[n]:SetText(s)
+		self.lines[n]:SetTextColor(clr)
+	end
+    self.lines[#self.lines]:SetText(TEXT)
+end
+function ChatBox:Open(focu)
+    local DOWN = MPMain_Downed_STOGETHER   -- lift the downed move-only lock so typing works
+    if DOWN and DOWN.suspend_movelock then DOWN.suspend_movelock() end
+    self:ShowDialog()
+    self.showed = true
+    self.chat_input:SetText("")
+    self.chat_input:CaptureFocus(focu)
+    Register_UI("ChatBox", "MPCHATBOX")
+end
+
+function ChatBox:Close()
+    local DOWN = MPMain_Downed_STOGETHER   -- restore the downed move-only lock if still downed
+    if DOWN and DOWN.restore_movelock then DOWN.restore_movelock() end
+    self:HideDialog()
+    self.showed = false
+    self.chat_input:SetText("")
+    self.chat_input:CaptureFocus(false)
+    Unregister_UI("ChatBox")
+end

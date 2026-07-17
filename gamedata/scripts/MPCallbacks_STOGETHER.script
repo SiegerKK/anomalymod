@@ -1,0 +1,100 @@
+--[[
+[================]
+C++ Programmer & Author: Werasik2aa
+Project Creator: Monokit
+Description: CALLING CALLBACKS! LIKE IDEAD IPICKUP E.T.C
+[================]
+--]]
+local GameManager = SteamGameManager()
+local function on_game_load()
+    local se_actor = alife():actor()
+    if se_actor then
+        local aname = GameManager:GetNickName()
+        se_actor:set_character_name(aname)
+    end
+    MPMain_STOGETHER.GlobalLastPosition = db.actor:position()
+    save_var(db.actor, "force_all_talk", true)
+end
+local function actor_on_first_update()
+    MPMain_STOGETHER.GameLoaded = true
+    GameManager:SetGameLoaded(true)
+    GameManager:OnRequest()
+    CreateTimeEvent(0, "foreall_animation_set", 2, function ()
+        GameManager:OnICustomAnimation("dinamit_0", "", true, 1)
+        return true
+    end)
+end
+local function onmp_player_connected(PlayerNetID, NickName)
+    CreateTimeEvent(PlayerNetID, "foreall_animation_set", 1, function ()
+        for _, v in pairs(db.actors) do
+            if v and v.object and v.netid == PlayerNetID then
+                v.object:play_cycle("dinamit_0")
+                return true
+            end
+        end
+        return false
+    end)
+end
+local function on_key_press(key)
+    if not db.actor then return end
+    if dik_to_bind(key) == key_bindings.kCHAT then
+        MChatbox_STOGETHER.OpenClose()
+    end
+end
+local function actor_on_item_take(item)
+    if not item then return end
+    GameManager:OnICustomAnimation("werasik2aa_pickup", IsFood(item) and item:section() or "", true, 1)
+end
+local function actor_on_sleep(hour)
+    GameManager:OnICustomAnimation("sleep_idle_0", "", true, 1.6)
+end
+local function actor_on_item_use(item)
+    if not item then return end
+    --[[ 
+    "werasik2aa_tablets", "werasik2aa_drink", "werasik2aa_eat", 
+    "werasik2aa_kurit", "werasik2aa_drug", "werasik2aa_bandage",
+    "werasik2aa_medkit", "werasik2aa_tablets"
+    --]]
+    if IsTablets(item) then
+        GameManager:OnICustomAnimation("werasik2aa_tablets", item:section(), true, 2)
+    elseif IsDrink(item) then
+        GameManager:OnICustomAnimation("werasik2aa_drink", item:section(), true, 2)
+    elseif IsFood(item) then
+        GameManager:OnICustomAnimation("werasik2aa_eat", item:section(), true, 2)
+    elseif IsCigar(item) then
+        GameManager:OnICustomAnimation("werasik2aa_kurit", "sigaret_for_nps", true, 3)
+    elseif IsDrugs(item) then
+        GameManager:OnICustomAnimation("werasik2aa_drug", item:section(), true, 3.5)
+    elseif IsBandages(item) then
+        GameManager:OnICustomAnimation("werasik2aa_bandage", item:section(), true, 4)
+    elseif IsMedKit(item) then
+        GameManager:OnICustomAnimation("werasik2aa_medkit", item:section(), true, 5)
+    elseif IsMedical(item) then
+        GameManager:OnICustomAnimation("werasik2aa_tablets", item:section(), true, 3.5)
+    end
+end
+--ITERATE AND REQUEST NEW ITEMS like looting
+local function actor_on_interaction(temp, _, section)
+    if "mutants" == temp then
+        GameManager:OnICustomAnimation("dinamit_0", "", true, 2)
+    end
+end
+function on_game_start()
+    -- REPEAT PATCH UNPATCHED PLACE
+    MPMain_GamePatches_STOGETHER.Patch()
+    if not IIsHost() then
+        MPMain_Client_STOGETHER.Patch()
+    else
+        MPMain_Server_STOGETHER.Patch()
+    end
+    -- REGISTER CALLBACKS
+    RegisterScriptCallback("actor_on_first_update", actor_on_first_update)
+    RegisterScriptCallback("on_game_load", on_game_load)
+    RegisterScriptCallback("actor_on_item_take", actor_on_item_take)
+    RegisterScriptCallback("actor_on_item_use", actor_on_item_use)
+    RegisterScriptCallback("on_key_press", on_key_press)
+    RegisterScriptCallback("actor_on_interaction", actor_on_interaction)
+    RegisterScriptCallback("actor_on_sleep", actor_on_sleep)
+    RegisterScriptCallback("on_option_change", MPMain_STOGETHER.ApplyValues)
+    RegisterScriptCallback("onmp_player_connected", onmp_player_connected)
+end

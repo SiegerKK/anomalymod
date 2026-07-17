@@ -1,0 +1,858 @@
+--[[
+C++ Programmer & Author: Werasik2aa | Project Creator: Monokit | Downed & Revival System: Quoeiza
+"Manual Revive" downed system. Active only when AllowResurrect and ReviveMode=="manual_revive".
+Down instead of die: a teammate channels a revive in place, else auto-resurrect at base after a lockout.
+All players down at once -> host reloads latest save.
+--]]
+local GameManager = SteamGameManager()
+
+-- ===== Tunables =====
+local BLOCK_ACTIONS    = true     -- lock downed player to movement only
+local REVIVE_RANGE     = 2.5      -- m; reviver must stay within this
+local DOWN_HEALTH      = 0.01     -- HP pin so engine never kills us
+local REVIVE_HEALTH    = 0.25     -- HP restored on teammate revive
+local DOWN_TRIGGER     = 0.02     -- HP at/below -> force DOWN (just above DOWN_HEALTH so DoT trips while HP>0)
+local HIT_SAFETY       = 10       -- HP headroom inflated before a relayed hit so it can't write 0 (engine clamps to 1.0)
+local HEARTBEAT_MS     = 1000     -- "still down" re-broadcast period
+local DOWNED_TTL       = 12000    -- ms a downed flag lives without a heartbeat (crash backstop; clean removals are instant)
+local REVIVED_GRACE    = 2500     -- ms after revive to ignore late "down" echoes
+local PROGRESS_PING    = 0.4      -- s between reviver->downed pings
+local BEING_FRESH      = 1200     -- ms a "being revived" ping stays valid
+local CROUCH_POLL_MS   = 100      -- ms between crouch re-asserts
+local DOWNED_PPE       = 27001    -- pp-effector id for blood overlay
+local SPAWN_PROTECT_MS = 3000     -- ms invuln after (re)spawn/join
+
+-- live MCM values
+local function channel_secs()  return math.max(0.1, MPMain_STOGETHER.TimeToReviveOthers or 5) end
+local function lockout_secs()  return math.max(1,   MPMain_STOGETHER.AutoReviveDelay or 120) end
+
+-- ===== State =====
+local downed = {}                 -- [netid] = last "down" time_global() ms
+local recently_revived = {}       -- [netid] = revive time; ignore late echoes
+local M_hb_next        = 0
+local M_is_downed      = false
+local M_downed_start   = 0        -- ms we went down (lockout base)
+local M_static         = false
+local M_crouch_next    = 0
+local reloading        = false
+local M_being_until    = 0        -- "being revived" overlay (downed side)
+local M_being_remain   = 0
+local M_reviver_nm     = ""
+local M_rev_target     = nil      -- netid we are reviving (reviver side)
+local M_rev_start      = 0
+local M_rev_loop       = false
+local M_rev_ping       = 0
+local M_spawn_protect_until = 0
+-- relayed-hit measuring (inflate in before_hit, resolve from real dealt in post-hit / update)
+local M_hit_measuring  = false
+local M_hit_pre        = 0        -- real HP before the inflated relayed hit
+local M_hit_inflated   = 0        -- HP after inflation (engine-clamped)
+local M_hit_time       = 0        -- tg of the inflate (update only rescues on a LATER frame)
+local M_det_was_out    = false    -- was a detector active when downed (un-stow it on revive)
+
+-- forward decls (started via AddUniqueCall)
+local update_downed_self, reviver_tick, update_indicators
+
+-- ===== Helpers =====
+local function active_mode()
+    return MPMain_STOGETHER and MPMain_STOGETHER.ReviveModeEn
+end
+
+local function tr(id, fb)         -- translate; fb when untranslated
+    local s = game.translate_string(id)
+    return (s == id) and fb or s
+end
+
+local function wipe(t) for k in pairs(t) do t[k] = nil end end
+
+-- log a [STDOWN] lifecycle line stamped with time_global ms
+local function dbg(fmt, ...)
+    log(string.format("[STDOWN] [tg=%d] " .. fmt, time_global(), ...))
+end
+
+local function self_downed()      -- "am I downed" via global table
+    local M = MPMain_Downed_STOGETHER
+    return M and M.is_self_downed and M.is_self_downed()
+end
+
+local function request_down()     -- ask core instance to put actor down
+    local M = MPMain_Downed_STOGETHER
+    if M and M.on_actor_downed then M.on_actor_downed() end
+end
+
+local function pin_and_down()     -- pin to downed HP + go down
+    db.actor:set_health_ex(DOWN_HEALTH)
+    request_down()
+end
+
+-- ===== Player identity (network id) =====
+local function my_srv() return GameManager:GetMySNETID() end
+
+local function stable_srv(obj)    -- prefer db.actors netid, fall back to live
+    if not obj then return nil end
+    local rec = db.actors[obj:id()]
+    if rec and rec.netid and rec.netid ~= 0 then return rec.netid end
+    local live = obj:GetNetID()
+    return (live ~= 0) and live or nil
+end
+
+local function obj_for_srv(srv)
+    if not srv then return nil end
+    for _, v in pairs(db.actors) do
+        if v and v.object and stable_srv(v.object) == srv then return v.object end
+    end
+end
+
+local function name_for_srv(srv)
+    local o = obj_for_srv(srv)
+    return o and o:character_name() or nil
+end
+
+local function news_player(srv, id, fallback, default_name, dur)   -- name news tip; no-op w/o actor
+    if not db.actor then return end
+    news_manager.send_tip(db.actor, string.format(tr(id, fallback), name_for_srv(srv) or default_name), nil, "nano", dur)
+end
+
+local function is_down(srv)
+    if not srv then return false end
+    local t = downed[srv]
+    if not t then return false end
+    if (time_global() - t) > DOWNED_TTL then downed[srv] = nil; return false end   -- stale -> clear
+    return true
+end
+
+local function use_key_name()   -- bound USE key label; recomputed (binds can change mid-session)
+    local name
+    local ok = pcall(function()
+        name = ui_mcm and ui_mcm.display_key and ui_mcm.display_key(bind_to_dik(key_bindings.kUSE))
+    end)
+    return (ok and name and name ~= "" and name ~= "<!!!>") and name or "Use"
+end
+
+-- swap a downed peer's talk prompt into the revive tip (or back)
+local function set_peer_talk(srv, talkable)
+    if not srv or srv == my_srv() then return end
+    local o = obj_for_srv(srv)
+    if not o then return end
+    if talkable then
+        o:enable_talk()
+        o:set_tip_text_default()
+    else
+        o:disable_talk()
+        o:set_tip_text(game.translate_string("st_mp_revive_tip"):gsub("%[.-%]", use_key_name()))
+    end
+end
+
+local function show_center(msg, r, g, b)
+    local hud = get_hud()
+    if not hud then return end
+    local st = hud:GetCustomStatic("text_on_screen_center")
+    if not st then   -- self-heal: the engine rebuilds the HUD across loads
+        hud:AddCustomStatic("text_on_screen_center", true); M_static = true
+        st = hud:GetCustomStatic("text_on_screen_center")
+    end
+    if st then
+        st:wnd():TextControl():SetText(msg)
+        st:wnd():TextControl():SetTextColor(GetARGB(255, r or 255, g or 255, b or 255))
+    end
+end
+
+local function clear_center()
+    if not M_static then return end
+    local hud = get_hud()
+    if hud then hud:RemoveCustomStatic("text_on_screen_center") end
+    M_static = false
+end
+
+local function cleanse_status()   -- clear harmful states (limb dmg kept); bleeding=1 = not bleeding
+    if not db.actor then return end
+    db.actor.radiation, db.actor.psy_health, db.actor.bleeding = 0, 1, 1
+end
+
+-- real crouch: press_action latches only in TOGGLE mode, so force g_crouch_toggle on + tap; the player's own
+-- value lives in actor pstor ("stog_crouch_toggle", captured by enter_downed) -- instance-safe + survives reload
+local function tap_crouch()
+    local ok, dik = pcall(bind_to_dik, key_bindings.kCROUCH)
+    if not (ok and dik) then return end
+    pcall(level.press_action, dik)
+    pcall(level.release_action, dik)
+end
+
+local function force_crouch(on)
+    if on then
+        pcall(function() get_console():execute("g_crouch_toggle 1") end)
+        if db.actor and not IsMoveState("mcCrouch") then tap_crouch() end
+    else
+        if db.actor and IsMoveState("mcCrouch") then tap_crouch() end   -- toggle off -> stand
+        local orig = db.actor and load_var(db.actor, "stog_crouch_toggle", false)
+        pcall(function() get_console():execute("g_crouch_toggle " .. (orig and 1 or 0)) end)
+    end
+end
+
+-- ===== Network relay =====
+local function relay(func, payload)        -- host -> all
+    if IIsHost() then GameManager:OnICustomScriptAction("MPMain_Downed_STOGETHER", func, payload, false) end
+end
+
+local function to_host(func, payload)      -- client -> host
+    if not IIsHost() then GameManager:OnICustomScriptAction("MPMain_Downed_STOGETHER", func, payload, true) end
+end
+
+-- wire: { netid, 1|0 }; the "on" path doubles as heartbeat
+function set_downed(t)
+    if not (t and t[1] ~= nil) then return end
+    local srv = tonumber(t[1])
+    if not srv then return end
+    local on   = (tonumber(t[2]) == 1)
+    local mine = (srv == my_srv())
+    if on then
+        local rr = recently_revived[srv]
+        if rr and not mine and (time_global() - rr) <= REVIVED_GRACE then return end   -- ignore late "down" echo
+        local prev = is_down(srv)
+        downed[srv] = time_global()
+        set_peer_talk(srv, false)   -- re-assert each heartbeat: the peer object may net_spawn after the first one
+        if not prev and not mine then news_player(srv, "st_mp_player_down", "%s is down!", "A stalker", 6000) end
+    else
+        set_peer_talk(srv, true)    -- unconditional: the entry may have TTL-expired already
+        downed[srv] = nil
+        recently_revived[srv] = time_global()   -- grace vs stale in-flight "down"
+    end
+    if IIsHost() then relay("set_downed", serialize_table_simple(t)); check_failure() end
+end
+
+function net_set_downed(on)
+    local srv = my_srv()
+    if not srv then return end
+    local t = { srv, on and 1 or 0 }
+    set_downed(t)
+    to_host("set_downed", serialize_table_simple(t))
+end
+
+function revive(srv)
+    srv = tonumber(srv)
+    if not srv then return end
+    local mine = (srv == my_srv())
+    local was  = is_down(srv)
+    dbg("revive netid=%s mine=%s", tostring(srv), tostring(mine))
+    downed[srv] = nil
+    recently_revived[srv] = time_global()
+    set_peer_talk(srv, true)
+    if mine then
+        do_local_revive()
+    elseif was then
+        news_player(srv, "st_mp_player_revived", "%s was revived.", "A stalker", 5000)
+    end
+    if IIsHost() then relay("revive", tostring(srv)); check_failure() end
+end
+
+function net_revive(srv)
+    if not srv then return end
+    revive(srv)
+    to_host("revive", tostring(srv))
+end
+
+-- wire: { target_srv, reviver_srv, secs_remaining }
+function revive_progress(t)
+    if not (t and t[1]) then return end
+    if IIsHost() then relay("revive_progress", serialize_table_simple(t)) end
+    if tonumber(t[1]) == my_srv() then
+        M_being_until  = time_global() + BEING_FRESH
+        M_being_remain = tonumber(t[3]) or 0
+        M_reviver_nm   = name_for_srv(tonumber(t[2])) or "Someone"
+    end
+end
+
+function net_revive_progress(target_srv, reviver_srv, secs)
+    if not target_srv then return end
+    local t = { target_srv, reviver_srv, secs }
+    revive_progress(t)
+    to_host("revive_progress", serialize_table_simple(t))
+end
+
+function force_reload(_)
+    do_failure_reload()
+    relay("force_reload", "1")
+end
+
+-- ===== Failure condition =====
+-- host-only: all known players down -> reload latest save
+function check_failure()
+    if not IIsHost() or reloading or not active_mode() or not db.actor then return end
+    local players = {}
+    local mine = my_srv()
+    if mine then players[mine] = true end
+    for _, v in pairs(db.actors) do
+        if v and v.object then
+            local s = stable_srv(v.object)
+            if s then players[s] = true end
+        end
+    end
+    if not next(players) then return end
+    for srv in pairs(players) do
+        if not is_down(srv) then return end   -- someone still up
+    end
+    log("[Server] All players downed. Reloading most recent save.")
+    force_reload(nil)
+end
+
+function do_failure_reload()
+    if reloading then return end
+    reloading = true
+    clear_center()        -- death screen owns the center text now
+    force_crouch(false)   -- restore g_crouch_toggle before reload
+    pcall(level.remove_pp_effector, DOWNED_PPE)
+    bind_stalker_ext.death_manager_mp(true, true)
+end
+
+-- ===== Downed lifecycle =====
+-- poll the chat key while downed and open the box on a press (the gated kCHAT command never reaches on_key_press)
+local M_chat_key_down = false
+local function poll_chat_key()
+    local ok, dik = pcall(bind_to_dik, key_bindings.kCHAT)
+    if not ok or not dik then return end
+    local now_down = (key_state(dik) or 0) ~= 0
+    if now_down and not M_chat_key_down then
+        local gui = MChatbox_STOGETHER.GUI
+        if not (gui and gui:IsShown()) then
+            MChatbox_STOGETHER.OpenClose()
+        end
+    end
+    M_chat_key_down = now_down
+end
+
+local function downed_tick()
+    if reloading or not M_is_downed then return true end   -- failure reload owns the screen: stop countdown/heartbeat
+    update_downed_self()
+    poll_chat_key()
+    return false
+end
+
+function enter_downed(from_reload)
+    if M_is_downed or reloading then return end
+    M_is_downed, M_downed_start, M_hb_next, M_being_until = true, time_global(), 0, 0
+    MPMain_STOGETHER.IDead = true   -- mirror death-hook flag
+    dbg("downed")
+    if BLOCK_ACTIONS then   -- movement only; stow weapon + detector (paired with restore on revive)
+        game.only_allow_movekeys(true)
+        local gui = MChatbox_STOGETHER and MChatbox_STOGETHER.GUI   -- downed mid-chat: keep typing until the box closes
+        if gui and gui:IsShown() then suspend_movelock() end
+        if db.actor and not from_reload then db.actor:hide_weapon() end   -- reload re-entry: weapon already stowed in the save
+        if db.actor then   -- stow the active detector (un-stowed on revive); reload re-entry reads the saved flag
+            if from_reload then
+                M_det_was_out = load_var(db.actor, "stog_det_out", false)
+            else
+                M_det_was_out = db.actor:active_detector() ~= nil
+                if M_det_was_out then db.actor:force_hide_detector() end
+                save_var(db.actor, "stog_det_out", M_det_was_out)
+            end
+        end
+        game.set_actor_allow_ladder(false)
+    end
+    if db.actor then
+        db.actor:set_health_ex(DOWN_HEALTH)
+        save_var(db.actor, "stog_was_downed", true)   -- so save/reload re-enters downed
+        if not from_reload then   -- capture the player's crouch-toggle for the revive restore (reload keeps the saved one)
+            local ok, v = pcall(function() return get_console():get_bool("g_crouch_toggle") end)
+            save_var(db.actor, "stog_crouch_toggle", ok and v or false)
+        end
+    end
+    net_set_downed(true)
+    M_crouch_next, M_chat_key_down = 0, false
+    force_crouch(true)   -- lowered cam + crouch locomotion; auto-synced (alive at DOWN_HEALTH)
+    pcall(level.add_pp_effector, "bloody.ppe", DOWNED_PPE, true)   -- local blood overlay
+    AddUniqueCall(downed_tick)
+end
+
+-- tear down downed STATE (loop+HUD); does NOT restore input
+local function exit_downed_cleanup()
+    M_is_downed, M_being_until = false, 0
+    clear_center()
+    pcall(level.remove_pp_effector, DOWNED_PPE)
+    if db.actor then save_var(db.actor, "stog_was_downed", false) end
+end
+
+-- restore control after revive: stand, unblock input, un-stow weapon + detector (paired restores), ladders
+local function restore_control()
+    if not BLOCK_ACTIONS then return end
+    force_crouch(false)
+    game.only_allow_movekeys(false)
+    if db.actor then db.actor:restore_weapon() end
+    if db.actor and M_det_was_out then db.actor:show_detector(true) end   -- un-stow detector if it was out
+    M_det_was_out = false
+    game.set_actor_allow_ladder(true)
+end
+
+-- lift/restore the downed move-only lock while chat/UI holds the keyboard; no-op unless lock is applied
+local M_movelock_suspended = false
+function suspend_movelock()
+    if not (BLOCK_ACTIONS and M_is_downed) then return end
+    M_movelock_suspended = true
+    game.only_allow_movekeys(false)
+end
+function restore_movelock()
+    if not M_movelock_suspended then return end
+    M_movelock_suspended = false
+    if BLOCK_ACTIONS and M_is_downed then game.only_allow_movekeys(true) end
+end
+
+-- teammate revive (on revived player's client): in place, REVIVE_HEALTH, harmful states cleared
+function do_local_revive()
+    if not M_is_downed then return end
+    exit_downed_cleanup()
+    MPMain_STOGETHER.IDead = false
+    if db.actor then db.actor:set_health_ex(REVIVE_HEALTH) end
+    if bind_stalker_ext and bind_stalker_ext.clear_death_logo then bind_stalker_ext.clear_death_logo() end
+    restore_control()
+    cleanse_status()
+    if bind_stalker_ext then bind_stalker_ext.invulnerable_time = time_global() + 3000 end
+    if db.actor then news_manager.send_tip(db.actor, game.translate_string("st_mp_revived"), nil, "nano", 6000) end
+end
+
+-- auto revival after lockout: classic resurrect-at-base (native full heal)
+local function do_self_resurrect()
+    if not M_is_downed then return end   -- never resurrect twice
+    dbg("auto-resurrect at base")
+    exit_downed_cleanup()
+    MPMain_STOGETHER.ResurrectFallbackKill = false   -- armed by the patch only if THIS resurrect dead-ends
+    bind_stalker_ext.death_manager_mp(false, false)
+    if MPMain_STOGETHER.ResurrectFallbackKill then   -- no respawn spot: the patch killed us + scheduled the party reload
+        MPMain_STOGETHER.ResurrectFallbackKill = false
+        force_crouch(false)   -- restore g_crouch_toggle before the reload; IDead stays true so the kill runs raw
+        return
+    end
+    MPMain_STOGETHER.IDead = false
+    restore_control()
+    if db.actor then   -- full injury heal if affordable, else 40% HP
+        if db.actor:money() >= 4000 then
+            dialogs.heal_actor_injury(db.actor, (db.actors[0] and db.actors[0].object) or db.actor)
+        else
+            db.actor:set_health_ex(0.4)
+        end
+    end
+    cleanse_status()
+    net_set_downed(false)
+end
+
+-- ===== Downed-self per-frame loop =====
+function update_downed_self()
+    if time_global() >= M_hb_next then   -- heartbeat
+        M_hb_next = time_global() + HEARTBEAT_MS
+        net_set_downed(true)
+    end
+    if bind_stalker_ext then bind_stalker_ext.invulnerable_time = time_global() + 5000 end   -- un-killable
+    if db.actor and db.actor.health < DOWN_HEALTH then db.actor:set_health_ex(DOWN_HEALTH) end   -- re-pin HP
+    -- keep BHS torso/head off 0 (0 -> it writes health=-1); restored on revive/respawn
+    if zzz_player_injuries and zzz_player_injuries.health and zzz_player_injuries.maxhp then
+        local H, MX = zzz_player_injuries.health, zzz_player_injuries.maxhp
+        if (H.torso or 1) <= 0 then H.torso = MX.torso or 11 end
+        if (H.head  or 1) <= 0 then H.head  = MX.head  or 11 end
+    end
+    if time_global() >= M_crouch_next then   -- re-assert crouch (tiny sprint/jump escape window)
+        M_crouch_next = time_global() + CROUCH_POLL_MS
+        if db.actor and not IsMoveState("mcCrouch") then tap_crouch() end
+    end
+    if M_being_until > time_global() then   -- teammate channelling on us
+        show_center(string.format(tr("st_mp_being_revived", "%s is reviving you (%d seconds)"),
+            M_reviver_nm, math.ceil(M_being_remain)), 120, 255, 120)
+        return
+    end
+    -- else count down to auto at-base revival
+    local remain = math.max(0, lockout_secs() - (time_global() - M_downed_start) / 1000)
+    show_center(string.format(tr("st_mp_auto_reviving", "Downed - auto-reviving in %d seconds"),
+        math.ceil(remain)), 255, 160, 120)
+    if remain <= 0 then do_self_resurrect() end
+end
+
+-- ===== Reviver side =====
+local function find_revive_target()   -- nearest downed peer in range
+    if not db.actor then return nil end
+    local apos = db.actor:position()
+    local mine = my_srv()
+    local best_o, best_s, best_d
+    for _, v in pairs(db.actors) do
+        local o = v and v.object
+        if o and o:id() ~= db.actor:id() then
+            local s = stable_srv(o)
+            if s and s ~= mine and is_down(s) then
+                local d = o:position():distance_to(apos)
+                if d <= REVIVE_RANGE and (not best_d or d < best_d) then best_o, best_s, best_d = o, s, d end
+            end
+        end
+    end
+    return best_o, best_s
+end
+
+local function end_channel() M_rev_loop, M_rev_target = false, nil; clear_center() end
+
+-- per-frame revive channel; cancels on down/out-of-range/target-up, revives at end
+reviver_tick = function()
+    local o = not M_is_downed and active_mode() and M_rev_target and is_down(M_rev_target)
+              and obj_for_srv(M_rev_target) or nil
+    if not (o and db.actor and o:position():distance_to(db.actor:position()) <= REVIVE_RANGE) then
+        end_channel(); return true
+    end
+    local dur = channel_secs()
+    local remain = math.max(0, math.ceil(dur - (time_global() - M_rev_start) / 1000))
+    if time_global() >= M_rev_ping then
+        M_rev_ping = time_global() + PROGRESS_PING * 1000
+        net_revive_progress(M_rev_target, my_srv(), remain)
+    end
+    show_center(string.format(tr("st_mp_reviving", "Reviving %s in %d seconds"),
+        o:character_name() or "stalker", remain), 120, 255, 120)
+    if (time_global() - M_rev_start) / 1000 >= dur then
+        local s = M_rev_target
+        end_channel()
+        net_revive(s)
+        return true
+    end
+    return false
+end
+
+-- ===== Single-tap action (runs in core instance via global table) =====
+function on_use_pressed()
+    if not active_mode() or M_is_downed or M_rev_loop then return end
+    local o, s = find_revive_target()
+    if o and s then
+        M_rev_target, M_rev_start, M_rev_ping, M_rev_loop = s, time_global(), 0, true
+        AddUniqueCall(reviver_tick)
+    end
+end
+
+function is_self_downed() return M_is_downed end   -- read via global table (input runs in another instance)
+
+-- ===== Input-side callbacks =====
+local function on_key_press(dik)
+    if dik_to_bind(dik) ~= key_bindings.kUSE or not active_mode() then return end
+    if MPMain_Downed_STOGETHER and MPMain_Downed_STOGETHER.on_use_pressed then
+        MPMain_Downed_STOGETHER.on_use_pressed()
+    end
+end
+
+local function on_weapon_before_fire(flags)   -- fire veto backstop (movekeys lock is primary)
+    if flags and active_mode() and self_downed() then flags.ret_value = false end
+end
+
+-- ===== Death prevention =====
+-- A real death (HP->0) destroys the weapon manager, so we enter downed while STILL ALIVE. The grok clamp
+-- (on_game_start) owns grok damage; these handlers cover the rest.
+
+-- fold a measured relayed hit: dealt = HP the engine removed from the inflated value; restore the true HP and
+-- down if it lands at/below the trigger. Runs only after the hit's write lands (next before_hit / later update).
+local function resolve_measured_hit()
+    if not M_hit_measuring then return end
+    M_hit_measuring = false
+    local dealt    = M_hit_inflated - db.actor.health
+    local new_real = M_hit_pre - dealt
+    if new_real <= DOWN_TRIGGER then
+        pin_and_down()                       -- sets DOWN_HEALTH
+    else
+        db.actor:set_health_ex(new_real)
+    end
+end
+
+-- downed: ignore all damage. alive: a hit must never write HP to 0 (a real death tears down the weapon manager
+-- + AI registration). A relayed fire_wound (weapon_id not local, grok skips it) inflates HP so the write can't
+-- reach 0; its write lands AFTER these callbacks, so settle the previous inflated hit first, then re-inflate.
+local function on_actor_before_hit(shit, bone_id, flags)
+    if not active_mode() or not db.actor or not shit then return end
+    resolve_measured_hit()   -- settle the previous relayed hit; no-op if none
+    if self_downed() then
+        shit.power = 0
+        if flags then flags.ret_value = false end
+        return
+    end
+    if shit.type == hit.fire_wound and shit.weapon_id and shit.weapon_id ~= 0
+       and not level.object_by_id(shit.weapon_id) then
+        M_hit_pre      = db.actor.health
+        db.actor:set_health_ex(M_hit_pre + HIT_SAFETY)   -- inflate; engine clamps to 1.0
+        M_hit_inflated = db.actor.health
+        M_hit_measuring, M_hit_time = true, time_global()
+        return
+    end
+    -- non-relayed: native (no grok) neutralizes a would-be-lethal hit and downs; on GAMMA grok's wrap owns these
+    if not grok_actor_damage_balancer then
+        local p = shit.power or 0
+        if (db.actor.health - p) <= DOWN_TRIGGER then
+            if flags then flags.ret_value = false end
+            shit.power = 0
+            pin_and_down()
+        end
+    end
+end
+
+-- backstop: down on post-hit HP at/below trigger. Skips while measuring (HP is inflated, not the real value)
+local function on_actor_hit_post()
+    if not active_mode() or not db.actor or self_downed() then return end
+    if M_hit_measuring then return end
+    if db.actor.health <= DOWN_TRIGGER then
+        pin_and_down()
+    end
+end
+
+-- DoT (bleeding/rad/hunger), trips while HP>0. Also settles the last relayed hit (no following before_hit) on a
+-- later frame, once its write has landed.
+local time = 0
+local function actor_update_guard()
+    if not active_mode() or not db.actor then return end
+
+    -- relayed-hit settle: must run EVERY frame, not throttled
+    if M_hit_measuring then
+        if time_global() > M_hit_time then resolve_measured_hit() end
+        return
+    end
+
+    if self_downed() then return end
+
+    -- throttle ONLY the DoT poll below
+    local tma = time_global()
+    if tma - time < 1000 then return end
+    time = tma
+
+    if db.actor.health > 0 and db.actor.health <= DOWN_TRIGGER then
+        request_down()
+    end
+end
+
+local EMPTY = {}   -- shared idle result; callers only read
+function get_downed_peers()   -- live downed netids from core instance (call via global table)
+    if not next(downed) then return EMPTY end
+    local t = {}
+    for srv in pairs(downed) do
+        if is_down(srv) then t[#t + 1] = srv end
+    end
+    return t
+end
+
+-- ===== Downed overhead marker =====
+-- Lua-rendered icon above each downed teammate, driven from downed[] (no extra networking)
+local MARKER_XML   = "ui_downed_marker_stogether.xml"
+local DOWNED_TEX   = [[ui\ui_radmp\ui_downed]]   -- direct path -> always loads
+local ICON_SIZE    = 20         -- px height; width aspect-corrected to 1:1
+local HEAD_OFFSET  = 0.45       -- m above head bone
+local marker_hud   = nil
+local marker_xml   = nil
+local marker_icons = {}         -- [netid] = CUIStatic
+
+class "DownedMarkerHUD" (CUIScriptWnd)
+function DownedMarkerHUD:__init() super()
+    marker_xml = CScriptXmlInit()
+    marker_xml:ParseFile(MARKER_XML)
+end
+function DownedMarkerHUD:__finalize() end
+
+local function hud_ensure()
+    if marker_hud then return end
+    local hud = get_hud()
+    if not hud then return end
+    marker_hud, marker_icons = DownedMarkerHUD(), {}
+    hud:AddDialogToRender(marker_hud)
+end
+
+local function hud_destroy()
+    if not marker_hud then return end
+    local hud = get_hud()
+    if hud then hud:RemoveDialogToRender(marker_hud) end
+    marker_hud, marker_xml, marker_icons = nil, nil, {}
+end
+
+local function icon_for(srv)
+    if marker_icons[srv] then return marker_icons[srv] end
+    if not (marker_hud and marker_xml) then return nil end
+    local ic = marker_xml:InitStatic("downed_marker", marker_hud)
+    if ic then
+        ic:InitTexture(DOWNED_TEX)
+        ic:SetTextureColor(GetARGB(255, 255, 255, 255))
+        ic:Show(false)
+        marker_icons[srv] = ic
+    end
+    return ic
+end
+
+local function marker_pos(obj)   -- above head bone; fall back to origin + ~1.7m
+    local p = utils_obj and utils_obj.safe_bone_pos and utils_obj.safe_bone_pos(obj, "bip01_head")
+    if p then return vector():set(p.x, p.y + HEAD_OFFSET, p.z) end
+    local q = obj:position()
+    return q and vector():set(q.x, q.y + 1.7 + HEAD_OFFSET, q.z) or nil
+end
+
+local function unsquish_ratio()   -- shrink WIDTH so square renders 1:1 on stretched 1024x768 canvas
+    local w, h = device().width, device().height
+    if not (w and h and w > 0) then return 1 end
+    return (h / w) / (768 / 1024)
+end
+
+local function on_actor_level(obj)   -- only project a peer on actor's current level (coords overlap)
+    return obj ~= nil and level.object_by_id(obj:id()) ~= nil
+end
+
+-- world -> 1024x768 UI; nil if off-screen/unavailable (disable cleanly if no world2ui)
+local M_no_world2ui = false
+local function project(pos)
+    if not game.world2ui then
+        if not M_no_world2ui then
+            M_no_world2ui = true
+            log("[STDOWN] overhead disabled: game.world2ui not available in this engine build")
+        end
+        return nil
+    end
+    local ok, vec = pcall(game.world2ui, pos, false, false)   -- marker_pos vectors are private per call
+    if ok and vec and vec.x ~= -9999 and vec.y ~= 0 then return vec end
+    return nil
+end
+
+-- per-frame; constant on-screen size, width aspect-corrected. Idle (nobody downed) -> free the overlay + bail
+update_indicators = function()
+    local M = MPMain_Downed_STOGETHER   -- downed netids via global table
+    local peers = active_mode() and db.actor and M and M.get_downed_peers and M.get_downed_peers()
+    if not peers or #peers == 0 then
+        hud_destroy()   -- lazily rebuilt by hud_ensure on the next down
+        return
+    end
+    local mine = my_srv()
+    local seen = {}
+    local iw   = ICON_SIZE * unsquish_ratio()
+    for _, srv in ipairs(peers) do
+        if srv ~= mine then
+            local obj  = obj_for_srv(srv)
+            local mpos = obj and on_actor_level(obj) and marker_pos(obj)
+            if mpos then
+                seen[srv] = true
+                hud_ensure()
+                local ic = icon_for(srv)
+                if ic then
+                    local vec = project(mpos)   -- always projected; no max range (matches the nametag)
+                    if vec then
+                        ic:SetWndSize(vector2():set(iw, ICON_SIZE))
+                        ic:SetWndPos(vector2():set(vec.x - iw / 2, vec.y - ICON_SIZE / 2))
+                        ic:Show(true)
+                    else
+                        ic:Show(false)
+                    end
+                end
+            end
+        end
+    end
+    for srv, ic in pairs(marker_icons) do   -- hide markers for anyone no longer downed/off-screen/gone
+        if not seen[srv] then ic:Show(false) end
+    end
+end
+
+-- marker driver + spawn-protection re-assert. AddUniqueCall (not actor_on_update, which stops while downed)
+local function indicator_loop()
+    if M_spawn_protect_until > time_global() and bind_stalker_ext then
+        bind_stalker_ext.invulnerable_time = M_spawn_protect_until
+    end
+    update_indicators()
+    return false
+end
+
+-- ===== AI aggro suppression =====
+-- remove downed player from NPC enemy SELECTION (acquisition only; mid-attack NPC keeps firing); auto-resets on revive
+function is_netid_downed(srv)
+    return srv ~= nil and srv ~= 0 and is_down(srv)
+end
+
+local function on_enemy_eval(obj, enemy, flags)
+    if not (flags and enemy and db.actor) or not active_mode() then return end
+    local id = enemy:id()
+    local srv
+    if id == db.actor:id() then
+        srv = my_srv()
+    else
+        local rec = db.actors[id]
+        srv = rec and rec.netid
+    end
+    if srv and MPMain_Downed_STOGETHER.is_netid_downed and MPMain_Downed_STOGETHER.is_netid_downed(srv) then
+        flags.override, flags.result = true, false
+    end
+end
+
+-- ===== Public entry points =====
+function on_actor_downed(from_reload)
+    if not active_mode() then return false end
+    -- BHS torso/head fatal writes health=-1 directly (uninterceptable) + already tore weapon mgr down:
+    -- heal parts, drop downed state, decline so death+respawn runs
+    local h = zzz_player_injuries and zzz_player_injuries.health
+    if h and ((h.torso or 1) <= 0 or (h.head or 1) <= 0) then
+        if zzz_player_injuries.maxhp then
+            for k in pairs(h) do h[k] = zzz_player_injuries.maxhp[k] or h[k] end
+        end
+        if M_is_downed then exit_downed_cleanup(); net_set_downed(false) end
+        log("[STDOWN] BHS torso/head fatal -> death+respawn fallback")
+        return false
+    end
+    enter_downed(from_reload)
+    return true
+end
+
+function on_peer_removed(netid)
+    if netid then downed[netid] = nil end
+    if IIsHost() then check_failure() end
+end
+
+function on_session_start()   -- fresh session/load: drop the failure-reload latch (runs in core via global table)
+    reloading = false
+end
+
+-- re-enter downed after a save/reload taken while downed (consume "stog_was_downed"); via global table so
+-- state lives in core instance. Also grants spawn-protection to a freshly loaded/joined actor.
+function on_first_update()
+    M_spawn_protect_until = time_global() + SPAWN_PROTECT_MS
+    if bind_stalker_ext then bind_stalker_ext.invulnerable_time = M_spawn_protect_until end
+    local M = MPMain_Downed_STOGETHER
+    if M and M.on_session_start then M.on_session_start() end
+    if not db.actor or not load_var(db.actor, "stog_was_downed", false) then return end
+    save_var(db.actor, "stog_was_downed", false)   -- consume; on_actor_downed re-sets it
+    if not M or (M.is_self_downed and M.is_self_downed()) then return end
+    M.on_actor_downed(true)   -- reload re-entry: re-apply the runtime lock but not hide_weapon (weapon already stowed)
+end
+
+function on_game_start()
+    clear_center()
+    wipe(downed); wipe(recently_revived)
+    M_is_downed, M_rev_loop, reloading = false, false, false
+    M_downed_start, M_hb_next, M_being_until, M_being_remain = 0, 0, 0, 0
+    M_rev_ping, M_crouch_next, M_spawn_protect_until = 0, 0, 0
+    M_rev_target, M_reviver_nm = nil, ""
+    M_hit_measuring, M_det_was_out = false, false   -- drop any dangling relayed-hit inflation / detector flag across a reload
+    if BLOCK_ACTIONS then game.only_allow_movekeys(false) end   -- ensure input not left locked
+    -- do NOT touch level.* pp-effectors here (render not ready -> uncatchable crash); engine clears on reload
+    hud_destroy()   -- rebuild marker HUD fresh
+
+    -- [GAMMA] grok shit_booster applies all actor dmg via set_health_ex(); a <=0 write kills the weapon mgr.
+    -- Wrap (own namespace): inflate HP so grok can't reach 0, measure real dmg, re-apply; if <=trigger pin+down.
+    local GROK = grok_actor_damage_balancer
+    if GROK and GROK.shit_booster and not _stog_dmg_clamp_installed then
+        _stog_dmg_clamp_installed = true
+        _stog_orig_shit_booster   = GROK.shit_booster
+        GROK.shit_booster = function(shit, bone_id, k_ap)
+            if not (active_mode() and db.actor) then return _stog_orig_shit_booster(shit, bone_id, k_ap) end
+            local real     = db.actor.health
+            db.actor:set_health_ex(real + 10)            -- inflate: grok can't hit 0
+            local inflated = db.actor.health             -- engine may clamp to 1.0
+            local r        = _stog_orig_shit_booster(shit, bone_id, k_ap)
+            local dealt    = math.max(0, inflated - db.actor.health)   -- grok's real applied dmg
+            local new_real = real - dealt
+            if new_real <= DOWN_TRIGGER then
+                pin_and_down()                           -- never died -> weapon mgr intact
+            else
+                db.actor:set_health_ex(new_real)
+            end
+            return r
+        end
+        log("[STDOWN] dmg-clamp installed (grok_actor_damage_balancer.shit_booster)")
+    elseif not _stog_dmg_clamp_installed then
+        log(string.format("[STDOWN] dmg-clamp NOT installed (grok=%s)", tostring(GROK ~= nil)))
+    end
+
+    RegisterScriptCallback("on_key_press", on_key_press)
+    RegisterScriptCallback("actor_on_weapon_before_fire", on_weapon_before_fire)
+    RegisterScriptCallback("actor_on_before_hit", on_actor_before_hit)   -- downed immunity + lethal-damage floor (relayed measure / native neutralize)
+    RegisterScriptCallback("actor_on_hit_callback", on_actor_hit_post)   -- resolves a measured relayed hit; backstop down
+    RegisterScriptCallback("actor_on_update", actor_update_guard)        -- down on attrition (DoT)
+    RegisterScriptCallback("actor_on_first_update", on_first_update)
+    RegisterScriptCallback("on_enemy_eval", on_enemy_eval)               -- NPCs ignore downed players
+    AddUniqueCall(indicator_loop)                                        -- marker driver, alive OR downed
+    RegisterScriptCallback("on_screen_resolution_changed", hud_destroy)   -- rebuilt lazily on next refresh
+    RegisterScriptCallback("actor_on_net_destroy", hud_destroy)
+end

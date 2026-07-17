@@ -1,0 +1,946 @@
+--[[
+[================]
+C++ Programmer & Author: Werasik2aa
+Project Creator: Monokit
+Description: Settings. Basic declarations. Universal. Possible to use in COP mods.
+Basic COP sync included. (Positions, Animations).
+[================]
+--]]
+local IS_GAME_SHOC_SCOC_SCOP_ = false
+GameManager = SteamGameManager()
+ServerSOSOCK = SteamServer()
+ClientSocks = SteamClient()
+GameLoaded = false
+IDead = false -- thing thing stops spamm death action
+AwaitThing = nil
+ShowMarks = ui_mcm and ui_mcm.get("werasik2aa/show_marks") or false
+ShowNames = ui_mcm and ui_mcm.get("werasik2aa/show_name") or false
+ClearInvOnDeath = ui_mcm and ui_mcm.get("werasik2aa/clear_inv") or false
+DropInvOnDeath = ui_mcm and ui_mcm.get("werasik2aa/drop_inv") or false
+MaxPlayers = ui_mcm and ui_mcm.get("werasik2aa/max_players") or 3
+FriendlyFire = ui_mcm and ui_mcm.get("werasik2aa/friendly_fire") or false
+TransferAllToLevel = ui_mcm and ui_mcm.get("werasik2aa/transferalltolevel") or false
+SectionExistCheck = ui_mcm and ui_mcm.get("werasik2aa/sections_check") or false
+ChatKeyBind = ui_mcm and ui_mcm.get("werasik2aa/p2p_peer_chat") or DIK_keys.DIK_RMENU
+ShowStats = ui_mcm and ui_mcm.get("werasik2aa/show_stats") or false
+-- Revival settings. The original master toggle (resurrect_allow / AllowResurrect) and the
+-- auto-respawn timer (resurrect_timeout / TimeEResurrect) keep their original ids/globals.
+AllowResurrect = ui_mcm and ui_mcm.get("werasik2aa/resurrect_allow") or false
+ReviveMode = ui_mcm and ui_mcm.get("werasik2aa/revive_mode") or "manual_revive"
+ReviveModeEn = string.find(ReviveMode, "manual_revive")
+TimeEResurrect = ui_mcm and ui_mcm.get("werasik2aa/resurrect_timeout") or 1               -- Auto Revive: auto-respawn timer
+TimeToReviveOthers = ui_mcm and ui_mcm.get("werasik2aa/time_to_revive_others") or 5       -- Manual Revive: teammate channel
+AutoReviveDelay = ui_mcm and ui_mcm.get("werasik2aa/auto_revive_delay") or 120            -- Manual Revive: lockout before auto-revival
+
+-- COP/COC/SHOC FIXES
+if IS_GAME_SHOC_SCOC_SCOP_ then
+    if not callstack then
+        _G.callstack = function (c1, to_str)
+            local sgsub = string.gsub
+            if (log and debug and type(debug.traceback) == 'function') then
+                --log( debug.traceback('\n', 2) )
+                -- Path is not needed
+                local str = sgsub( debug.traceback('', 2) , "%.%.%.(.-)\\scripts\\" , "... " )
+                -- Line text
+                for ss in string.gmatch(str,":(%d*):") do
+                    local num = sgsub( ss , ":","")
+                    str = sgsub( str , ":" .. num .. ":" , " (line: " .. num .. ")" )
+                end
+                str = sgsub( str , "^(.-):" , "" )
+                -- In case we want first caller only
+                if c1 then
+                    local cnt = 0
+                    for ss in string.gmatch(str,"'(.-)'") do
+                        cnt = cnt + 1
+                        local f = sgsub( ss , "'","")
+                        str = sgsub( str , "'" .. f .. "'" , "'" .. f .. "'[" .. cnt .. "]" ) -- mark lines with numbers
+                    end
+                    str = sgsub( str , "%[2%](.*)$" , "") -- remove everything after second line
+                    str = sgsub( str , "^(.*)%.%.%." , "") -- remove crap at beginning
+                end
+                -- in case we want a string back
+                if to_str then
+                    return str
+                elseif c1 then
+                    log( "STACK TRACEBACK: " .. str )
+                else
+                    -- Framing
+                    log( "~ ------------------------------------------------------------------------" )
+                    log( "~ STACK TRACEBACK:" )
+                    log( str )
+                    log( "~ ------------------------------------------------------------------------" )
+                end
+            end
+        end
+    end
+    if game_relations then
+        if game_relations.get_squad_relation_to_actor_by_id and not game_relations.get_squad_goodwill_to_actor_by_id then
+            game_relations.get_squad_goodwill_to_actor_by_id = game_relations.get_squad_relation_to_actor_by_id
+        end
+    end
+    if not ini_sys then _G.ini_sys = system_ini() end
+    _G.RESScriptCallbacksTables = {}
+    if not RegisterScriptCallback or not SendScriptCallback then
+        _G.RegisterScriptCallback = function(name, func_or_userdata)
+            log("~~ Registering: "..name)
+            if name then
+                _G.RESScriptCallbacksTables[#RESScriptCallbacksTables+1] = { name, func_or_userdata }
+            end
+        end
+        _G.AddScriptCallback = function (name)
+            log("= Adding: "..name)
+        end
+        _G.SendScriptCallback = function(name, ...)
+            for _, ttb in pairs(_G.RESScriptCallbacksTables) do
+                if ttb[1] == name and ttb[2] then
+                    ttb[2](...)
+                end
+            end
+        end
+    end
+    _G.RESScriptTimersTables = {}
+    if not CreateTimeEvent or not RemoveTimeEvent or not ResetTimeEvent or not ProcessEventQueue then
+        _G.CreateTimeEvent = function(ev_id,act_id,timer,f,...)
+            if not (_G.RESScriptTimersTables[ev_id]) then
+                _G.RESScriptTimersTables[ev_id] = {}
+                _G.RESScriptTimersTables[ev_id].__size = 0
+            end
+
+            if not (_G.RESScriptTimersTables[ev_id][act_id]) then
+                _G.RESScriptTimersTables[ev_id][act_id] = {}
+                _G.RESScriptTimersTables[ev_id][act_id].timer = time_global() + timer*1000
+                _G.RESScriptTimersTables[ev_id][act_id].f = f
+                _G.RESScriptTimersTables[ev_id][act_id].p = {...}
+                _G.RESScriptTimersTables[ev_id].__size = _G.RESScriptTimersTables[ev_id].__size + 1
+            end
+        end
+        _G.RemoveTimeEvent = function(ev_id,act_id)
+            if (_G.RESScriptTimersTables[ev_id] and _G.RESScriptTimersTables[ev_id][act_id]) then
+                _G.RESScriptTimersTables[ev_id][act_id] = nil
+                _G.RESScriptTimersTables[ev_id].__size = _G.RESScriptTimersTables[ev_id].__size - 1
+            end
+        end
+        _G.ResetTimeEvent = function(ev_id,act_id,timer)
+            if (_G.RESScriptTimersTables[ev_id] and _G.RESScriptTimersTables[ev_id][act_id]) then
+                _G.RESScriptTimersTables[ev_id][act_id].timer = time_global() + timer*1000
+            end
+        end
+        _G.ProcessEventQueue = function()
+            if has_alife_info("sleep_active") then
+                return false
+            end
+            for event_id,actions in pairs(_G.RESScriptTimersTables) do
+                for action_id,act in pairs(actions) do
+                    if (action_id ~= "__size") then
+                        if time_global() >= act.timer then
+                            -- utils_data.debug_write(strformat("event_queue: event_id=%s action_id=%s",event_id,action_id))
+                            if (act.f(unpack(act.p)) == true) then
+                                _G.RESScriptTimersTables[event_id][action_id] = nil
+                                _G.RESScriptTimersTables[event_id].__size = _G.RESScriptTimersTables[event_id].__size - 1
+                            end
+                        end
+                    end
+                end
+                if (_G.RESScriptTimersTables[event_id].__size == 0) then
+                    _G.RESScriptTimersTables[event_id] = nil
+                end
+            end
+            return false
+        end
+    end
+    _G.RESScriptUpdatesTables = {}
+    if not AddUniqueCall then
+        _G.AddUniqueCall = function(functor_a)
+            if (_G.RESScriptUpdatesTables[functor_a]) then
+                return
+            end
+            local function wrapper()
+                if not (_G.RESScriptUpdatesTables[functor_a]) then
+                    return true
+                end
+                if (functor_a()) then
+                    _G.RESScriptUpdatesTables[functor_a] = nil
+                    return true
+                end
+                return false
+            end
+            _G.RESScriptUpdatesTables[functor_a] = true
+            level.add_call(wrapper,function() end)
+        end
+        _G.RemoveUniqueCall = function(functor_a)
+            _G.RESScriptUpdatesTables[functor_a] = nil
+        end
+    end
+    if not log1 then
+        _G.log1 = log
+    end
+    if not IsStalker then
+        _G.IsStalker = function (o,c)
+            if not c then
+                c = o and o:clsid()
+            end
+            return c and (c == clsid.script_stalker or c == clsid.script_actor or c == clsid.stalker or c == clsid.actor) or false
+        end
+    end
+    if not IsMelee then
+        _G.IsMelee = function (o,c)
+            if not (c) then
+                c = o and o:clsid()
+            end
+            return c and (c == clsid.wpn_knife or c == clsid.wpn_knife_s) or false
+        end
+    end
+    if not IsInvbox then
+        _G.IsInvbox = function (o,c)
+            if not (c) then
+                c = o and o:clsid()
+            end
+            return c and (c == clsid.inventory_box_s or c == clsid.inventory_box)
+        end
+    end
+    if not IsMonster then
+        _G.IsMonster = function (o,c)
+            if not (c) then
+                c = o and o:clsid()
+            end
+            if not (monster_classes) then
+                monster_classes = {
+                [clsid.bloodsucker] 			= true,
+                [clsid.bloodsucker_s] 			= true,
+                [clsid.boar] 					= true,
+                [clsid.boar_s] 					= true,
+                [clsid.dog_red] 				= true,
+                [clsid.dog_s] 					= true,
+                [clsid.flesh] 					= true,
+                [clsid.flesh_s] 				= true,
+                [clsid.dog_black] 				= true,
+                [clsid.pseudodog_s] 			= true,
+                [clsid.burer] 					= true,
+                [clsid.burer_s] 				= true,
+                [clsid.cat] 					= true,
+                [clsid.cat_s] 					= true,
+                [clsid.rat] 					= true,
+                [clsid.rat_s]					= true,
+                [clsid.chimera] 				= true,
+                [clsid.chimera_s] 				= true,
+                [clsid.controller] 				= true,
+                [clsid.controller_s] 			= true,
+                [clsid.fracture] 				= true,
+                [clsid.fracture_s] 				= true,
+                [clsid.poltergeist] 			= true,
+                [clsid.poltergeist_s] 			= true,
+                [clsid.pseudo_gigant] 			= true,
+                [clsid.gigant_s] 				= true,
+                [clsid.zombie] 					= true,
+                [clsid.zombie_s] 				= true,
+                [clsid.snork] 					= true,
+                [clsid.snork_s] 				= true,
+                [clsid.tushkano] 				= true,
+                [clsid.tushkano_s] 				= true,
+                [clsid.psy_dog_s] 				= true,
+                [clsid.psy_dog_phantom_s] 		= true
+                }
+            end
+            return c and monster_classes[c] or false
+        end
+    end
+    if not alife_record then
+        _G.alife_record = function (se, tbl)
+        end
+    end
+    if not alife_create then
+        _G.alife_create = function(sec,pos,lid,gid,id,state)
+            if (type(pos) == "userdata") and (not pos.x) then
+                local obj = pos
+                local with_id = (lid == true)
+                state = gid
+                if (type(obj.id) == "function") then
+                    pos = obj:position()
+                    lid = obj:level_vertex_id()
+                    gid = obj:game_vertex_id()
+                    id  = with_id and obj:id()
+                elseif obj.id then
+                    pos = obj.position
+                    lid = obj.m_level_vertex_id
+                    gid = obj.m_game_vertex_id
+                    id  = with_id and obj.id
+                else
+                    callstack()
+                    printe("!ERROR: alife_create | invalid usedata type")
+                    return
+                end
+            end
+            -- Validate
+            if not (sec and ini_sys:section_exist(sec)) then
+                callstack()
+                printe("!ERROR: alife_create | section [%s] is invalid!",sec)
+                return
+            elseif not (pos and lid and gid) then
+                callstack()
+                printe("!ERROR: invalid parameter for alife():create!",sec)
+                return
+            end
+            local se_obj
+            if (state ~= nil) then
+                se_obj = alife():create(sec, pos, lid, gid, id, state)
+            elseif id then
+                se_obj = alife():create(sec, pos, lid, gid, id)
+            else
+                se_obj = alife():create(sec, pos, lid, gid)
+            end
+            if (not se_obj) then
+                printe("!ERROR: alife_create | failed to create object [%s]!",sec)
+                return
+            else
+                alife_record(se_obj, true)
+                return se_obj
+            end
+        end
+    end
+    if not alife_release then
+        _G.alife_release = function(se_obj, msg)
+            if se_obj and (type(se_obj.id) == "function") then
+                se_obj = alife_object(se_obj:id())
+            end
+            if (not se_obj) then
+                callstack()
+                printe("!ERROR: alife_release | no server object!")
+                return nil
+            end
+            -- Custom prints for debugging
+            if msg then
+                printf("~ alife_release [%s] (%s) | %s", se_obj:section_name(), se_obj.id, msg)
+            end
+            -- NPC
+            if IsStalker(nil,cls) or IsMonster(nil,cls) then
+                local squad = se_obj.group_id and se_obj.group_id ~= 65535 and alife_object(se_obj.group_id)
+                if squad then
+                    squad:remove_npc(se_obj.id, true)
+                    return true
+                end
+            -- Squads
+            elseif (cls == clsid.online_offline_group_s or cls == clsid.online_offline_group) then
+                se_obj:remove_squad()
+                return true
+            -- Others
+            else
+                alife_record(se_obj, false)
+                alife():release(se_obj, true)
+                return true
+            end
+            return false
+        end
+    end
+    if not alife_release_id then
+        _G.alife_release_id = function(id, msg)
+            if (not id) then
+                callstack()
+                printf("!ERROR: alife_release_id | no id passed!")
+                return
+            end
+            return alife_release(alife_object(id), msg)
+        end
+    end
+    if not alife_object then
+        _G.alife_object = function(id)
+            if not id or id >= 65535 then return end
+            return alife():object(id)
+        end
+    end
+    if not is_empty then
+        _G.is_empty = function(t)
+            if not (t) then
+                return true
+            end
+            for i,j in pairs(t) do
+                return false
+            end
+            return true
+        end
+    end
+    _G.RES_GUIs = {}
+    _G.RES_GUIsInstances = {}
+    _G.RES_GUIs_keyfree = {}
+    if not Register_UI then
+        _G.Register_UI = function(name, path, instance)
+            if (not name) then
+                return
+            end
+            printf("* Register UI: %s", name)
+            RES_GUIs[name] = { path=path , instance=instance }
+            RES_GUIsInstances[name] = { path=path , instance=instance }
+            if (not RES_GUIs_keyfree[name]) then
+                KEYS_UNLOCK = false
+            end
+            SendScriptCallback("GUI_on_show", name, path)
+        end
+    end
+    if not Unregister_UI then
+        _G.Unregister_UI = function(name)
+            if not (name and RES_GUIs[name]) then
+                return
+            end
+            local path = RES_GUIs[name].path
+            printf("* Unregister UI: %s", name)
+            RES_GUIs[name] = nil
+            if is_empty(RES_GUIs) then
+                KEYS_UNLOCK = true
+            else
+                KEYS_UNLOCK = true
+                for n,p in pairs(RES_GUIs) do
+                    if (not RES_GUIs_keyfree[n]) then
+                        KEYS_UNLOCK = false
+                    end
+                end
+            end
+            SendScriptCallback("GUI_on_hide", name, path)
+        end
+    end
+end
+
+--MAIN SERVER-CLIENT BOOLEANS
+_G.IIsHosted = function ()
+   return ServerSOSOCK:IsSteamSocketOpen()
+end
+_G.IIsHost = function ()
+    return GameManager:GetFlag()
+end
+_G.IIsConnected = function ()
+    return ClientSocks:IsConnected()
+end
+_G.IIsClient = function ()
+    return not GameManager:GetFlag()
+end
+xr_conditions.IIsHost = function ()
+    return GameManager:GetFlag()
+end
+xr_conditions.IIsHosted = function ()
+   return ServerSOSOCK:IsSteamSocketOpen()
+end
+xr_conditions.IIsConnected = function ()
+    return ClientSocks:IsConnected()
+end
+xr_conditions.IIsClient = function ()
+    return not GameManager:GetFlag()
+end
+
+--OTHER THINGS
+_G.alife_register = function (se)
+    alife():register(se)
+end
+_G.IsActor = function(o, c)
+    if not c then
+        c = o and o:clsid()
+    end
+    return c == clsid.actor or c == clsid.script_actor
+end
+_G.IsSquad = function(o, c)
+    if not c then
+        c = o and o:clsid()
+    end
+    return c == clsid.online_offline_group or c == clsid.online_offline_group_s
+end
+_G.IsFood = function(o)
+	local str = type(o) ~= "string" and (o.section_name and o:section_name() or o.section and o:section()) or o
+	local d = ini_sys:r_string_ex(str, "kind")
+	local ptrs = {
+		["i_food"] = true,
+		["i_mutant_cooked"] = true,
+	}
+	return d and ptrs[d] and not string.find(str, "cigar", 1, true) or false
+end
+_G.IsMedical = function(o)
+	local str = type(o) ~= "string" and (o.section_name and o:section_name() or o.section and o:section()) or o
+	local d = ini_sys:r_string_ex(str, "kind")
+	return d == "i_medical"
+end
+_G.IsMedKit = function(o)
+	local str = type(o) ~= "string" and (o.section_name and o:section_name() or o.section and o:section()) or o
+	local d = ini_sys:r_string_ex(str, "kind")
+	if d == "i_medical" then
+		if string.match(str, "medkit") then return true end
+	end
+	return false
+end
+_G.IsTablets = function(o)
+	local str = type(o) ~= "string" and (o.section_name and o:section_name() or o.section and o:section()) or o
+	local d = ini_sys:r_string_ex(str, "kind")
+	if d == "i_medical" then
+		if string.match(str, "drug_") or str == "antirad_kalium" or str == "yadylin" or str == "akvatab" then return true end
+	end
+	return false
+end
+_G.IsBandages = function(o)
+	local str = type(o) ~= "string" and (o.section_name and o:section_name() or o.section and o:section()) or o
+	local d = ini_sys:r_string_ex(str, "kind")
+	if d == "i_medical" then
+		local ptsr = {
+			["bandage"] = true,
+			["jgut"] = true,
+		}
+		for t, _ in pairs(ptsr) do
+			if string.find(str, t) then return true end
+		end
+	end
+	return false
+end
+_G.IsDrugs = function(o)
+	local str = type(o) ~= "string" and (o.section_name and o:section_name() or o.section and o:section()) or o
+	local d = ini_sys:r_string_ex(str, "kind")
+	if d == "i_medical" then
+		local ptrs = {
+			["glucose"] = true,
+			["morphine"] = true,
+			["analgetic"] = true,
+			["rebirth"] = true,
+			["adrenaline"] = true,
+			["stimpack"] = true,
+			["salicidic"] = true,
+		}
+		for t, _ in pairs(ptrs) do
+			if string.match(str, t) then return true end
+		end
+	end
+	return false
+end
+_G.IsBowl = function(o)
+	local str = type(o) ~= "string" and (o.section_name and o:section_name() or o.section and o:section()) or o
+	local d = ini_sys:r_string_ex(str, "kind")
+	return d == "i_mutant_cooked"
+end
+_G.IsDrink = function(o)
+	local str = type(o) ~= "string" and (o.section_name and o:section_name() or o.section and o:section()) or o
+	local d = ini_sys:r_string_ex(str, "kind")
+	return d == "i_drink"
+end
+_G.IsCigar = function(o)
+	local str = type(o) ~= "string" and (o.section_name and o:section_name() or o.section and o:section()) or o
+	local d = ini_sys:r_string_ex(str, "kind")
+	local ptrs = {
+		["i_food"] = true,
+		["i_drink"] = true
+	}
+	return d and ptrs[d] and string.find(str, "cigar", 1, true)
+end
+_G.alife_create_client = function(sec,pos,lid,gid,id,state)
+    if IIsHost() then return alife_create(sec,pos,lid,gid,id,state) end
+    if type(pos) == "userdata" and not pos.x then
+        local obj = pos
+        state = gid
+
+        if (type(obj.id) == "function") then
+            pos = obj:position()
+            lid = obj:level_vertex_id()
+            gid = obj:game_vertex_id()
+            id  = lid and obj:id()
+        elseif obj.id then
+            pos = obj.position
+            lid = obj.m_level_vertex_id
+            gid = obj.m_game_vertex_id
+            id  = lid and obj.id
+        else
+            callstack()
+            printe("!ERROR: alife_create | invalid usedata type")
+            return
+        end
+    end
+
+    -- Validate
+    if not (sec and ini_sys:section_exist(sec)) then
+        callstack()
+        printe("!ERROR: alife_create | section [%s] is invalid!",sec)
+        return
+    elseif not (pos and lid and gid) then
+        callstack()
+        printe("!ERROR: invalid parameter for alife():create!",sec)
+        return
+    end
+
+    local se_obj
+    if state ~= nil then
+        se_obj = alife():create(sec, pos, lid, gid, id, state)
+    elseif id then
+        se_obj = alife():create(sec, pos, lid, gid, id)
+    else
+        se_obj = alife():create(sec, pos, lid, gid)
+    end
+    if not se_obj then
+        printe("!ERROR: alife_create | failed to create object [%s]!",sec)
+    else
+        if not IIsHost() then
+            if MPMain_STOGETHER.GameLoaded then
+                GameManager:OnQuestSpawner(se_obj)
+                if IsStalker(se_obj) or IsMonster(se_obj) then
+                    alife():release(se_obj)
+                end
+            end
+        else
+            alife_record(se_obj, true)
+            return se_obj
+        end
+    end
+end
+_G.alife_create_awaite = function(funca,sec,pos,lid,gid,id,state)
+	if IIsHost() then
+        local se_obj = alife_create(sec, pos, lid, gid, id, state)
+        funca(se_obj)
+        return se_obj --USELES BUT Why not?
+    end
+    if type(pos) == "userdata" and not pos.x then
+        local obj = pos
+        state = gid
+
+        if (type(obj.id) == "function") then
+            pos = obj:position()
+            lid = obj:level_vertex_id()
+            gid = obj:game_vertex_id()
+            id  = lid and obj:id()
+        elseif obj.id then
+            pos = obj.position
+            lid = obj.m_level_vertex_id
+            gid = obj.m_game_vertex_id
+            id  = lid and obj.id
+        else
+            callstack()
+            printe("!ERROR: alife_create | invalid usedata type")
+            return
+        end
+    end
+
+    -- Validate
+    if not (sec and ini_sys:section_exist(sec)) then
+        callstack()
+        printe("!ERROR: alife_create | section [%s] is invalid!",sec)
+        return
+    elseif not (pos and lid and gid) then
+        callstack()
+        printe("!ERROR: invalid parameter for alife():create!",sec)
+        return
+    end
+
+    local se_obj
+    if state ~= nil then
+        se_obj = alife():create(sec, pos, lid, gid, id, state)
+    elseif id then
+        se_obj = alife():create(sec, pos, lid, gid, id)
+    else
+        se_obj = alife():create(sec, pos, lid, gid)
+    end
+
+    if not se_obj then
+        printe("!ERROR: alife_create | failed to create object [%s]!",sec)
+    else
+        GameManager:OnQuestSpawner(se_obj)
+        alife():release(se_obj)
+        -- wait 5 secs for spawned and call funca
+        CreateTimeEvent(0, "TIME_EVENT_AWAIT", 0.1, function (DTIMEWAIT)
+            if time_global() > DTIMEWAIT then
+                callstack()
+                log("![ERROR] Failed to catch entity. Host refuse that spawn or failed to spawn?")
+                return true
+            end
+            if not funca then
+                callstack()
+                log("![ERROR] NO FUNCTION PROVIDED!")
+                return true
+            end
+            if AwaitThing and AwaitThing:section_name() == sec then
+                log("-[Client] Alife object spawned Catching!")
+                funca(AwaitThing)
+                return true
+            end
+            return false
+        end, time_global() + 5000)
+    end
+end
+_G.alife_create_special_awaite = function(funca, special, sec,pos,lid,gid,id,state)
+	if IIsHost() then
+        local se_obj = alife_create(sec, pos, lid, gid, id, state)
+        funca(se_obj)
+        return se_obj --USELES BUT Why not?
+    end
+    if type(pos) == "userdata" and not pos.x then
+        local obj = pos
+        state = gid
+
+        if (type(obj.id) == "function") then
+            pos = obj:position()
+            lid = obj:level_vertex_id()
+            gid = obj:game_vertex_id()
+            id  = lid and obj:id()
+        elseif obj.id then
+            pos = obj.position
+            lid = obj.m_level_vertex_id
+            gid = obj.m_game_vertex_id
+            id  = lid and obj.id
+        else
+            callstack()
+            printe("!ERROR: alife_create | invalid usedata type")
+            return
+        end
+    end
+
+    -- Validate
+    if not (sec and ini_sys:section_exist(sec)) then
+        callstack()
+        printe("!ERROR: alife_create | section [%s] is invalid!",sec)
+        return
+    elseif not (pos and lid and gid) then
+        callstack()
+        printe("!ERROR: invalid parameter for alife():create!",sec)
+        return
+    end
+
+    local se_obj
+    if state ~= nil then
+        se_obj = alife():create(sec, pos, lid, gid, id, state)
+    elseif id then
+        se_obj = alife():create(sec, pos, lid, gid, id)
+    else
+        se_obj = alife():create(sec, pos, lid, gid)
+    end
+
+    if not se_obj then
+        printe("!ERROR: alife_create | failed to create object [%s]!",sec)
+    else
+        special(se_obj)
+        GameManager:OnQuestSpawner(se_obj)
+        alife():release(se_obj)
+        -- wait 5 secs for spawned and call funca
+        CreateTimeEvent(0, "TIME_EVENT_AWAIT", 0.1, function (DTIMEWAIT)
+            if time_global() > DTIMEWAIT then
+                callstack()
+                log("![ERROR] Failed to catch entity. Host refuse that spawn or failed to spawn?")
+                return true
+            end
+            if not funca then
+                callstack()
+                log("![ERROR] NO FUNCTION PROVIDED!")
+                return true
+            end
+            if AwaitThing and AwaitThing:section_name() == sec then
+                log("-[Client] Alife object spawned Catching!")
+                funca(AwaitThing)
+                return true
+            end
+            return false
+        end, time_global() + 5000)
+    end
+end
+_G.alife_create_local = function(sec,pos,lid,gid,id,state)
+	if IIsHost() then return alife_create(sec, pos, lid, gid, id, state) end
+    if type(pos) == "userdata" and not pos.x then
+        local obj = pos
+        state = gid
+        if (type(obj.id) == "function") then
+            pos = obj:position()
+            lid = obj:level_vertex_id()
+            gid = obj:game_vertex_id()
+            id  = lid and obj:id()
+        elseif obj.id then
+            pos = obj.position
+            lid = obj.m_level_vertex_id
+            gid = obj.m_game_vertex_id
+            id  = lid and obj.id
+        else
+            callstack()
+            printe("!ERROR: alife_create | invalid usedata type")
+            return
+        end
+    end
+
+    -- Validate
+    if not (sec and ini_sys:section_exist(sec)) then
+        callstack()
+        printe("!ERROR: alife_create | section [%s] is invalid!",sec)
+        return
+    elseif not (pos and lid and gid) then
+        callstack()
+        printe("!ERROR: invalid parameter for alife():create!",sec)
+        return
+    end
+
+    local se_obj
+    if state ~= nil then
+        se_obj = alife():create_local(sec, pos, lid, gid, id, state)
+    elseif id then
+        se_obj = alife():create_local(sec, pos, lid, gid, id)
+    else
+        se_obj = alife():create_local(sec, pos, lid, gid)
+    end
+
+    if not se_obj then
+        printe("!ERROR: alife_create | failed to create object [%s]!",sec)
+    else
+        alife_record(se_obj, true)
+        return se_obj
+    end
+end
+_G.alife_release_full = function (se_obj, msg)
+    if not se_obj then
+        callstack()
+        printe("!ERROR: alife_release | no server object!")
+        return nil
+    end
+
+    if se_obj and (type(se_obj.id) == "function") then
+        se_obj = alife_object(se_obj:id())
+    end
+
+    if msg then
+        printf("~ alife_release [%s] (%s) | %s", se_obj:section_name(), se_obj.id, msg)
+    end
+    alife_record(se_obj, false)
+    alife():release_local(se_obj, true)
+    return true
+end
+_G.alife_release_client = function (se_obj, msg)
+    if IIsHost() then return alife_release(se_obj, msg) end
+
+    if se_obj and (type(se_obj.id) == "function") then
+        se_obj = alife_object(se_obj:id())
+    end
+
+    if not se_obj then
+        callstack()
+        printe("!ERROR: alife_release | no server object!")
+        return nil
+    end
+
+    GameManager:RequestEntityDespawn(se_obj)
+end
+_G.alife_release_client_id = function (id, msg)
+    alife_release_client(alife_object(id), msg)
+end
+_G.alife_release_full_id = function (id, msg)
+    alife_release_full(alife_object(id), msg)
+end
+if surge_manager then
+    function mp_set_state_surge(pstate)
+        if pstate then
+            surge_manager.start_surge(true)
+        else
+            surge_manager.stop_surge(true)
+        end
+    end
+end
+if psi_storm_manager then
+    function mp_set_state_storm(pstate)
+        if pstate then
+            psi_storm_manager.start_psi_storm(true)
+        else
+            psi_storm_manager.stop_psi_storm(true)
+        end
+    end
+end
+xr_conditions.is_mp_actor = function (enemy, object)
+    return enemy and IsActor(enemy)
+end
+function ApplyValues()
+    log("=== [RELOADING PROPERTIES] ===")
+    log("MP-WERASIK2AA: 2.0 Build 506")
+    ShowMarks = ui_mcm and ui_mcm.get("werasik2aa/show_marks") or false
+    ShowNames = ui_mcm and ui_mcm.get("werasik2aa/show_name") or false
+    ClearInvOnDeath = ui_mcm and ui_mcm.get("werasik2aa/clear_inv") or false
+    DropInvOnDeath = ui_mcm and ui_mcm.get("werasik2aa/drop_inv") or false
+    MaxPlayers = ui_mcm and ui_mcm.get("werasik2aa/max_players") or 3
+    FriendlyFire = ui_mcm and ui_mcm.get("werasik2aa/friendly_fire") or false
+    TransferAllToLevel = ui_mcm and ui_mcm.get("werasik2aa/transferalltolevel") or false
+    SectionExistCheck = ui_mcm and ui_mcm.get("werasik2aa/sections_check") or false
+    ChatKeyBind = ui_mcm and ui_mcm.get("werasik2aa/p2p_peer_chat") or DIK_keys.DIK_RMENU
+    ShowStats = ui_mcm and ui_mcm.get("werasik2aa/show_stats") or false
+    AllowResurrect = ui_mcm and ui_mcm.get("werasik2aa/resurrect_allow") or false
+    ReviveMode = ui_mcm and ui_mcm.get("werasik2aa/revive_mode") or "manual_revive"
+    ReviveModeEn = string.find(ReviveMode, "manual_revive")
+    TimeEResurrect = ui_mcm and ui_mcm.get("werasik2aa/resurrect_timeout") or 1
+    TimeToReviveOthers = ui_mcm and ui_mcm.get("werasik2aa/time_to_revive_others") or 5
+    AutoReviveDelay = ui_mcm and ui_mcm.get("werasik2aa/auto_revive_delay") or 120
+
+    --SETTUP PREFERENCES
+    GameManager:SetMaxPlayers(MaxPlayers)
+    GameManager:SetFriendFire(FriendlyFire)
+    GameManager:SetSectionMissmatchCheck(SectionExistCheck)
+    GameManager:SetTransferToAnotherLVL(TransferAllToLevel or true)
+    GameManager:SetDrawPlayerMarks(ShowMarks, ShowNames)
+    GameManager:SetDrawNetworkStats(ShowStats)
+end
+
+-- CALL APPLY ON START?
+ApplyValues()
+
+function MPAttackCondition(entity, player)
+    if not IIsHost() then return false end
+    -- ��������, ��� ��� ����� ������
+    local npc_storage = db.storage[entity:id()]
+    if not npc_storage then return true end
+
+    -- ����� ��� ����� � ���, �� �� �� ��������� �������
+    local active_scheme = npc_storage.active_scheme
+    if not active_scheme then return true end
+
+    -- �� �����, ��� ��� �� ��� ��������. � ����� ��������. ��� ���������.
+    --return xr_combat_ignore.is_enemy(entity, db.actor)
+    return xr_combat_ignore.is_enemy(entity, db.actor, npc_storage.combat_ignore)
+    --return xr_combat_ignore.is_enemy(entity, player, npc_storage.combat_ignore) and xr_combat_ignore.is_enemy(entity, db.actor, npc_storage.combat_ignore)
+end
+
+function on_key_press_fix(dik,bind,dis)
+    -- FOR COP/COC/SOC
+    if (level.present() and db.actor) then
+        SendScriptCallback("on_key_press", dik)
+    end
+    return false
+end
+
+function on_game_start()
+    -- COP / COC FIX
+    log("IT'S USED FOR COP/COC/SOC/ EMPTY. JUST NOTIFY")
+    ApplyValues()
+end
+
+-- Callbacks
+AddScriptCallback("onmp_player_connected_server")
+AddScriptCallback("onmp_player_connected")
+AddScriptCallback("onmp_player_disconnected_server")
+AddScriptCallback("onmp_player_disconnected")
+AddScriptCallback("onmp_player_changed_level")
+AddScriptCallback("onmp_player_chatted_message")
+AddScriptCallback("onmp_player_changed_visual")
+AddScriptCallback("onmp_player_info_portion")
+AddScriptCallback("onmp_player_interact")
+AddScriptCallback("onmp_entity_spawned")
+AddScriptCallback("onmp_connected")
+AddScriptCallback("onmp_player_task_data")
+
+-- Serializator
+_G.serialize_table_simple = function(tbl)
+    local type_ = type
+    local result = "{"
+    for key, value in pairs(tbl) do
+        if #result > 1 then
+            result = result .. ", "
+        end
+        if type_(key) == "string" then
+            result = result .. key .. " = "
+        else
+            result = result .. "[" .. tostring(key) .. "] = "
+        end
+        if type_(value) == "string" then
+            result = result .. string.format("%q", value)
+        elseif type_(value) == "number" or type_(value) == "boolean" then
+            result = result .. tostring(value)
+        elseif type_(value) == "table" then
+            result = result .. serialize_table_simple(value)
+        elseif type_(value) == "userdata" then
+            if value.x and value.y and value.z then
+                result = result .. serialize_table_simple({ value.x, value.y, value.z, value.w })
+            end
+        end
+    end
+    return result .. "}"
+end
+
+--PATCH GAME
+db.actors = {}
+MPMain_GamePatches_STOGETHER.Patch()
+if not IIsHost() then MPMain_Client_STOGETHER.Patch() else MPMain_Server_STOGETHER.Patch() end

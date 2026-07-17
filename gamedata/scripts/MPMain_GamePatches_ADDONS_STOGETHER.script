@@ -1,0 +1,3349 @@
+--[[
+[================]
+C++ Programmer & Author: Werasik2aa
+Project Creator: Monokit
+Modified by: Animor, Werasik2aa
+Description: Patches for addons. Like furniture or something like that.
+WHY I should do that? Maybe you do that huh?
+EXAMPLES.
+[================]
+--]]
+local GameManager = SteamGameManager()
+local function NOP(...) end
+local function RETURN_FALSE(...) return false end
+local function RETURN_TRUE(...) return true end
+local function RDEF(task_id, field, p, tsk)
+    if not (db.actor and tsk and field == "target") then return nil end
+    return tsk.current_target or tsk.task_giver_id
+end
+
+-- SOME TREASURES OR THINGS
+local OLDGROK_COCKSUCKER = grok_no_npc_friendly_fire and grok_no_npc_friendly_fire.npc_on_before_hit
+local OLDCRFUN = visual_memory_manager.get_crouch_mult
+local OLDDYNFARLS = dynamic_faction_relations_customizer and dynamic_faction_relations_customizer.get_npc_data_tbl
+local OLDARTILTBX = arti_lootboxes and arti_lootboxes.pick_lootbox
+
+-- FURNITURE
+local OLDPLACEFUR = placeable_furniture and placeable_furniture.create_object
+local OLDPICKUPFU = placeable_furniture and placeable_furniture.pickup_obj
+local OLDTAKEALLW = ui_furniture_workshop and ui_furniture_workshop.GiveStashItemsToActor
+local OLDPLFSOUND = ui_furniture_piano and ui_furniture_piano.PlaySound
+local OLDFURNIUPD = bind_light_furniture and bind_light_furniture.placeable_light_wrapper.update
+local OLDTOGGLEIG = ui_furniture_light and ui_furniture_light.toggle_light
+
+-- PDA TASKBOARD
+local OLDTBDETALS = pda_taskboard and pda_taskboard.get_details
+
+-- GRIM RAID SCOUT...
+local OLDGRASCOUTA = raid_tasks_scout and raid_tasks_scout.actor_on_update
+local OLDGRASCOUTB = raid_tasks_scout_dunge and raid_tasks_scout_dunge.actor_on_update
+local OLDGRASCOUTC = raid_tasks_scout_dunge and task_status_functor.raid_task_scout_dunge_status_functor
+local OLDGRAMAPGUI = raid_map_gui and raid_map_gui.RaidMap.OnClickMapInformantOption
+
+local OLDGRASMINES = raid_tasks_deliveries and task_status_functor.raid_task_delivery_mines_status_functor
+local OLDGRADELIWO = raid_tasks_deliveries and task_status_functor.raid_task_delivery_out_world_status_functor
+local OLDGRADELISO = raid_tasks_deliveries and task_status_functor.raid_task_delivery_out_status_functor
+local OLDGRADELISI = raid_tasks_deliveries and task_status_functor.raid_task_delivery_in_status_functor
+
+local OLDGRASCANER = raid_task_anomaly_scan and task_status_functor.raid_task_anomaly_scan_status_functor
+local OLDGRAKILLSA = raid_task_kill_and_delivery_out and task_status_functor.raid_task_kill_stalker_and_delivery_out_status_functor
+local OLGRARFFDLVR = raid_task_rf_find_and_delivery_out and task_status_functor.raid_task_rf_find_and_delivery_out_status_functor
+local OLGRARFFDRVR = raid_task_rf_scout_and_delivery_out and task_status_functor.raid_task_rf_scout_and_delivery_out_status_functor
+local OLGRARFFSQIT = raid_sudden_task_find_squad_and_delivery_out and task_status_functor.raid_sudden_task_find_squad_and_delivery_out_status_functor
+
+local OLDGRARAIDPR = raid_trade and raid_trade.set_profile_general
+
+local LastSyncMoney = {}
+
+-- RAID TASKS HACKS RANDOM STILL CAN MAKE SAME ITEMS
+local USEDNUMRNDT = {}
+local OLDRANDOMRT = math.random
+function NEWRANDOMRT(startl, endl)
+    local num = startl and endl and OLDRANDOMRT(startl, endl) or startl and OLDRANDOMRT(startl) or OLDRANDOMRT()
+    if USEDNUMRNDT[num] then
+        -- Just anti cycle overflow freeze.
+        printf("! COOP: STOGETHER : %s | NUM WAS OBTAINED", num)
+        USEDNUMRNDT[num] = false
+        return NEWRANDOMRT(startl, endl)
+    end
+    printf("! COOP: STOGETHER : %s | NUM WAS GENERATED", num)
+    USEDNUMRNDT[num] = true
+    return num
+end
+
+-- TASK FIND ITEM
+local OGRADTSKFINDA = raid_tasks_find and task_status_functor.raid_task_find_weapon_status_functor
+local OLDGRATSKFNDE = raid_tasks_find and raid_tasks_find.check_quest_box
+
+local OLDGRAREWARD = raid_utils and raid_utils.give_task_reward
+
+-- Magazines
+local OLDUNJECMAGS = magazines and magazines.func_unload_ammo
+local OLDEJECTMAGS = magazines and magazines.eject_magazine
+
+-- Loot claim
+local OLDLRCLAIMSP = grok_loot_claim and grok_loot_claim.npc_on_death_callback
+
+-- ACTOR SPEAK
+local OLDACTVOICEO = agdd_voiced_actor and agdd_voiced_actor.actor_speak
+local OLDACTVOICEN = agdd_voiced_actor and agdd_voiced_actor.actor_speak_base
+
+-- RF CLIENT SOUND
+local sound_source = MPMain_RF_Receiver_STOGETHER.get_sounder()
+local flags = { ret_value = true }
+
+-- WPO ARTI WPO
+local OLDCOLORWPOS  = utils_xml.get_color("d_purple")
+local OLDARTISTRIP = zzzz_arti_jamming_repairs and zzzz_arti_jamming_repairs.act_fieldstrip
+
+local function DNEWGETCOM(npc, default)
+    local blacklisted_comms = {
+        ["trader"] = true,
+        ["monster"] = true
+    }
+    local furniture = {
+        ["esc_m_trader"] = true,
+        ["red_m_lesnik"] = true
+    }
+    if furniture[npc:name()] then return "stalker" end
+    local community = character_community(npc)
+    if not blacklisted_comms[community] then return community end
+    local sq = get_object_squad(npc)
+    local squad_community = sq and sq:get_squad_community()
+    if squad_community and not blacklisted_comms[squad_community] then return squad_community end
+    return default or "stalker"
+end
+
+function engine_perform_special_addon_sync(id, ToPlayerNetID)
+    CreateTimeEvent(id, "send_special_addons_sync", 0.1, function ()
+        if magazines then
+            local mag_data = magazines.get_mag_data(id)
+            if not mag_data then return true end
+            local payload = { GameManager:GetServerIDByLocalID(id), { #mag_data.loaded, mag_data.loaded[1] } }
+            GameManager:OnICustomScriptAction("magazines", "remote_set_mag_or_ammo", serialize_table_simple(payload), false, ToPlayerNetID or 0)
+        end
+        return true
+    end)
+end
+
+local MCMSetting = reworked_rf_receiver_mcm and reworked_rf_receiver_mcm.get_config("only_equip_rf") or false
+function addoned_rf_client()
+    -- Raid to grim rf receiver beeper
+    if raid_tasks_main and raid_tasks_main.raid_active_tasks then
+        -- From slot or active detector object
+        local obj_det = MCMSetting and db.actor:item_in_slot(9) or db.actor:active_detector()
+        if not (obj_det and sound_source and obj_det:section() == "detector_radio") then return true end
+        -- Search the raid quest points
+        for k, v in pairs(raid_tasks_main.raid_active_tasks) do
+            if v and v.target_freq and v.target_position and v.level_name then
+                local mpos = vector():set(v.target_position[1], v.target_position[2], v.target_position[3])
+                local dist = db.actor:position():distance_to(mpos)
+                if dist < 250 and v.level_name == level.name() then
+                    MPMain_RF_Receiver_STOGETHER.set_beep_freq(dist)
+                    local dist_ratio = dist / 250
+                    local pass_range = item_radio.is_in_range(v.target_freq)
+                    local vol_range = item_radio.get_vol_range(v.target_freq)
+                    local vol_signal = pass_range and clamp((1 - dist_ratio) * vol_range, 0, 1) or 0
+                    sound_source:play(db.actor, 0, sound_object.s2d)
+                    sound_source.volume = vol_signal
+                end
+            end
+        end
+        return true
+    end
+    return false
+end
+
+function ui_workshop.UIWorkshopCraft:addoned_uicraft()
+    -- CHECK BEHAVIOUR
+    if not zz_item_artefact then return false end
+    -- This array will contain the craft items to despawn haha.
+    local payload = {}
+
+    -- GAMMA variables, used for artefact crafting sorry i dunno how it;s works...
+    local total_cond = 0
+    local counter = 0
+    local randomize = 0
+    local randomina = zz_item_artefact.arti_min_eff or 30
+    local randomaxa = zz_item_artefact.arti_max_eff or 44
+
+    -- Check condition and other parameters
+    for i = 1, #self.craft_item do
+        -- Calc craft item to be in list it;s easier sync instead of other...
+        if #self.craft_item[i] > 0 then
+            for j = 1, #self.craft_item[i] do
+                local item_id = self.craft_item[i][j]
+                local obj = level.object_by_id(item_id)
+                local obj_p = obj and obj:parent()
+                if obj_p then
+                    local kindergarden = SYS_GetParam(0, obj:section(), "kind")
+                    if kindergarden == "i_arty_junk" then
+                        total_cond = 1
+                        counter = 1
+                        randomize = 1
+                    elseif kindergarden == "i_arty" then
+                        total_cond = total_cond + obj:condition()
+                        counter = counter + 1
+                        randomize = 0
+                    end
+                    if obj_p:id() == db.actor:id() or IIsHost() then
+                        alife_release(obj)
+                    elseif obj_p:id() ~= 0 then
+                        payload[#payload + 1] = GameManager:GetServerIDByLocalID(item_id)
+                    end
+                end
+            end
+        end
+
+        -- Perform special sync when discharge tools...
+        local remain = self.craft_item_remain[i]
+        if remain and remain.id and remain.cnt then
+            local obj_itm = level.object_by_id(remain.id)
+            if obj_itm then
+                if utils_item.discharge(obj_itm, remain.cnt) ~= 0 then
+                    MPMain_GamePatches_STOGETHER.engine_perform_special_sync(remain.id)
+                else
+                    payload[#payload + 1] = GameManager:GetServerIDByLocalID(remain.id)
+                end
+            end
+        end
+    end
+
+    -- Increase Statistic
+    game_statistics.increment_statistic("items_crafted")
+
+    -- Effect
+    actor_effects.play_item_fx("craft_dummy")
+
+    -- Craft item that we decide
+    local crafto = self.craft_item_r[1]
+    local params = self.craft_item_r[2]
+    if IsItem("ammo", crafto) then
+        alife_create_item(crafto, db.actor, { ammo = params })
+    else
+        for _ = 1, params do
+            local kind = SYS_GetParam(0, crafto, "kind")
+            if kind == "i_arty" or kind == "i_arty_cont" then
+                if counter > 0 and total_cond > 0 then
+                    local cond_to_set = total_cond / counter
+                    -- GAMMA artefact overhaul: a junk ingredient rolls random effectiveness; keeps the average on plain Anomaly
+                    if cond_to_set >= 0.99 then cond_to_set = 0.989 end
+                    if randomize == 1 then cond_to_set = math.random(randomina, randomaxa) / 100 end
+                    alife_create_item(crafto, db.actor, { cond = cond_to_set })
+                end
+            else
+                alife_create_item(crafto, db.actor)
+            end
+        end
+    end
+
+    -- Sending to clients request to clear that items in ui or host do releasing
+    GameManager:OnICustomScriptAction("ui_workshop", "silent_craft_item", serialize_table_simple(payload), false)
+
+    -- LOST MODDED BEHAVIOUR AND STFU IT
+    if self.last_cont and self.last_idx and self.UpdateUi then
+        self.btn_craft:Enable(false)
+        CreateTimeEvent("totally_not_random_event" .. time_global(), "update_ui_delay" .. time_global(), 0.1, self.UpdateUi, self, self.last_cont, self.last_idx)
+    end
+    return true
+end
+
+function addoned_draw_postpone_locally(task_id)
+    local task_ini = task_manager.task_ini
+    if igi_generic_task and igi_desscription then
+        local igi_qmp_details = igi_generic_task and igi_generic_task.TASK_SETUP[task_id]
+        if igi_qmp_details then
+            local title, text, icon = igi_desscription.get_task_text_values(igi_qmp_details)
+            return { title, text, icon , "iconed_answer_item" }
+        end
+    end
+    -- If nta_details has super quest another like...
+    local nta_details = task_ini:r_string_ex(task_id, "nta_task_details")
+    if nta_details then
+        local data = load_var(db.actor, task_id) or {}
+        local news_text = game.translate_string(nta_details)
+        local title = game.translate_string(task_ini:r_string_ex(task_id, "title") or "error")
+        local icon = task_ini:r_string_ex(task_id, "icon") or "ui_iconsTotal_mutant"
+        local realtbl = type(data) == "table"
+        local map = realtbl and (data.lvl_target or data.target_map or data.map or data.level_name or data.lvl_task)
+        local locname = map and (game.translate_string("st_location") .. ": " .. game.translate_string(map)) or ""
+        if locname ~= "" then news_text = news_text .. "\\n " .. locname end
+        db.actor:give_talk_message2(title, news_text, icon, "iconed_answer_item")
+        return { title, news_text, icon, "iconed_answer_item" }
+    end
+    -- Fetch task and addoned z_fetch_shows_count
+    local sec = load_var(db.actor, task_id .. "_fetch")
+    if z_fetch_shows_count and sec then
+        local news_caption = game.translate_string("ui_inv_needs") .. ":"
+        local fetch_count = load_var(db.actor, task_id .. "_fetch_count") or 1
+        local iname = game.translate_string(ini_sys:r_string_ex(sec, "inv_name") or sec)
+        local extra = ""
+        if (ini_sys:r_string_ex(sec, "kind") == "i_arty") then
+            extra = " " .. game.translate_string("st_ui_artefact")
+        end
+        local clr = utils_xml.get_color("pda_white")
+        local news_text = iname .. extra .. clr .. " (x" .. fetch_count .. ")"
+        news_text = z_fetch_shows_count.extend_news_text(news_text, sec, fetch_count)
+        local news_ico = task_manager.task_ini:r_string_ex(task_id, "icon") or "ui_inGame2_D_Sisshik"
+        db.actor:give_talk_message2(news_caption, news_text, news_ico, "iconed_answer_item")
+        return { news_caption, news_text, news_ico, "iconed_answer_item" }
+    end
+    -- Skip specials
+    return MPMain_QuestPatches_STOGETHER.client_draw_postpone_locally(task_id, true)
+end
+
+function Patch()
+    if not GameManager:GetFlag() then Patch_Client() end
+    -- ==== Patches of launch on new aoe and off features =====
+    if not _G.class_registrator_modded_exes then
+        _G.class_registrator_modded_exes = {}
+    end
+    _G.class_registrator_modded_exes.cs_register = function(factory,client_object_class,server_object_class,clsid,script_clsid)
+        factory:register(client_object_class,server_object_class,clsid,script_clsid)
+    end
+    _G.class_registrator_modded_exes.c_register = function(factory,client_object_class,clsid,script_clsid)
+        if not editor() then factory:register(client_object_class,clsid,script_clsid) end
+    end
+    _G.class_registrator_modded_exes.s_register = function(factory,server_object_class,clsid,script_clsid)
+        factory:register(server_object_class,clsid,script_clsid)
+    end
+    _G.class_registrator_modded_exes.register = function(object_factory)
+        cs_register(object_factory, "CWeaponSSRS", "se_item.se_weapon_magazined", "_WP_SSRS", "wpn_ssrs_s")
+    end
+    -- Some missing or new db something likely
+    if not (clsid.wpn_ssrs and clsid.wpn_ssrs_s) then
+        clsid.wpn_ssrs = clsid.wpn_ssrs or clsid.wpn_vintorez
+        clsid.wpn_ssrs_s = clsid.wpn_ssrs_s or clsid.wpn_vintorez_s
+    end
+    -- Imgui onrender funca
+    if not axr_main["imgui_on_render"] then
+        AddScriptCallback("imgui_on_render")
+    end
+    -- This part we fill with disable stuff which not supported in MP at all
+    -- New aoe don't support this shit. Or just to disble it
+    _G.se_stmgun = {}
+    _G.se_projector = {}
+    _G.sar_mcm_handler_mcm = {}
+    _G.sar_reverb_preset = {}
+    _G.sar_snd_replacer = {}
+    _G.sar_main = {}
+    _G.zzzz_ads_sound = {}
+    _G.swm_legs = {}
+    _G.npc_loot_claim = {}
+    -- ==== END =====
+    -- Arti jam
+    if zzzz_arti_jamming_repairs then
+        zzzz_arti_jamming_repairs.act_fieldstrip = function (id, part_name)
+            local obj = level.object_by_id(id)
+            if not obj then return end
+            OLDARTISTRIP(id, part_name)
+            -- Sync ejected part!
+            local parent = obj:parent()
+            if parent and parent:id() ~= db.actor:id() then
+                local payload = string.format("%s, %s", id, part_name)
+                GameManager:OnICustomScriptAction("zzzz_arti_jamming_repairs", "remote_remove_part", payload, false)
+            end
+        end
+        zzzz_arti_jamming_repairs.remote_remove_part = function (id, part_name)
+            id = id and GameManager:GetLocalIDByServerID(id)
+            local part_list = item_parts.get_parts_con(level.object_by_id(id), id, false)
+            if not part_list then return end
+            printf("=== [Client] Someone ejected part [%u][%s] or its flag!", id, tostring(part_name))
+            -- Remote remove specific part...
+            if part_list[part_name] then
+                printf("[Client] Part %s = ejected!", tostring(ipart_name))
+                part_list[part_name] = -1
+                return
+            end
+            -- Remove all if not selected any specific
+            for ipart_name, v in pairs(part_list) do
+                printf("[Client] Part %s = ejected!", tostring(ipart_name))
+                part_list[ipart_name] = -1
+            end
+        end
+        function ui_item.build_desc_header(obj, sec, str)
+            local _str = ""
+            local _str2 = zzzz_arti_jamming_repairs.original_build_desc_header(obj, sec, str)
+            local flag = a_arti_jamming_mcm.on_key_press and a_arti_jamming_mcm.on_key_hold or zzzz_arti_jamming_repairs.get_config("display")
+            if obj and IsWeapon(obj) and not IsAmmo(obj) and flag and zzzz_arti_jamming_repairs.has_parts(obj) then
+                local display_str = ""
+                local parts = item_parts.get_parts_con(obj, obj:id(), true) or {}
+                for k, v in pairs(parts) do
+                    display_str = display_str .. zzzz_arti_jamming_repairs.process_part(k, v)
+                end
+                _str = _str .. " " .. OLDCOLORWPOS .. game.translate_string("st_name_issues") .. "\\n" .. display_str
+            end
+            return _str .. _str2
+        end
+    end
+    -- Grok shit fixes
+    if grok_actor_damage_balancer then
+        grok_actor_damage_balancer.premitigation = 0
+    end
+    -- Magazines
+    if magazines then
+        magazines.remote_set_mag_or_ammo = function (data)
+            local id = GameManager:GetLocalIDByServerID(data[1])
+            local value = data[2]
+            local ammobox = data[3]
+            local obj = level.object_by_id(id)
+            -- Wow simplified
+            if not obj then return end
+            -- Set Magazine val
+            if not ammobox then
+                local mag_data = magazines.get_mag_data(id)
+                if mag_data then
+                    -- Fill mag with same type of ammo...
+                    mag_data.loaded = {}
+                    if value[2] then
+                        for i = 1, value[1] do
+                            stack.push(mag_data.loaded, value[2])
+                        end
+                    end
+                    magazines.set_mag_data(id, mag_data)
+                end
+                return
+            end
+            -- Set ammo box val
+            if not obj.ammo_set_count then return end
+            obj:ammo_set_count(value)
+        end
+        -- Remote eject magazine behavior
+        magazines.ejectmug_remote_event = function (id, obj)
+            obj = obj or level.object_by_id(GameManager:GetLocalIDByServerID(id))
+            if not (obj and obj:parent()) then return end
+            if IIsHost() then return OLDEJECTMAGS(obj) end
+            obj:set_ammo_elapsed(0)
+            return true
+        end
+        magazines.eject_magazine = function (weapon, remote)
+            if not (weapon and weapon:parent()) then return end
+            if weapon:parent():id() == db.actor:id() then return OLDEJECTMAGS(weapon) end
+            -- Send sync events
+            local srvid = GameManager:GetServerIDByLocalID(weapon:id())
+            GameManager:OnICustomScriptAction("magazines", "ejectmug_remote_event", tostring(srvid), false)
+            return magazines.ejectmug_remote_event(weapon:id(), weapon)
+        end
+        -- Remote unload behavior
+        -- WERASIK2AA TODO: MAKE GLOBAL
+        magazines.host_spawn_ammo = function (data)
+            data[2] = vector():set(data[2][1], data[2][2], data[2][3])
+            create_ammo(data[1], data[2], data[3], data[4], data[5], data[6])
+        end
+        magazines.func_unload_ammo = function (obj)
+            if not (obj and obj:parent() and magazines.is_magazine(obj)) then return end
+            -- Fuck the syncing timed update. Fast eject_magazine
+            local mag_parent = obj:parent()
+            local pos = mag_parent:position()
+            local lv = mag_parent:level_vertex_id()
+            local gv = mag_parent:game_vertex_id()
+            local flagfast = IsInvbox(mag_parent) or not magazines_mcm or magazines_mcm.get_config("unload_behavior") == 1
+            local flaglocal = mag_parent:id() == db.actor:id()
+            if flagfast then
+                local mag_data = magazines.get_mag_data(obj:id())
+                if not mag_data then return end
+                local ammo_to_make = {}
+                while #mag_data.loaded > 0 do
+                    local round = stack.pop(mag_data.loaded)
+                    ammo_to_make[round] = (ammo_to_make[round] or 0) + 1
+                end
+                -- Play Sound
+                local snd_obj = sound_object("magazines\\ammo_load"..math.random(1, 7))
+	            if snd_obj then snd_obj:play_no_feedback(mag_parent, 0, 0, pos, 1.0, 1.0) end
+                -- Host spawns ammo in that box
+                if IIsHost() or flaglocal then
+                    for k, v in pairs(ammo_to_make) do
+                        create_ammo(k, pos, lv, gv, mag_parent:id(), v)
+                    end
+                else
+                    for k, v in pairs(ammo_to_make) do
+                        local payload = { k, pos, lv, gv, mag_parent:id(), v }
+                        GameManager:OnICustomScriptAction("magazines", "host_spawn_ammo", serialize_table_simple(payload), false)
+                    end
+                end
+                -- Save mag data
+                magazines.set_mag_data(obj:id(), mag_data)
+                magazines.timed_refresh()
+                -- Sync mag data
+                if not flaglocal then
+                    local payload = { GameManager:GetServerIDByLocalID(obj:id()), { #mag_data.loaded,  mag_data.loaded[1] } }
+                    GameManager:OnICustomScriptAction("magazines", "remote_set_mag_or_ammo", serialize_table_simple(payload), false)
+                end
+            else -- Timed unloading...
+                local msection = obj:section()
+                local delay = magazines.get_mag_time(msection, true)
+                CreateTimeEvent("mag_redux", "unload_mag_remote_"..msection, delay, function (magazine)
+                    if not magazine then return true end
+                    -- Check and interrup if it's our action (like we can interrup that)
+                    if ui_inventory.GUI and not ui_inventory.GUI:IsShown() then
+                        printf("== Player interrupt that unload")
+                        return true
+                    end
+                    -- All stuff works below
+                    local mag_data = magazines.get_mag_data(magazine:id())
+                    if not mag_data or #mag_data.loaded == 0 then return true end
+                    local mag_rounds = stack.pop(mag_data.loaded)
+                    if not (mag_parent and mag_rounds) then return true end
+                    -- Spawn ammo if we host
+                    local magpid = mag_parent:id()
+                    if IIsHost() or magpid == db.actor:id() then
+                        create_ammo(mag_rounds, pos, lv, gv, magpid, 1)
+                        local payload = { mag_rounds, pos, lv, gv, magpid, 1 }
+                        GameManager:OnICustomScriptAction("magazines", "host_spawn_ammo", serialize_table_simple(payload), false)
+                    end
+                    -- Play sound near that box/npc
+                    local snd_obj = sound_object("magazines\\ammo_load"..math.random(1, 7))
+	                if snd_obj then
+                        snd_obj:play_no_feedback(mag_parent, 0, 0, pos, 1.0, 1.0)
+                    end
+                    -- Save data
+                    magazines.set_mag_data(magazine:id(), mag_data)
+                    magazines.timed_refresh()
+                    -- Reset timer due delay...
+                    ResetTimeEvent("mag_redux", "unload_mag_remote_"..msection, delay)
+                    -- Sync mag data
+                    if not flaglocal then
+                        local payload = { GameManager:GetServerIDByLocalID(obj:id()), { #mag_data.loaded,  mag_data.loaded[1] } }
+                        GameManager:OnICustomScriptAction("magazines", "remote_set_mag_or_ammo", serialize_table_simple(payload), false)
+                    end
+                    return false
+                end, obj)
+            end
+        end
+        -- Load ammo functos
+        magazines.fast_load_magazine = function (obj, ammo_obj, load_one)
+            if not (obj and obj:parent() and ammo_obj and ammo_obj:parent()) then return end
+            local mag_data = magazines.get_mag_data(obj:id())
+            if not mag_data then return end
+            local parent = ammo_obj:parent()
+            local mag_parent = obj:parent()
+            local ammo_sec = ammo_obj:section()
+            local capacity = SYS_GetParam(2, obj:section(), "max_mag_size")
+            local ammo_to_load = capacity - #mag_data.loaded
+            local flagslow = not IsInvbox(mag_parent) or not magazines_mcm or magazines_mcm.get_config("unload_behavior") == 1
+            local flaglocal = mag_parent:id() == db.actor:id()
+            local function itr_box(_, item)
+                if item:section() == ammo_sec and ammo_to_load > 0 then
+                    if ui_inventory.GUI and not ui_inventory.GUI:IsShown() then
+                        printf("== Player interrupt that unload")
+                        return true
+                    end
+                    local available = item:ammo_get_count()
+                    local to_take = math.min(available, ammo_to_load)
+                    ammo_to_load = ammo_to_load - to_take
+                    for _ = 1, to_take do
+                        stack.push(mag_data.loaded, ammo_sec)
+                    end
+                    -- Check who parent and determ sync that or no
+                    if to_take == available then
+                        if flaglocal then
+                            alife_release(item)
+                        else
+                            alife_release_client(item)
+                        end
+                    elseif flaglocal then
+                        item:ammo_set_count(available - to_take)
+                    else
+                        local num = available - to_take
+                        item:ammo_set_count(num)
+                        local payload = { GameManager:GetServerIDByLocalID(item:id()), num, true }
+                        GameManager:OnICustomScriptAction("magazines", "remote_set_mag_or_ammo", serialize_table_simple(payload), false)
+                    end
+                    -- Save data and sync
+                    magazines.set_mag_data(obj:id(), mag_data)
+                    magazines.timed_refresh()
+                    -- Play sound
+                    xr_sound.set_sound_play(db.actor:id(), "reload_shell")
+                    -- Sync mag data
+                    if not flaglocal then
+                        local payload = { GameManager:GetServerIDByLocalID(obj:id()), { #mag_data.loaded,  mag_data.loaded[1] } }
+                        GameManager:OnICustomScriptAction("magazines", "remote_set_mag_or_ammo", serialize_table_simple(payload), false)
+                    end
+                    return flagslow
+                end
+            end
+            -- Depends on flag doing iterating and filling
+            if flagslow then
+                local delay = magazines.get_mag_time(obj:section(), true)
+                CreateTimeEvent("mag_redux", "load_mag_remote_"..obj:section(), delay, function (magazine)
+                    if IsInvbox(parent) then
+                        parent:iterate_inventory_box(itr_box)
+                    else
+                        parent:iterate_inventory(itr_box)
+                    end
+                end)
+            elseif IsInvbox(parent) then
+                parent:iterate_inventory_box(itr_box)
+            else
+                parent:iterate_inventory(itr_box)
+            end
+        end
+    end
+    -- ANIMOR and WERASIK2AA...
+    if ui_pda_taskboard_tab and pda_taskboard and z_taskboard_overrides then
+        pda_taskboard.get_details = function(task_info)
+            if IIsHost() then return OLDTBDETALS(task_info) end
+            return task_info or {}
+        end
+        pda_taskboard.remote_request_improved_taskboard = function(table_data, onlyreturn)
+            local netid = table_data.netid
+            local srv_ids = table_data.srv_ids
+            local response_data = {}
+            pda_taskboard.refresh_tasks()
+            for _, srv_id in ipairs(srv_ids) do
+                local npc = level.object_by_id(srv_id)
+                if npc then
+                    ui_pda_taskboard_tab.currently_processed_npc_id = srv_id
+                    local backend_data = MPMain_QuestPatches_STOGETHER.get_busied_npcs()
+                    backend_data[65536] = { id = npc:id(), busy = true, netid = netid }
+                    axr_task_manager.generate_available_tasks(npc, string.find(npc:section(), "sim_", 1, true))
+                    local tasks = axr_task_manager.available_tasks[srv_id] or {}
+                    for _, task_id in ipairs(tasks) do
+                        z_taskboard_overrides.StartOverride()
+                        pda_taskboard.prepare_task({ task_id = task_id, npc_id = srv_id })
+                        z_taskboard_overrides.StopOverride()
+                        MPMain_QuestPatches_STOGETHER.sync_task_variables(task_id, netid)
+                        --Begin job collector
+                        local task_effect = pda_taskboard.get_task_effect(task_id)
+                        local details = pda_taskboard.get_details({ task_id = task_id, has_details = false })
+                        if not response_data[task_effect] then response_data[task_effect] = {} end
+                        response_data[task_effect][#response_data[task_effect]+1] = {
+                            npc_id = srv_id,
+                            task_id = task_id,
+                            task_details = details and details.task_details or nil,
+                            task_icon = details and details.task_icon or task_manager.task_ini:r_string_ex(task_id, "icon") or "ui_icon_equipment_unknown",
+                            task_fetch = load_var(db.actor, task_id .. "_fetch")
+                        }
+                    end
+                    backend_data[65536] = nil
+                    ui_pda_taskboard_tab.currently_processed_npc_id = nil
+                end
+            end
+            if onlyreturn then return response_data end
+            GameManager:OnICustomScriptAction("pda_taskboard", "remote_receive_improved_taskboard", serialize_table_simple(response_data), false, netid)
+        end
+        pda_taskboard.remote_receive_improved_taskboard = function(table_data)
+            local backend_data = pda_taskboard.get_data()
+            empty_table(backend_data)
+            -- Convert to normal ids and finish it
+            for k, tasks in pairs(table_data) do
+                backend_data[k] = {}
+                for _, t in ipairs(tasks) do
+                    local pprope = MPMain_QuestPatches_STOGETHER.client_draw_postpone_locally(t.task_id)
+                    t.npc_id = GameManager:GetLocalIDByServerID(t.npc_id)
+                    t.task_description = pda_taskboard.get_long_task_description({ task_id = t.task_id })
+                    t.task_title = game.translate_string(task_manager.task_ini:r_string_ex(t.task_id, "title") or "")
+                    t.task_details = t.task_details or pprope and pprope[2] or ""
+                    if t.task_fetch then
+                        t.task_title = t.task_title:gsub("%%s", ui_item.get_sec_name(t.task_fetch))
+                    else -- Freq parse to string key
+                        local data = load_var(db.actor, t.task_id)
+                        if type(data) == "table" and data.freq then
+                            t.task_title = utils_data.parse_string_keys(t.task_title, { ["freq"] = data.freq })
+                        end
+                    end
+                    t.has_details = true
+                    backend_data[k][#backend_data[k]+1] = t
+                end
+            end
+            local ui = ui_pda_taskboard_tab.get_ui()
+            if ui and ui:IsShown() then
+                ui:DrawCategoryList()
+            end
+        end
+        function ui_pda_taskboard_tab.pda_taskboard_tab:OnBtnRefreshClicked()
+            if IIsHost() then
+                self.task_list:RemoveAll()
+                pda_taskboard.refresh_tasks()
+                self:DrawCategoryList()
+                return
+            end
+            self.task_list:RemoveAll()
+            self.category_list:RemoveAll()
+            local srv_ids = {}
+            local npc_list = pda_taskboard.get_nearby_npcs()
+            for _, npc in ipairs(npc_list) do
+                if not IsActor(npc) then
+                    srv_ids[#srv_ids+1] = GameManager:GetServerIDByLocalID(npc:id())
+                end
+            end
+            if #srv_ids > 0 then
+                local payload = { srv_ids = srv_ids, netid = GameManager:GetMySNETID() }
+                GameManager:OnICustomScriptAction("pda_taskboard", "remote_request_improved_taskboard", serialize_table_simple(payload), true)
+                actor_menu.set_msg(1, game.translate_string("st_pda_accessing_network"), 3)
+            end
+        end
+    elseif ui_pda_taskboard_tab and z_taskboard_overrides then
+        if not ui_pda_taskboard_tab.get_task_effect then
+            ui_pda_taskboard_tab.get_task_effect = function (task_id)
+                local raw_task_effect_descr = task_manager.task_ini:r_string_ex(task_id, "on_job_descr")
+                local raw_task_effect_fetch = task_manager.task_ini:r_string_ex(task_id, "fetch_func")
+                local str = raw_task_effect_descr or raw_task_effect_fetch or ""
+			    local task_effect = string.gmatch(str, "=(.*)%(")() or "rest"
+                return ui_pda_taskboard_tab.normalize_task_effect(task_effect)
+            end
+        end
+        ui_pda_taskboard_tab.remote_request_taskboard_data = function(table_data, onlyreturn)
+            local netid = table_data.netid
+            local response_data = {}
+            for _, srv_id in ipairs(table_data.srv_ids) do
+                local npc = level.object_by_id(srv_id)
+                if npc then
+                    ui_pda_taskboard_tab.currently_processed_npc_id = srv_id
+                    local backend_data = MPMain_QuestPatches_STOGETHER.get_busied_npcs()
+                    backend_data[65536] = { id = npc:id(), busy = true, netid = netid }
+                    axr_task_manager.generate_available_tasks(npc, string.find(npc:section(), "sim_", 1, true) ~= nil)
+                    z_taskboard_overrides.clear_tasks_info()
+                    local tasks = axr_task_manager.available_tasks[srv_id] or {}
+                    for _, task_id in ipairs(tasks) do
+                        ui_pda_taskboard_tab.prepare_task({ task_id = task_id, npc_id = srv_id })
+                        MPMain_QuestPatches_STOGETHER.sync_task_variables(task_id, netid)
+                        -- Begin job collector
+                        local info = z_taskboard_overrides.tasks_info[1] or {}
+                        local task_effect = ui_pda_taskboard_tab.get_task_effect(task_id)
+                        if not response_data[task_effect] then response_data[task_effect] = {} end
+                        response_data[task_effect][#response_data[task_effect]+1] = {
+                            npc_id = srv_id,
+                            task_id = task_id,
+                            task_details = info and info.task_details,
+                            task_icon = info and info.task_icon or task_manager.task_ini:r_string_ex(task_id, "icon") or "ui_icon_equipment_unknown",
+                            task_fetch = load_var(db.actor, task_id .. "_fetch")
+                        }
+                    end
+                    backend_data[65536] = nil
+                    ui_pda_taskboard_tab.currently_processed_npc_id = nil
+                end
+            end
+            if onlyreturn then return response_data end
+            GameManager:OnICustomScriptAction("ui_pda_taskboard_tab", "remote_receive_taskboard_data", serialize_table_simple(response_data), false, netid)
+        end
+        ui_pda_taskboard_tab.global_prepared_tasks_data = {}
+        ui_pda_taskboard_tab.remote_receive_taskboard_data = function(table_data)
+            local backend_data = ui_pda_taskboard_tab.global_prepared_tasks_data
+            empty_table(backend_data)
+            -- Convert to normal ids and finish it
+            for k, tasks in pairs(table_data) do
+                backend_data[k] = {}
+                for _, t in ipairs(tasks) do
+                    local pprope = MPMain_QuestPatches_STOGETHER.client_draw_postpone_locally(t.task_id)
+                    t.npc_id = GameManager:GetLocalIDByServerID(t.npc_id)
+                    t.effector = k
+                    t.task_description = ui_pda_taskboard_tab.get_long_task_description({ task_id = t.task_id })
+                    t.task_title = game.translate_string(task_manager.task_ini:r_string_ex(t.task_id, "title") or "")
+                    t.task_details = t.task_details or pprope and pprope[2] or ""
+                    if t.task_fetch then
+                        t.task_title = t.task_title:gsub("%%s", ui_item.get_sec_name(t.task_fetch))
+                    else -- Freq parse to string key
+                        local data = load_var(db.actor, t.task_id)
+                        if type(data) == "table" and data.freq then
+                            t.task_title = utils_data.parse_string_keys(t.task_title, { ["freq"] = data.freq })
+                        end
+                    end
+                    t.has_details = true
+                    backend_data[k][#backend_data[k]+1] = t
+                end
+            end
+            -- Refresh Task List
+            local ui = ui_pda_taskboard_tab.get_ui()
+            if ui then
+                ui:RefreshFromNetwork()
+            end
+        end
+        ui_pda_taskboard_tab.reset_taskboard = function(pda_tab)
+            ui_pda_taskboard_tab.global_prepared_tasks_data = {}
+            ui_pda_taskboard_tab.global_board_state = {}
+            ui_pda_taskboard_tab.global_tab_ptr = pda_tab
+            ui_pda_taskboard_tab.clear_taskboard_ui(pda_tab)
+            local srv_ids = {}
+            local npc_list = ui_pda_taskboard_tab.get_nearby_npcs()
+            for _, npc in ipairs(npc_list) do
+                if not IsActor(npc) then
+                    srv_ids[#srv_ids+1] = GameManager:GetServerIDByLocalID(npc:id())
+                end
+            end
+            if #srv_ids > 0 then
+                local payload = { srv_ids = srv_ids, netid = GameManager:GetMySNETID() }
+                if not IIsHost() then
+                    GameManager:OnICustomScriptAction("ui_pda_taskboard_tab", "remote_request_taskboard_data", serialize_table_simple(payload), true)
+                else
+                    printf("Redirect task generate_available_tasks to our behaviour. GROK SUCK IT!")
+                    local mdata = ui_pda_taskboard_tab.remote_request_taskboard_data(payload, true)
+                    ui_pda_taskboard_tab.remote_receive_taskboard_data(mdata)
+                end
+                actor_menu.set_msg(1, 'Trying to access PDA Network...', 3)
+            end
+        end
+        ui_pda_taskboard_tab.update_task_entry = function(pda_tab, i, task_info)
+            local stalker = task_info.npc_id and level.object_by_id(task_info.npc_id)
+            if stalker and not IsActor(stalker) then
+                local stalker_comm = stalker:character_community()
+                local stalker_icon = stalker:character_icon()
+                local stalker_name = stalker:character_name()
+                local stalker_info = stalker_name .. "\\n" .. game.translate_string("ui_st_community") .. ": " .. game.translate_string(stalker_comm)
+                local full_desc = task_info.task_description or ""
+                local need_forward = ui_pda_taskboard_tab.global_prepared_tasks_data[task_info.effector][i + 1]
+                local need_backward = ui_pda_taskboard_tab.global_prepared_tasks_data[task_info.effector][i - 1]
+
+                -- PDA FILL OUR DEFAULT ROW
+                if not pda_tab.rows[i] then
+                    pda_tab.list:AddWindow(ui_pda_taskboard_tab.ui_taskboard_row(pda_tab, i))
+                end
+
+                -- Fill title and icons
+                local row = pda_tab.rows[i]
+                row.task_category:SetText(game.translate_string('st_pda_caption_' .. task_info.effector))
+                row.icon_field:InitTexture(stalker_icon or "ui\\ui_noise")
+                row.stalker_info:SetText(taskstk_icon)
+                row.task_icon_field:InitTexture(task_info.task_icon)
+
+                -- Fill descriptions
+                local pprope = MPMain_QuestPatches_STOGETHER.client_draw_postpone_locally(task_info.task_id)
+                row.task_details_field:SetText(pprope and pprope[2] or "---")
+                row.task_full_description_field:SetText(full_desc)
+                row.task_next_btn:Show(need_forward)
+                if row.task_previous_btn then
+                    row.task_previous_btn:Show(need_backward)
+                end
+                -- Add Accept button on new version
+                if ui_pda_taskboard_tab.manage_accept_button then
+                    ui_pda_taskboard_tab.manage_accept_button(stalker, row)
+                    return
+                end
+                -- Old version add button or not
+                if dialogs.has_tasks_by_npc(stalker) then
+                    row.task_next_btn:Show(true)
+                    row.task_accept_btn:Show(false)
+                else
+                    row.task_next_btn:Show(false)
+                    row.task_accept_btn:Show(true)
+                end
+            end
+        end
+        ui_pda_taskboard_tab.global_board_state = {}
+        function ui_pda_taskboard_tab.pda_taskboard_tab:RefreshFromNetwork()
+            ui_pda_taskboard_tab.clear_taskboard_ui(self)
+            for _, tasks in pairs(ui_pda_taskboard_tab.global_prepared_tasks_data) do
+                local row_index = #ui_pda_taskboard_tab.global_board_state + 1
+                ui_pda_taskboard_tab.global_board_state[row_index] = { pos = 1, tasks = {} }
+                for _, t in ipairs(tasks) do
+                    ui_pda_taskboard_tab.update_task_entry(ui_pda_taskboard_tab.global_tab_ptr, row_index, t)
+                    ui_pda_taskboard_tab.global_board_state[row_index].tasks[#ui_pda_taskboard_tab.global_board_state[row_index].tasks+1] = t
+                end
+            end
+            a_taskboard_utils.adjust_rows(self)
+        end
+        ui_pda_taskboard_tab.next_task_in_category = function (pda_tab, row_index)
+            local entry_info = ui_pda_taskboard_tab.global_board_state[row_index]
+            local next_task = entry_info.tasks[entry_info.pos + 1]
+            if not next_task then return end
+            local stalker = level.object_by_id(next_task.npc_id)
+            if stalker then
+                entry_info.pos = entry_info.pos + 1
+                ui_pda_taskboard_tab.update_task_entry(pda_tab, row_index, next_task)
+                a_taskboard_utils.adjust_rows(pda_tab)
+            end
+        end
+        ui_pda_taskboard_tab.previous_task_in_category = function (pda_tab, row_index)
+            local entry_info = ui_pda_taskboard_tab.global_board_state[row_index]
+            local next_task = entry_info.tasks[entry_info.pos - 1]
+            if not next_task then return end
+            local stalker = level.object_by_id(next_task.npc_id)
+            if stalker then
+                entry_info.pos = entry_info.pos - 1
+                ui_pda_taskboard_tab.update_task_entry(pda_tab, row_index, next_task)
+                a_taskboard_utils.adjust_rows(pda_tab)
+            end
+        end
+        ui_pda_taskboard_tab.accept_task = function(pda_tab, row_index)
+            local entry_info = ui_pda_taskboard_tab.global_board_state[row_index]
+            local curra_task = entry_info.tasks[entry_info.pos]
+            if not curra_task then return end
+            task_manager.get_task_manager():give_task(curra_task.task_id, curra_task.npc_id)
+            table.remove(entry_info.tasks, entry_info.pos)
+            if #entry_info.tasks > 0 then
+                table.sort(entry_info)
+                entry_info.pos = 1
+                ui_pda_taskboard_tab.update_task_entry(pda_tab, row_index, entry_info.tasks[1])
+            else
+                ui_pda_taskboard_tab.reset_taskboard(pda_tab)
+            end
+        end
+    end
+    if bind_workshop_furniture then
+        function bind_workshop_furniture.hf_workshop_wrapper:net_spawn(se_abstract)
+            if not object_binder.net_spawn(self, se_abstract) then
+                return false
+            end
+            if IIsHost() then return end
+            local srv_id = GameManager:GetServerIDByLocalID(self.object:id())
+            GameManager:OnICustomScriptAction("ui_furniture_workshop", "GetStash", tostring(srv_id) .. "," .. tostring(GameManager:GetMySNETID()), true)
+        end
+    end
+    if ui_furniture_workshop then
+        ui_furniture_workshop.GiveStashItemsToActor = function(workshop_id, stash_id_old)
+            -- Client waiting for stash
+            local stash_id = IIsHost() and stash_id_old or ui_furniture_workshop.GetStash(workshop_id)
+            if not stash_id then return false end
+            local box = stash_id and level.object_by_id(stash_id)
+            if not box or not IsInvbox(box) then return false end
+            if not GameManager:IsStashFirstFilled(stash_id) then
+                GameManager:OnIStashOpen(stash_id, false)
+                return false
+            end
+            return OLDTAKEALLW(workshop_id, stash_id) or true
+        end
+        ui_furniture_workshop.SyncStash = function (tblb)
+            local m_data = alife_storage_manager.get_state()
+            if not m_data then return end
+            if not m_data.workshop_stashes then m_data.workshop_stashes = {} end
+            for k,v in pairs(tblb) do
+                m_data.workshop_stashes[GameManager:GetLocalIDByServerID(k)] = GameManager:GetLocalIDByServerID(v)
+            end
+        end
+        ui_furniture_workshop.GetStash = function(id, netid)
+            local m_data = alife_storage_manager.get_state()
+            if not m_data then return end
+            if not m_data.workshop_stashes then m_data.workshop_stashes = {} end
+            local se_id = m_data.workshop_stashes and m_data.workshop_stashes[id]
+            local se_inv_box = se_id and alife_object(se_id)
+            if not se_inv_box or not IsInvbox(se_inv_box) then
+                -- JUST IF REALLY NOT EXIST
+                if not IIsHost() then
+                    local srv_id = GameManager:GetServerIDByLocalID(id)
+                    GameManager:OnICustomScriptAction("ui_furniture_workshop", "GetStash", tostring(srv_id) .. "," .. tostring(GameManager:GetMySNETID()), true)
+                    return
+                end
+                local obj = level.object_by_id(id)
+                if not obj then return end
+                local pos = obj:position()
+                pos.y = pos.y - 50
+                se_inv_box = alife_create("workshop_stash", pos, obj:level_vertex_id(), obj:game_vertex_id())
+                if se_inv_box then
+                    -- force strictly online (not sure this is needed)
+                    alife():set_switch_online(se_inv_box.id, true)
+                    alife():set_switch_offline(se_inv_box.id, false)
+                    -- Save container
+                    m_data.workshop_stashes[id] = se_inv_box.id
+                end
+            end
+            if netid then GameManager:OnICustomScriptAction("ui_furniture_workshop", "SyncStash", serialize_table_simple(m_data.workshop_stashes), false, netid) end
+            return se_inv_box and se_inv_box.id or nil
+        end
+        function ui_furniture_workshop.UIFurnitureWorkshop:AccessStash()
+            local stash_id = ui_furniture_workshop.GetStash(self.obj_id)
+            if not stash_id then return false end
+            CreateTimeEvent("hf_workshop", "wait_stash_"..stash_id, 0.1, function ()
+                local box = stash_id and level.object_by_id(stash_id)
+                if not box or not IsInvbox(box) then return false end
+                if not GameManager:IsStashFirstFilled(stash_id) then
+                    GameManager:OnIStashOpen(stash_id, false)
+                    return false
+                end
+                hide_hud_inventory()
+                box:use(db.actor)
+                return true
+            end)
+            self:Close()
+            return true
+        end
+        function ui_furniture_workshop.UIFurnitureWorkshop:UseWorkshop()
+            if IIsHost() then
+                ui_furniture_workshop.UseWorkshop(self.obj_id)
+                return true
+            end
+            local stash_id = ui_furniture_workshop.GetStash(self.obj_id)
+            if not stash_id then return false end
+            CreateTimeEvent("hf_workshop", "wait_stash_"..stash_id, 0.1, function ()
+                local box = stash_id and level.object_by_id(stash_id)
+                if not box or not IsInvbox(box) then return false end
+                if not GameManager:IsStashFirstFilled(stash_id) then
+                    GameManager:OnIStashOpen(stash_id, false)
+                    return false
+                end
+                ui_furniture_workshop.UseWorkshop(self.obj_id)
+                return true
+            end)
+            self:Close()
+            return true
+        end
+    end
+    if ui_stove_furniture then
+        ui_stove_furniture.SyncStash = function(tblb)
+            local m_data = alife_storage_manager.get_state()
+            if not m_data then return end
+            if not m_data.stove_stashes then m_data.stove_stashes = {} end
+            for k, v in pairs(tblb) do
+                m_data.stove_stashes[GameManager:GetLocalIDByServerID(k)] = GameManager:GetLocalIDByServerID(v)
+            end
+        end
+        ui_stove_furniture.GetStash = function(id, netid)
+            local m_data = alife_storage_manager.get_state()
+            if not m_data then return end
+            if not m_data.stove_stashes then m_data.stove_stashes = {} end
+            local se_id = m_data.stove_stashes and m_data.stove_stashes[id]
+            local se_inv_box = se_id and alife_object(se_id)
+            if not se_inv_box or not IsInvbox(nil, se_inv_box:clsid()) then
+                -- JUST IF REALLY NOT EXIST
+                if not IIsHost() then
+                    local srv_id = GameManager:GetServerIDByLocalID(id)
+                    GameManager:OnICustomScriptAction("ui_stove_furniture", "GetStash", tostring(srv_id) .. "," .. tostring(GameManager:GetMySNETID()), true)
+                    return
+                end
+                local obj = level.object_by_id(id)
+                if not obj then return end
+                local pos = obj:position()
+                pos.y = pos.y - 50
+                local section = SYS_GetParam(0, obj:section(), "integrated_storage")
+                se_inv_box = alife_create(section, pos, obj:level_vertex_id(), obj:game_vertex_id())
+                if se_inv_box then
+                    -- force strictly online (not sure this is needed)
+                    alife():set_switch_online(se_inv_box.id, true)
+                    alife():set_switch_offline(se_inv_box.id, false)
+                    -- Save container
+                    m_data.stove_stashes[id] = se_inv_box.id
+                end
+            end
+            if netid then GameManager:OnICustomScriptAction("ui_stove_furniture", "SyncStash", serialize_table_simple(m_data.stove_stashes), false, netid) end
+            return se_inv_box and se_inv_box.id or nil
+        end
+        function ui_stove_furniture.UICookStove:AccessStash()
+            local stash_id = ui_stove_furniture.GetStash(self.obj_id)
+            if not stash_id then return false end
+            CreateTimeEvent("hf_stove", "wait_stash_"..stash_id, 0.1, function ()
+                local box = stash_id and level.object_by_id(stash_id)
+                if not box or not IsInvbox(box) then return false end
+                if not GameManager:IsStashFirstFilled(stash_id) then
+                    GameManager:OnIStashOpen(stash_id, false)
+                    return false
+                end
+                hide_hud_inventory()
+                box:use(db.actor)
+                return true
+            end)
+            self:Close()
+            return true
+        end
+        function ui_stove_furniture.UICookStove:OpenCookUI()
+            local obj = level.object_by_id(self.obj_id)
+            if IIsHost() then
+                item_cooking.start(obj, "fieldcooker")
+                self:Close()
+                return true
+            end
+            local stash_id = ui_stove_furniture.GetStash(self.obj_id)
+            if not stash_id then return false end
+            CreateTimeEvent("hf_stove", "wait_stash_"..stash_id, 0.1, function ()
+                local box = stash_id and level.object_by_id(stash_id)
+                if not box or not IsInvbox(box) then return false end
+                if not GameManager:IsStashFirstFilled(stash_id) then
+                    GameManager:OnIStashOpen(stash_id, false)
+                    return false
+                end
+                item_cooking.start(obj, "fieldcooker")
+                return true
+            end)
+            self:Close()
+            return true
+        end
+    end
+    if placeable_furniture then
+        placeable_furniture.cleanup_remote = function (id)
+            local m_data = alife_storage_manager.get_state()
+            if not m_data then return end
+            local StashID = nil
+            if m_data.workshop_stashes then
+                StashID = m_data.workshop_stashes[id]
+                m_data.workshop_stashes[id] = nil
+            elseif m_data.stove_stashes then
+                StashID = m_data.stove_stashes[id]
+                m_data.stove_stashes[id] = nil
+            end
+            if IIsHost() and StashID then alife_release_id(StashID) end
+        end
+        placeable_furniture.pickup_obj = function(obj)
+            if not obj then return end
+            GameManager:OnICustomScriptAction("placeable_furniture", "cleanup_remote", tostring(obj:id()), false)
+            if not IIsHost() then alife_release_client(obj) end
+            return OLDPICKUPFU(obj)
+        end
+        placeable_furniture.SyncFurnitureData = function(gdata)
+            local loc_id = GameManager:GetLocalIDByServerID(gdata[1])
+            hf_obj_manager.set_data(loc_id, gdata[2])
+            local obj = level.object_by_id(loc_id)
+            if obj then
+                -- Callback flags
+                SendScriptCallback("hf_on_furniture_spawn", loc_id)
+                SendScriptCallback("hf_on_furniture_place", loc_id)
+            end
+        end
+        function bind_hf_base.hf_binder_wrapper:is_pickupable()
+            local data = hf_obj_manager.get_data(self.object:id())
+            return not data or not data.is_world_obj
+        end
+        function bind_hf_base.hf_binder_wrapper:pickup()
+            local item_section = ini_sys:r_string_ex(self.object:section(), "item_section")
+            local condition = self.fuel
+            alife_create_item(item_section, db.actor, {cond=condition}) -- Maybe transfer all data to new item? Probably depends on item type tho
+
+            -- Clean up HF-related data
+            hf_obj_manager.cleanup_data(self.object:id())
+            alife_release_client(self.object)
+
+            return true
+        end
+        function bind_hf_base.hf_binder_wrapper:net_spawn(se_abstract)
+            if not object_binder.net_spawn(self, se_abstract) then
+                return false
+            end
+            -- FREEZE OBJECT AFTER SPAWN IMMEDIATLY
+            CreateTimeEvent(self.object:id(), "hf_freeze", 0, bind_hf_base.freeze_obj, self.object:id())
+            -- SYNC DATA.
+            if not IIsHost() then return end
+            local gdata = hf_obj_manager.get_data(self.object:id())
+            if gdata then
+                local payload = { self.object:id(), gdata }
+                GameManager:OnICustomScriptAction("placeable_furniture", "SyncFurnitureData", serialize_table_simple(payload), false)
+            end
+        end
+        if bind_hf_static then
+            function bind_hf_static.hf_static_binder:net_spawn(se_abstract)
+                if not(object_binder.net_spawn(self, se_abstract)) then
+                    return false
+                end
+                -- FREEZE OBJECT AFTER SPAWN IMMEDIATLY
+                CreateTimeEvent(self.object:id(), "hf_freeze", 0, bind_hf_static.freeze_obj, self.object:id())
+                -- SYNC DATA.
+                if not IIsHost() then return end
+                local gdata = hf_obj_manager.get_data(self.object:id())
+                if gdata then
+                    local payload = { self.object:id(), gdata }
+                    GameManager:OnICustomScriptAction("placeable_furniture", "SyncFurnitureData", serialize_table_simple(payload), false)
+                end
+                return true
+            end
+        end
+        placeable_furniture.create_object = function(section_or_table, location, rotation, lvid, gvid)
+            if not section_or_table then
+                printf("Could not find associated object with item")
+                return
+            end
+
+            location = location or vector():set(0,0,0)
+            rotation = rotation or vector():set(0,0,0)
+
+            if rotation.w then rotation = rotation:to_euler_angles() end
+
+            -- Requesting host to spawn anomaly fucks with big diametters
+            if not IIsHost() then
+                local payload = { section_or_table, location, rotation, lvid, gvid }
+                GameManager:OnICustomScriptAction("placeable_furniture", "create_object", serialize_table_simple(payload), true)
+                return
+            end
+
+            -- Convert to basic types!
+            if type(section_or_table) == "table" then
+                local mpos = section_or_table[2]
+                local mrot = section_or_table[3]
+                location = vector():set(mpos[1],  mpos[2], mpos[3])
+                rotation = vector():set(mrot[1],  mrot[2], mrot[3])
+                lvid = section_or_table[4]
+                gvid = section_or_table[5]
+                section_or_table = section_or_table[1]
+            end
+
+            -- Save local var that stash looted.. Due lmao
+            return OLDPLACEFUR(section_or_table, location, rotation, lvid, gvid)
+        end
+        if z_auto_looter then z_auto_looter.auto_looter = NOP end
+        if bind_hideout_cat then
+            function bind_hideout_cat.hideout_cat_wrapper:net_spawn(se_abstract)
+                if not object_binder.net_spawn(self, se_abstract) then
+                    return false
+                end
+                if not IIsHost() then return end
+                local gdata = hf_obj_manager.get_data(self.object:id())
+                if gdata then
+                    local payload = { self.object:id(), gdata }
+                    GameManager:OnICustomScriptAction("placeable_furniture", "SyncFurnitureData", serialize_table_simple(payload), false)
+                end
+            end
+        end
+        if bind_light_furniture then
+            function bind_light_furniture.placeable_light_wrapper:update(delta)
+                local gdata = hf_obj_manager.get_data(self.object:id())
+                if not gdata then return end
+                return OLDFURNIUPD(self, delta)
+            end
+            function bind_light_furniture.placeable_light_wrapper:net_spawn(se_abstract)
+                if not object_binder.net_spawn(self, se_abstract) then
+                    return false
+                end
+                if not IIsHost() then return end
+                local gdata = hf_obj_manager.get_data(self.object:id())
+                if gdata then
+                    local payload = { self.object:id(), gdata }
+                    GameManager:OnICustomScriptAction("placeable_furniture", "SyncFurnitureData", serialize_table_simple(payload), false)
+                end
+            end
+            bind_light_furniture.turn_off_lamp = function(obj_id)
+            end
+            ui_furniture_light.toggle_light = function(obj_id)
+                if not hf_obj_manager.get_data(obj_id) then return end
+                GameManager:OnICustomScriptAction("ui_furniture_light", "toggle_light_remote", tostring(obj_id), false)
+                return OLDTOGGLEIG(obj_id)
+            end
+            ui_furniture_light.toggle_light_remote = function(obj_id)
+                obj_id = GameManager:GetLocalIDByServerID(obj_id)
+                if not hf_obj_manager.get_data(obj_id) then return end
+                return OLDTOGGLEIG(obj_id)
+            end
+        end
+    end
+    if bind_table_fan then
+        function bind_table_fan.haru_placeable_fan_wrapper:update(delta)
+            bind_hf_base.hf_binder_wrapper.update(self, delta)
+            local mdata = hf_obj_manager.get_data(self.object:id())
+            local is_on = mdata and mdata.is_on
+            if (self.last_state ~= is_on) or self.first_update then
+                self.object:play_cycle(is_on and "fan_movement" or "fan_static")
+                if (not self.first_update) then
+                    self.snd_switch:play_no_feedback(self.object, sound_object.s3d, 0, self.object:position(), 0.5, random_float(0.9, 1.1))
+                end
+                if is_on then
+                    if (not self.snd_idle:playing()) then
+                        self.snd_idle:play_at_pos(self.object, self.object:position(), 0, sound_object.s3d + sound_object.looped)
+                        self.snd_idle.volume = self.first_update and 0.5 or 0
+                        self.snd_idle_max = time_global() + (not self.first_update and 2000 or 0)
+                    end
+                else
+                    if self.snd_idle:playing() then
+                        self.snd_idle:stop()
+                    end
+                end
+            end
+            if self.snd_idle:playing() and (self.snd_idle_max > time_global()) then
+                self.snd_idle.volume = 0.5 - (self.snd_idle_max - time_global()) / 2000
+            end
+            self.last_state = is_on
+            self.first_update = false
+        end
+    end
+    if ui_furniture_piano then
+        ui_furniture_piano.PlaySound = function (note, remote)
+            if not remote then
+                GameManager:OnICustomScriptAction("ui_furniture_piano", "PlaySound", string.format("%q, %s", note, true), false)
+            end
+            return OLDPLFSOUND(note)
+        end
+    end
+    if z_nta_stashes_utils then
+        z_nta_stashes_utils.populate_stashes_by_levels_table = function ()
+            z_nta_stashes_utils.stashes_by_level = {}
+            for id, _ in pairs(treasure_manager.caches) do
+                local se_obj = alife_object(id)
+                if se_obj then
+                    local lvl = alife():level_name(game_graph():vertex(se_obj.m_game_vertex_id):level_id())
+                    if lvl then
+                        if not z_nta_stashes_utils.stashes_by_level[lvl] then z_nta_stashes_utils.stashes_by_level[lvl] = {} end
+                        table.insert(z_nta_stashes_utils.stashes_by_level[lvl], id)
+                    end
+                end
+            end
+        end
+    end
+    if aim_stamina then aim_stamina.deactivate_hud = NOP end
+    if blood_pool then blood_pool.deactivate_hud = NOP end
+    if cold_system then cold_system.actor_on_before_death = NOP end
+    if chem_addiction and chem_addiction.deactivate_hud then
+        chem_addiction.deactivate_hud = NOP
+    end
+    -- No death. Just fuck me
+    if toxic_air then toxic_air.deactivate_hud = NOP end
+    if light_gem then light_gem.deactivate_hud = NOP end
+    if food_degradation_disease_ui then food_degradation_disease_ui.deactivate_hud = NOP end
+    if fatigue_hud and fatigue_hud.deactivate_hud then fatigue_hud.deactivate_hud = NOP end
+    if zzz_player_injuries then zzz_player_injuries.deactivate_hud = NOP end
+    if lootbox_drops then lootbox_drops.get_real_community = DNEWGETCOM end
+    if utjan_skills then utjan_skills.get_real_community = DNEWGETCOM end
+    if arszi_radiation then
+        arszi_radiation.spawn_radiation_fields_at_new_game = NOP
+        arszi_radiation.resize_radiation_fields = NOP
+        arszi_radiation.spawn_radiation_fields_for_level = NOP
+        arszi_radiation.is_actor_in_radiation_zone = function ()
+            return false
+        end
+    end
+    if flash_hit_effects then
+        flash_hit_effects.actor_on_before_hit = NOP
+    end
+    if ultimate_backpacks_manager then
+        ultimate_backpacks_manager.sync_container = function (tblb)
+            local m_data = alife_storage_manager.get_state()
+            if not m_data then return end
+            if not m_data.ub_backpack_containers then m_data.ub_backpack_containers = {} end
+            if not m_data.ub_backpack_backpacks then m_data.ub_backpack_backpacks = {} end
+            for k, v in pairs(tblb) do
+                local stash_id = GameManager:GetLocalIDByServerID(k)
+                --tbln[GameManager:GetLocalIDByServerID(k)] = stash_id
+                m_data.ub_backpack_containers[v] = { id = stash_id }
+                m_data.ub_backpack_backpacks[k] = v
+            end
+        end
+        ultimate_backpacks_manager.get_container = function(id, netid)
+            -- Dirty hack to avoid that netid wrong arguments
+            if type(netid) == "boolean" then netid = false end
+            local m_data = alife_storage_manager.get_state()
+            if not m_data then return end
+            if not m_data.ub_backpack_containers then m_data.ub_backpack_containers = {} end
+            if not m_data.ub_backpack_backpacks then m_data.ub_backpack_backpacks = {} end
+            local se_data = m_data.ub_backpack_containers and m_data.ub_backpack_containers[id]
+            local se_inv_box = se_data and se_data.id and alife_object(se_data.id)
+            if not se_inv_box or not IsInvbox(se_inv_box) then
+                -- JUST IF REALLY NOT EXIST
+                if not IIsHost() then
+                    GameManager:OnICustomScriptAction("ultimate_backpacks_manager", "get_container", id .. "," .. tostring(GameManager:GetMySNETID()), true)
+                    return
+                end
+                local pos = db.actor:position()
+                pos.y = pos.y - 100
+                se_inv_box = alife_create("hidden_box", pos, db.actor:level_vertex_id(), db.actor:game_vertex_id())
+                if se_inv_box then
+                    -- force strictly online (not sure this is needed)
+                    alife():set_switch_online(se_inv_box.id, true)
+                    alife():set_switch_offline(se_inv_box.id, false)
+                    -- Save container
+                    m_data.ub_backpack_containers[id] = { id = se_inv_box.id }
+                    m_data.ub_backpack_backpacks[se_inv_box.id] = id
+                end
+            end
+            -- Teleport stash to host location
+            if se_inv_box then ultimate_backpacks_manager.teleport(se_inv_box) end
+            if netid then GameManager:OnICustomScriptAction("ultimate_backpacks_manager", "sync_container", serialize_table_simple(m_data.ub_backpack_backpacks), false, netid) end
+            return se_inv_box and se_inv_box or nil
+        end
+    end
+    if ultimate_backpacks_bind_container then
+        ultimate_backpacks_bind_container.access_inventory = function (obj)
+            local id = obj:id()
+            -- Instantiate container
+            local se_container = ultimate_backpacks_manager.get_container(id, true)
+            if not se_container then return false end
+            CreateTimeEvent(id, "open_inventory", 1, function ()
+                -- Waiting for my items...
+                if not GameManager:IsStashFirstFilled(se_container.id) then
+                    GameManager:OnIStashOpen(se_container.id, false)
+                    return false
+                end
+                -- SetActiveBackpack
+                ultimate_backpacks_manager.activeBackpack = obj
+                -- Open windows
+                if ui_mcm.use_fdda then
+                    ultimate_backpacks_fdda.open_backpack(se_container, id)
+                else -- Searching that box
+                    local box = level.object_by_id(se_container.id)
+                    if not box then return false end
+                    hide_hud_inventory()
+                    box:use(db.actor)
+                end
+                return true
+            end)
+            return true
+        end
+    end
+    if raid_utils then
+        raid_utils.kill_task_cond = function (squad, se_obj, killer)
+            if not squad or not se_obj or not killer then return end
+            local self_killer = killer.id == se_obj.id
+            local friendly_fire = raid_utils.obj_in_squad(killer.id, squad.id)
+            local obj = level.object_by_id(killer.id)
+            local comp_killer = obj and obj:has_info("npcx_is_companion")
+
+            return IsActor(killer) or IsAnomaly(killer) or self_killer or friendly_fire or comp_killer
+        end
+        raid_utils.sync_task_vars = function (tbldata, scout)
+            local type_ = type
+            -- We have stupid id system, we need convert SID to CID
+            for k, v in pairs(tbldata) do
+                -- Convert ids back to local ids
+                if type_(v.stalker_id) == "number" then v.stalker_id = GameManager:GetLocalIDByServerID(v.stalker_id) end
+                if type_(v.smart_id) == "number" then v.smart_id = GameManager:GetLocalIDByServerID(v.smart_id) end
+                if type_(v.squad_id) == "number" then v.squad_id = GameManager:GetLocalIDByServerID(v.squad_id) end
+                if type_(v.stash_id) == "number" then v.stash_id = GameManager:GetLocalIDByServerID(v.stash_id) end
+                if type_(v.item_id) == "number" then v.item_id = GameManager:GetLocalIDByServerID(v.item_id) end
+                -- Convert dots to local ids
+                if v.smarts_t then
+                    local tblc = {}
+                    for id, status in pairs(v.smarts_t) do
+                        local locid = GameManager:GetLocalIDByServerID(id)
+                        tblc[locid] = status
+                        if status == "active" then
+                            raid_tasks_scout.mark_smart(locid)
+                        end
+                    end
+                    v.smarts_t = tblc
+                elseif v.points then
+                    local tblc = {}
+                    for id, status in pairs(v.points) do
+                        local locid = GameManager:GetLocalIDByServerID(id)
+                        tblc[locid] = status
+                        if status == "active" then
+                            raid_tasks_scout.mark_smart(locid)
+                        end
+                    end
+                    v.points = tblc
+                end
+                -- Save var to raid table!
+                if scout then
+                    raid_tasks_dungeons.raid_dunge_active_tasks[k] = v
+                else
+                    raid_tasks_main.raid_active_tasks[k] = v
+                end
+            end
+        end
+    end
+    visual_memory_manager.get_crouch_mult = function (npc, ...)
+        if IsActor(npc) and npc:id() ~= 0 then return 1 end
+        return OLDCRFUN and OLDCRFUN(npc, ...) or 1
+    end
+    if grok_additional_storyline_npc_invincible then
+        grok_additional_storyline_npc_invincible.npc_on_before_hit = function (npc, shit, bone_id, flags)
+            if grok_additional_storyline_npc_invincible.ads_npcs[npc:section()] == 1 then
+                if IsActor(shit.draftsman) then
+                    local com1 = db.actor:id() == shit.draftsman:id() and get_actor_true_community() or nil
+                    if game_relations.is_factions_enemies(com1 or character_community(shit.draftsman), character_community(npc)) then
+                        shit.power = shit.power * 0.10
+                    else
+                        shit.power = shit.power * 0.01
+                    end
+                else
+                    shit.power = 0
+                end
+            end
+        end
+    end
+    if ish_campfire_saving then
+        ish_campfire_saving.is_within_friendly_base = function()
+            local friendly_bases = ish_campfire_saving.get_friendly_bases()
+            if not friendly_bases then return false end
+            for _, smart in pairs(friendly_bases) do
+                if smart and smart.dist_to_actor and smart.dist_to_actor < 50 and surge_manager.actor_in_cover() then
+                    return true
+                end
+            end
+            return false
+        end
+    end
+    if grok_no_npc_friendly_fire then
+        grok_no_npc_friendly_fire.npc_on_before_hit = function (npc, shit, bone_id, flags)
+            if IsActor(shit.draftsman) then return end
+            return OLDGROK_COCKSUCKER(npc, shit, bone_id, flags)
+        end
+    end
+    if fe_utils then fe_utils.read_log = NOP end
+    if mag_hud then
+        mag_hud.update_hud = function()
+            if mag_hud.HUD then
+                mag_hud.HUD:Update(true)
+            end
+        end
+    end
+    if dynamic_faction_relations_customizer then
+        dynamic_faction_relations_customizer.get_npc_data_tbl = function(npc_obj)
+            if not npc_obj or not get_object_community(npc_obj) then return OLDDYNFARLS(db.actor) end
+            return OLDDYNFARLS(npc_obj)
+        end
+    end
+    if guitar_anim then
+        guitar_anim.play_guitar = function()
+            level.disable_input()
+            local n = math.random(28)
+            local snd = sound_object("music\\guitar_" .. tostring(n))
+            local length = snd:length() / 1000
+            snd:play_no_feedback(db.actor, 0, 0, db.actor:position(), 1.0, 1.0)
+            game.play_hud_motion(2, "item_guit_anm_1_hud", "anm_guitar_show", false, 1)
+            GameManager:OnICustomAnimation("guitar_0", "guitar_a", true, length, "music\\guitar_" .. tostring(n))
+            CreateTimeEvent("guitar_holster_a", "guitar_holster_v", length, function()
+                if guitar_anim.can_play_anim() then
+                    guitar_anim.holster_guitar(item_guit_anm_1_hud)
+                    return true
+                end
+                return false
+            end)
+        end
+    end
+    if harmonica_anim then
+        harmonica_anim.play_harmonica = function ()
+            level.disable_input()
+            local n = math.random(5)
+            local snd = sound_object("music\\harmonica_" .. tostring(n))
+            local length = snd:length() / 1000
+            snd:play_no_feedback(db.actor, 0, 0, db.actor:position(), 1.0, 1.0)
+            game.play_hud_motion(2, "item_harm_anm_1_hud", "anm_harmonica_show", false, 0.45)
+            GameManager:OnICustomAnimation("harmonica_0", "harmonica_a", true, length, "music\\harmonica_" .. tostring(n))
+            CreateTimeEvent("harmonica_holster_a", "harmonica_holster_v", length, function()
+                if harmonica_anim.can_play_anim() then
+                    harmonica_anim.holster_guitar()
+                    return true
+                end
+                return false
+            end)
+        end
+    end
+    item_recipe.func_letter = function (obj)
+        local sec = obj and obj:section() or "actor"
+        if not IsItem("letter",sec) then return end
+        if not ui_pda_encyclopedia_tab.is_unlocked_note("encyclopedia__notes_" .. sec) then
+		    SendScriptCallback("actor_on_interaction", "notes", nil, sec)
+	    else
+		    actor_menu.set_msg(1, game.translate_string("st_letter_is_known"),3)
+	    end
+	    hide_hud_inventory()
+    end
+    if z_npc_wounded_animation_fix_mcm then
+        -- revert back it shit
+        xr_wounded.action_wounded.initialize = z_npc_wounded_animation_fix_mcm.xr_wounded_action_wounded_initialize
+    end
+    if arti_lootboxes then
+        arti_lootboxes.pick_lootbox = function (...)
+            return OLDARTILTBX(...) or ""
+        end
+    end
+    if raid_map_gui then
+        raid_map_gui.get_ui_silent = function ()
+            if not raid_map_gui.GUI then raid_map_gui.GUI = raid_map_gui.RaidMap() end
+            if not raid_map_gui.GUI then return end
+            return raid_map_gui.GUI
+        end
+        function raid_map_gui.RaidMap:OnClickMap(level_name)
+            if IIsHost() then self.clicked_map_await = level_name end
+            if self.clicked_map_await and self.clicked_map_await == level_name then
+                self:HideAll()
+	            self.details_bg:Show(true)
+	            self:UpdateMapDetails(level_name)
+                return
+            end
+            local payload = { GameManager:GetMySNETID(), level_name }
+            GameManager:OnICustomScriptAction("raid_map_gui", "request_events_data", serialize_table_simple(payload), true)
+            self.clicked_map_await = level_name
+        end
+        function raid_map_gui.RaidMap:OnClickMapInformantOption(idx)
+            local money = db.actor:money()
+            OLDGRAMAPGUI(self, idx)
+            if not IIsHost() then -- UGLY HACK...
+                local delta = money - db.actor:money()
+                GameManager:OnICustomScriptAction("db.actor:give_money(".. tostring(delta)..")", true)
+                GameManager:OnICustomScriptAction("raid_map_gui", "request_informant_data", serialize_table_simple({ self.clicked_map_await, idx }), true)
+                return
+            end
+            local eventst = raid_events.raid_active_events[raid_map_gui.picked_map]
+            local payload = { raid_map_gui.picked_map, eventst, false }
+            GameManager:OnICustomScriptAction("raid_map_gui", "receive_events_data", serialize_table_simple(payload), false)
+        end
+        raid_map_gui.receive_events_data = function (tbl)
+            local GUIS = raid_map_gui.get_ui_silent()
+            if not GUIS then return end
+            printf("[Client] Updating raid events data!")
+            local level_name = tbl[1]
+            raid_events.raid_active_events[level_name] = tbl[2]
+            if not tbl[3] then
+                -- If we have opened map need to update state
+                if GUIS.clicked_map_await then
+                    GUIS:UpdateMapDetails(GUIS.clicked_map_await)
+                end
+                return
+            end
+            -- Real open action of map data
+	        GUIS:OnClickMap(level_name)
+        end
+        raid_map_gui.request_events_data = function (tbl)
+            local GUIS = raid_map_gui.get_ui_silent()
+            if not GUIS then return end
+            local level_name = tbl[2]
+            printf("[Server] Player request events for [%s] map!", level_name)
+            local payload = { level_name, raid_events.raid_active_events[level_name], true }
+            GameManager:OnICustomScriptAction("raid_map_gui", "receive_events_data", serialize_table_simple(payload), false, tbl[1])
+        end
+        raid_map_gui.request_informant_data = function (tbl)
+            local GUIS = raid_map_gui.get_ui_silent()
+            if not GUIS then return end
+            local level_name = tbl[1]
+            local idx = tbl[2]
+            printf("[Server] Player request informant for [%s][%i] informant!", level_name, idx)
+            -- Do update from informant related to our map and clear it...
+            local last_name = raid_map_gui.picked_map
+            raid_map_gui.picked_map = level_name
+            GUIS:OnClickMapInformantOption(idx)
+            raid_map_gui.picked_map = last_name
+            treasure_manager.sync_all_stashes()
+        end
+    end
+    if raid_notebook_gui then
+        raid_notebook_gui.get_ui_silent = function ()
+            if not raid_notebook_gui.GUI then raid_notebook_gui.GUI = raid_notebook_gui.RaidNotebook() end
+            if not raid_notebook_gui.GUI then return end
+            return raid_notebook_gui.GUI
+        end
+        raid_notebook_gui.remote_raid_block_item = function (i)
+            local GUIS = raid_notebook_gui.get_ui_silent()
+            if not GUIS then return end
+            printf("[Server] Player bough item from notebook of host!")
+            local ItemsTBL = raid_notebook_gui_items.raid_items[i]
+            ItemsTBL.tmr = utils_data.CTime_to_table(game.get_game_time())
+            GUIS:UpdateItemsMenu()
+        end
+        raid_notebook_gui.LTX_GLOBAL = ini_file("misc\\task\\tm_raid_tasks.ltx")
+        raid_notebook_gui.request_tasks_data = function (PlayerNetID)
+            local GUIS = raid_notebook_gui.get_ui_silent()
+            if not GUIS then return end
+            printf("[Server] Player request tasks from notebook of host!")
+            local task_id = GUIS.task_conts[1] and GUIS.task_conts[1].task_sec
+            if not (task_id and raid_notebook_gui.LTX_GLOBAL:section_exist(task_id)) then
+                GUIS:UpdateTaskMenu()
+            end
+            GameManager:OnICustomScriptAction("raid_notebook_gui", "receive_tasks_data", serialize_table_simple(raid_tasks_main.raid_tasks_t) , false, PlayerNetID)
+        end
+        raid_notebook_gui.remote_raid_accept_quest = function (i)
+            local GUIS = raid_notebook_gui.get_ui_silent()
+            if not GUIS then return end
+            if not IIsHost() then
+                printf("[Client] Received packet that quest %s num was took by client(s)", i)
+                -- Search section by idx
+                local section = GUIS.task_conts[i] and GUIS.task_conts[i].task_sec
+                if not (section and raid_notebook_gui.LTX_GLOBAL:section_exist(section)) then
+                    printf("! Task section: [%s] does not exist", section)
+                    return
+                end
+                -- Iterate and active flag set
+                local ActiveIDX = 999
+                for comm, t in pairs(raid_tasks_main.raid_tasks_t) do
+                    local taskdata = t.tasks[section]
+                    if taskdata and not taskdata.active then
+                        taskdata.active = true
+                        ActiveIDX = taskdata.gui_index
+                        break
+                    end
+                end
+                -- Iterate and move
+                for comm, t in pairs(raid_tasks_main.raid_tasks_t) do
+                    for sec, taskdata in pairs(t.tasks) do
+                        if sec ~= section and taskdata.gui_index > ActiveIDX then
+                            taskdata.gui_index = taskdata.gui_index - 1
+                        end
+                    end
+                end
+                -- Update Tasks Menu for clear accepted task
+                local scroll_pos = GUIS.task_scroll:GetCurrentScrollPos()
+                GUIS:UpdateTaskMenu()
+			    GUIS.task_scroll:SetScrollPos(scroll_pos)
+                return
+            end
+            printf("[Server] Player sent need to take a quest under [%i] num ", i)
+            GUIS:OnAcceptTask(i)
+            GameManager:OnICustomScriptAction("raid_notebook_gui", "remote_raid_accept_quest", tostring(i), false)
+        end
+        raid_notebook_gui.remote_raid_perf_upgrade = function (i)
+            printf("[Server] Player sent need to get upgrade under [%i] num ", i)
+            local UpgradeTBL = raid_notebook_gui_shelter.raid_shelter_upgrades[i]
+            local funcerman = raid_notebook_gui_shelter[UpgradeTBL.func]
+            if type(funcerman) ~= "function" then
+                printe("! Failed to call upgrade: " .. tostring(UpgradeTBL.func))
+                return
+            end
+            UpgradeTBL.active = true
+            if IIsHost() then funcerman() end
+        end
+        -- Both sides... Need to im lock item
+        function raid_notebook_gui.RaidNotebook:OnBuyUpgrade(i)
+            local UpgradeTBL = raid_notebook_gui_shelter.raid_shelter_upgrades[i]
+            if db.actor:money() < UpgradeTBL.cost then return end
+		    db.actor:give_money(-UpgradeTBL.cost)
+            -- Set flags or call func if need
+            raid_notebook_gui.remote_raid_perf_upgrade(i)
+            -- sync bough upgrade
+            GameManager:OnICustomScriptAction("raid_notebook_gui", "remote_raid_perf_upgrade", tostring(i), false)
+            self:UpdateShelterMenu()
+        end
+        function raid_notebook_gui.RaidNotebook:OnBuyItem(i)
+            local ItemsTBL = raid_notebook_gui_items.raid_items[i]
+            local funcerman = raid_notebook_gui_items[ItemsTBL.func]
+            xr_sound.set_sound_play(db.actor:id(), "raid_click_2")	
+            if db.actor:money() < ItemsTBL.cost then return end
+            db.actor:give_money(-ItemsTBL.cost)
+            ItemsTBL.tmr = utils_data.CTime_to_table(game.get_game_time())
+            funcerman()
+            -- Sync flag
+            GameManager:OnICustomScriptAction("raid_notebook_gui", "remote_raid_block_item", tostring(i), false)
+            -- Update UI
+            self:UpdateItemsMenu()
+        end
+    end
+    if raid_utils then
+        raid_utils.money_to_sync = {}
+        raid_utils.give_task_reward = function (task_t, comm, task_id)
+            local oldval = db.actor:money()
+            OLDGRAREWARD(task_t, comm, task_id)
+            raid_utils.money_to_sync[task_id] = db.actor:money() - oldval
+        end
+        raid_utils.sync_raid_reward = function (tbl)
+            for task_id, money in pairs(tbl) do
+                local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+                task_data = task_data or raid_tasks_dungeons.raid_dunge_active_tasks and raid_tasks_dungeons.raid_dunge_active_tasks[task_id]
+                if task_data then
+                    local summ = money / math.random(2, 8)
+                    db.actor:give_money(summ)
+                    news_manager.relocate_money(db.actor, "in", summ)
+                end
+            end
+        end
+    end
+    if raid_save_manager then raid_save_manager.allow_save = not level.present() or level.name() == "fake_start" end
+    if raid_tasks_scout and raid_tasks_scout_dunge and raid_task_rf_scout_and_delivery_out then
+        raid_tasks_scout.remote_scout_point = function (tabled)
+            local task_id = tabled[1]
+            local smart_id = GameManager:GetLocalIDByServerID(tabled[2])
+
+            -- Sync scouted points for save in list
+            local dunge_cur = raid_tasks_dungeons.raid_dunge_active_tasks and raid_tasks_dungeons.raid_dunge_active_tasks[task_id]
+            if dunge_cur then
+                if dunge_cur.points[smart_id] then
+                    dunge_cur.points[smart_id] = "scouted"
+				    dunge_cur.scouted = dunge_cur.scouted + 1
+                end
+            end
+
+            -- Another scout task if something happens it's fallback here too.
+            local scout_cur = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+            if scout_cur then
+                if scout_cur.smarts_t[smart_id] then
+                    scout_cur.smarts_t[smart_id] = "scouted"
+				    scout_cur.scouted = scout_cur.scouted + 1
+                end
+            end
+
+            if not (scout_cur and scout_cur.smarts_t[smart_id] or dunge_cur and dunge_cur.points[smart_id]) then
+                printe("! %s | ERROR. Can't find object in smarts_t and smart_id lists... | ID: %s", task_id, smart_id)
+            end
+
+            -- Unmark that object if it's was marked...
+            raid_tasks_scout.unmark_smart(smart_id)
+        end
+        raid_tasks_scout.stmr = 0
+        raid_tasks_scout.actor_on_update = function ()
+            local tg = time_global()
+            if raid_tasks_scout.stmr > tg then return end
+            raid_tasks_scout.stmr = tg + 1000
+
+            -- Original calls
+            OLDGRASCOUTA()
+            
+            -- Get array and some condtions...
+            local active_t = raid_tasks_main.raid_active_tasks
+	        if not active_t or is_empty(active_t) then return end
+
+            -- Iterating tasks.... And collecting the scouted dots
+            for task_id, taskdata in pairs(active_t) do
+		        if level.name() == taskdata.level_name and string.find(task_id, "scout", 1, true) then
+                    for id, status in pairs(taskdata.smarts_t) do
+                        -- Sync scouted dot(s)... Usually 1 but who knows...
+                        if not taskdata.cachemp then taskdata.cachemp = {} end
+                        if status == "scouted" and not taskdata.cachemp[id] then
+                            local payload = { task_id, GameManager:GetServerIDByLocalID(id) }
+                            GameManager:OnICustomScriptAction("raid_tasks_scout", "remote_scout_point", serialize_table_simple(payload), false)
+                            taskdata.cachemp[id] = true
+                        end
+                    end
+                end
+            end
+        end
+        raid_tasks_scout_dunge.unmark_object = raid_tasks_scout.unmark_smart
+        raid_tasks_scout_dunge.point_in_viewport = raid_tasks_scout.smart_in_viewport
+        raid_tasks_scout_dunge.stmr = 0
+        raid_tasks_scout_dunge.actor_on_update = function ()
+            local tg = time_global()
+	        if raid_tasks_scout_dunge.stmr > tg then return end
+	        raid_tasks_scout_dunge.stmr = tg + 1000
+            
+            -- Original calls
+            OLDGRASCOUTB()
+
+            -- Get array and some condtions...
+            local active_t = raid_tasks_dungeons.raid_dunge_active_tasks
+	        if not active_t or is_empty(active_t) then return end
+
+            -- Send item to host. Just for will he!
+            if not IIsHost() then
+                local section = "raid_intelligence_note"
+                local item = db.actor:object(section)
+                if item then
+                    local str = "alife_create_item(%q, db.actor); news_manager.relocate_item(db.actor, 'in', %q)"
+                    local cmd = string.format(str, section, section)
+                    GameManager:OnICustomScriptAction(cmd, true)
+                    news_manager.relocate_item(db.actor, 'out', section)
+                    alife_release(item)
+                    return
+                end
+            end
+
+            -- Iterating tasks.... And collecting the active dots
+            for task_id, taskdata in pairs(active_t) do
+		        if level.name() == taskdata.level_name and string.find(task_id, "scout_dunge", 1, true) then
+                    for id, status in pairs(taskdata.points) do
+                        -- Sync scouted dot(s)... Usually 1 but who knows...
+                        if not taskdata.cachemp then taskdata.cachemp = {} end
+                        if status == "scouted" and not taskdata.cachemp[id] then
+                            local payload = { task_id, GameManager:GetServerIDByLocalID(id) }
+                            GameManager:OnICustomScriptAction("raid_tasks_scout", "remote_scout_point", serialize_table_simple(payload), false)
+                            taskdata.cachemp[id] = true
+                        end
+                    end
+                end
+            end
+        end
+        raid_objects_arranger.get_object_rand_point = function (_, level_name, __, ___)
+            local found_objects = {}
+            local sim, gg = alife(), game_graph()
+            for _, smart in pairs(SIMBOARD.smarts_by_names) do
+                if smart and sim:level_name(gg:vertex(smart.m_game_vertex_id):level_id()) == level_name then
+                    found_objects[#found_objects+1] = smart.id
+                end
+            end
+            for _, binder in pairs(bind_campfire.campfires_all) do
+                if binder and binder.object and sim:level_name(gg:vertex(binder.object:game_vertex_id()):level_id()) == level_name then
+                    --table.insert(found_objects, binder.object:id())
+                end
+            end
+            for name, zone in pairs(db.zone_by_name) do
+                if zone and sim:level_name(gg:vertex(zone:game_vertex_id()):level_id()) == level_name then
+                    --table.insert(found_objects, zone:id())
+                end
+            end
+            if #found_objects == 0 then
+                printe("ERROR: No objects found for raid_objects_arranger.get_object_rand_point")
+                return nil
+            end
+            local random_index = math.random(1, #found_objects)
+            return found_objects[random_index]
+        end
+        task_status_functor.raid_task_scout_dunge_status_functor = function (tsk, task_id)
+            local task_data = raid_tasks_dungeons.raid_dunge_active_tasks and raid_tasks_dungeons.raid_dunge_active_tasks[task_id]
+            if not (db.actor and tsk and IIsHost()) then return end
+
+            -- Use default status functor. It's good other parts at least for now.
+            if tsk.stage ~= 0 then return OLDGRASCOUTC(tsk, task_id) end
+
+            -- We not spawn the objects, we getting already existent
+            local old_function = raid_objects_arranger.spawn_object_rand_point
+            raid_objects_arranger.spawn_object_rand_point = raid_objects_arranger.get_object_rand_point
+            -- Call raid functors
+            local NeedSync = tsk.stage == 0
+            local ret = OLDGRASCOUTC(tsk, task_id)
+            -- Restore original
+            raid_objects_arranger.spawn_object_rand_point = old_function
+            if NeedSync then
+                task_data = task_data or raid_tasks_dungeons.raid_dunge_active_tasks and raid_tasks_dungeons.raid_dunge_active_tasks[task_id]
+                GameManager:OnICustomScriptAction("raid_utils", "sync_task_vars", serialize_table_simple({ task_id, task_data })..", true", false)
+            end
+            return ret
+        end
+    end
+    if raid_tasks_find then
+        raid_tasks_find.check_quest_box = function ()
+            if IIsHost() then return OLDGRATSKFNDE() end
+            GameManager:OnICustomScriptAction("raid_tasks_find", "check_quest_box", true)
+        end
+        task_status_functor.raid_task_find_weapon_status_functor = function (tsk, task_id)
+            local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+	        if not (db.actor and tsk and IIsHost()) then return end
+            if task_data then
+                if not task_data.wpn_cond then task_data.wpn_cond = task_data.outf_cond or task_data.art_tier end
+                if task_data.found_item_id then
+                    -- End task and sync money
+		            raid_tasks_main.end_raid_task(task_id, "complete", task_data.wpn_cond)
+                    local money = raid_utils.money_to_sync[task_id] or 0
+                    local cmd = string.format("db.actor:give_money(%d); news_manager.relocate_money(db.actor, 'in', %d)", money, money)
+                    GameManager:OnICustomScriptAction(cmd, false)
+                    return
+                end
+                return OGRADTSKFINDA(tsk, task_id)
+            end
+            OGRADTSKFINDA(tsk, task_id)
+        end
+        task_status_functor.raid_task_find_outfit_status_functor = task_status_functor.raid_task_find_weapon_status_functor
+        task_status_functor.raid_task_find_artefact_status_functor = task_status_functor.raid_task_find_weapon_status_functor
+    end
+    if raid_tasks_deliveries then
+        raid_tasks_deliveries.remote_set_flag = function (task_id)
+            local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+            if not task_data then return end
+            printf("--- [Client] Player placed quest mines - sync flag received!")
+            local smart = alife_object(task_data.smart_id)
+            if smart then -- CAN COMPLETE ABSOLUTE DIFFERENT QUEST. SAD : TODO: Fix the multiquest...
+                task_data.mines_placed = true
+                task_data.item_id = nil
+            end
+        end
+        task_status_functor.raid_task_delivery_mines_status_functor = function (tsk, task_id)
+            local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+            if not (db.actor and tsk) then return end
+            local se_item = task_data and type(task_data.item_id) == "number" and alife_object(task_data.item_id)
+            if tsk.stage ~= 3 and task_data and not task_data.mines_placed and not se_item then -- Prevent every frame iterating if we have
+                local item = task_data.item_sec and db.actor:object(task_data.item_sec)
+                -- Return new or changed it if item was dropped by another player or like spawned
+                if item then task_data.item_id = item:id() end
+                return
+            end
+
+            -- For Mines can't use old logic client
+            if not IIsHost() then return end
+            local NeedSync = tsk.stage == 0
+            local ret = OLDGRASMINES(tsk, task_id)
+
+            -- Sync task vars if it's was stage 0
+            if IIsHost() and NeedSync then
+                task_data = task_data or raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+                task_data.item_sec = "raid_delivery_item_mines"
+                GameManager:OnICustomScriptAction("raid_utils", "sync_task_vars", serialize_table_simple({ task_id, task_data }), false)
+            end
+            return ret
+        end
+        task_status_functor.raid_task_delivery_out_status_functor = function(tsk, task_id)
+	        local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+            if not (db.actor and tsk) then return end
+
+            if tsk.stage ~= 0 and task_data then
+                local item = task_data.item_sec and db.actor:object(task_data.item_sec)
+                if item then
+                    if not IIsHost() then
+                        local str = "alife_create_item(%q, db.actor); news_manager.relocate_item(db.actor, 'in', %q)"
+                        local cmd = string.format(str, task_data.item_sec, task_data.item_sec)
+                        GameManager:OnICustomScriptAction(cmd, true)
+                        news_manager.relocate_item(db.actor, 'out', task_data.item_sec)
+                        alife_release(item)
+                        return
+                    end
+                    -- Return new or changed it if item was dropped by another player or like spawned
+                    task_data.item_id = item:id()
+                    if level.name() == raid_utils.raid_home_level then
+                        raid_tasks_main.end_raid_task(task_id, "complete")
+                        return
+                    end
+                end
+            end
+
+            -- For Mines can't use old logic client
+            if not IIsHost() then return end
+            local NeedSync = tsk.stage == 0
+            math.random = NEWRANDOMRT
+            local ret = OLDGRADELISO(tsk, task_id)
+            math.random = OLDRANDOMRT
+
+            -- Sync task vars if it's was stage 0
+            if IIsHost() and NeedSync then
+                task_data = task_data or raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+                GameManager:OnICustomScriptAction("raid_utils", "sync_task_vars", serialize_table_simple({ task_id, task_data }), false)
+            end
+            return ret
+        end
+        task_status_functor.raid_task_delivery_out_world_status_functor = function(tsk, task_id)
+	        local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+            if not (db.actor and tsk) then return end
+
+            if tsk.stage ~= 0 and task_data then
+                local item = task_data.item_sec and db.actor:object(task_data.item_sec)
+                if item then
+                    if not IIsHost() then
+                        local str = "alife_create_item(%q, db.actor); news_manager.relocate_item(db.actor, 'in', %q)"
+                        local cmd = string.format(str, task_data.item_sec, task_data.item_sec)
+                        GameManager:OnICustomScriptAction(cmd, true)
+                        news_manager.relocate_item(db.actor, 'out', task_data.item_sec)
+                        alife_release(item)
+                        return
+                    end
+                    -- Return new or changed it if item was dropped by another player or like spawned
+                    task_data.item_id = item:id()
+                    if level.name() == raid_utils.raid_home_level then
+                        raid_tasks_main.end_raid_task(task_id, "complete")
+                        return
+                    end
+                end
+            end
+
+            -- For Mines can't use old logic client
+            if not IIsHost() then return end
+            local NeedSync = tsk.stage == 0
+            math.random = NEWRANDOMRT
+            local ret = OLDGRADELIWO(tsk, task_id)
+            math.random = OLDRANDOMRT
+
+            -- Sync task vars if it's was stage 0
+            if IIsHost() and NeedSync then
+                task_data = task_data or raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+                GameManager:OnICustomScriptAction("raid_utils", "sync_task_vars", serialize_table_simple({ task_id, task_data }), false)
+            end
+            return ret
+        end
+    end
+    if raid_task_anomaly_scan then
+        raid_task_anomaly_scan.remote_reset_flag = function (task_id)
+            local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+            if not task_data then return end
+            printf("~~~ [Server] Some player request to interrupt scanning...")
+            task_data.scanner_placed = false
+        end
+        raid_task_anomaly_scan.remote_set_flag = function (task_id, time)
+            local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+            if not task_data then return end
+            printf("~~~ [Server] Some player request to begin scanning...")
+            task_data.anomaly_scanner_placed_time = utils_data.CTime_to_table(game.get_game_time())
+        	task_data.time_to_scan = time
+            task_data.scanner_placed = true
+            -- Do the spawn mutants maybe
+            if math.random(1, 100) < 80 and IIsHost() then
+				local squad = raid_task_anomaly_scan.spawn_mutant_for_scan()
+				if squad then
+					task_data.mutant_squad_id = squad.id
+				else
+					printf("! GRA Warning: failed to spawn mutant for scan, squad is nil")
+				end
+			end
+            -- Send message to all... Due need it.
+            local str = strformat(game.translate_string("anomaly_scan_task_begin"), ui_options.curr_player_name())
+            news_manager.send_tip(db.actor, str, 0, "death", 5000)
+        end
+        task_functor.raid_task_anomaly_scan_target_functor = function(task_id,field,p,tsk)
+            local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+            if not (task_data and tsk) then return end
+            if field == "title" then
+                return raid_utils.get_raid_task_title(task_id, tsk.stage, 5)
+            elseif field == "descr" then
+                return raid_utils.get_raid_task_descr(task_id, tsk.stage, 5)
+            elseif field == "target" and tsk.stage > 0 and task_data.item_sec then
+                if tsk.stage == 5 then return end
+                if not task_data.scanner_placed and not xr_conditions.actor_has_item(db.actor, db.actor, { task_data.item_sec }) then
+                    return task_data.item_id
+                end
+                return task_data.smart_id
+            end
+        end
+        task_status_functor.raid_task_anomaly_scan_status_functor = function (tsk, task_id)
+            local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+            if not (db.actor and tsk) then return end
+            if not IIsHost() and tsk.stage == 0 then return end
+            
+            local cur_time = game.get_game_time()
+            local se_item = task_data and type(task_data.item_id) == "number" and alife_object(task_data.item_id)
+            if tsk.stage ~= 0 and task_data and not se_item and not task_data.scanner_placed then -- Prevent every frame iterating if we have
+                local item = task_data.item_sec and db.actor:object(task_data.item_sec)
+                -- Return new or changed it if item was dropped by another player or like spawned
+                if item then task_data.item_id = item:id() end
+                return
+            end
+
+            -- We can't repeat the hacks like above or buttom due it's total closed and local...
+            -- Maybe exist more easier way. But this too work. Animor: Quest stage synced properly.
+            if tsk.stage == 0 and IIsHost() then
+                local ret = OLDGRASCANER(tsk, task_id)
+                task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+                task_data.item_sec = "raid_anomaly_scanner"
+                GameManager:OnICustomScriptAction("raid_utils", "sync_task_vars", serialize_table_simple({ task_id, task_data }), false)
+                return ret
+            end
+
+            -- IDK, but task_data can be null here...
+            if not task_data then return end
+
+            -- Probably but here we can't be sure that smart id not moved on client side.
+            local smart = alife_object(task_data.smart_id)
+            if not smart then
+                printe("! %s | ERROR FAILED TO FIND SMART ZONE | ID %u !", task_id, task_data.smart_id)
+                return
+            end
+
+            -- Reworked status for scanner place
+            -- Stage 5 - is complete, 2 - is to early, 
+            if not task_data.scanner_placed then
+                local ndist = task_data.scanned_radius + 10
+                if se_item and se_item.parent_id ~= 0 and db.actor:position():distance_to_sqr(smart.position) < ndist * ndist then
+                    local time_rnd = math.random(60, 200)
+                    GameManager:OnICustomScriptAction("raid_task_anomaly_scan", "remote_set_flag", string.format("%q", task_id)..","..tostring(time_rnd), false)
+                    raid_task_anomaly_scan.remote_set_flag(task_id, time_rnd)
+                    xr_sound.set_sound_play(db.actor:id(), "pda_beep_2")
+                    tsk.stage = 3
+                    return
+                end
+            else
+                local item = task_data.item_sec and db.actor:object(task_data.item_sec)
+                if item then
+                    if tsk.stage == 5 and level.name() == raid_utils.raid_home_level then
+                        raid_tasks_main.end_raid_task(task_id, "complete")
+                    elseif tsk.stage == 4 then
+                        tsk.stage = 5
+                        xr_sound.set_sound_play(db.actor:id(), "pda_beep_2")
+                    elseif tsk.stage == 3 then
+                        GameManager:OnICustomScriptAction("raid_task_anomaly_scan", "remote_reset_flag", string.format("%q", task_id), false)
+                        raid_task_anomaly_scan.remote_reset_flag(task_id)
+                        tsk.stage = 2
+                    end
+                elseif tsk.stage == 5 then
+                    tsk.stage = 4
+                elseif tsk.stage ~= 4 and cur_time:diffSec(utils_data.CTime_from_table(task_data.anomaly_scanner_placed_time)) > task_data.time_to_scan then
+                    local str = strformat(game.translate_string("anomaly_scan_task_update"), ui_options.curr_player_name())
+                    news_manager.send_tip(db.actor, str, 0, "death", 5000)
+                    tsk.stage = 4
+                end
+            end
+
+            -- fail on timer
+            if task_data.urgent and task_data.urgent < 9 and IIsHost() then
+                local hours = raid_tables.raid_urgency_time[task_data.urgent]
+                if hours and cur_time:diffSec(utils_data.CTime_from_table(task_data.start_time)) > hours * 3600 then
+                    raid_tasks_main.end_raid_task(task_id, "fail")
+                end
+            end
+        end
+    end
+    if raid_task_kill_and_delivery_out then
+        task_status_functor.raid_task_kill_stalker_and_delivery_out_status_functor = function(tsk, task_id)
+            local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+            if not (db.actor and tsk) then return end
+
+            -- Clients no need more than this... Haha host...
+            if not IIsHost() then
+                if task_data then
+                    local item = task_data.pick_up_item_sec and db.actor:object(task_data.pick_up_item_sec) or task_data.item_sec and db.actor:object(task_data.item_sec)
+                    if item then
+                        -- Transfer all to host. We can't manage that!
+                        task_data.item_id = 65535
+                        local sec = item:section()
+                        local str = "alife_create_item(%q, db.actor); news_manager.relocate_item(db.actor, 'in', %q)"
+                        local cmd = string.format(str, sec, sec)
+                        GameManager:OnICustomScriptAction(cmd, true)
+                        news_manager.relocate_item(db.actor, 'out', sec)
+                        alife_release(item)
+                        -- Send updated task msg...
+                        local str = strformat(game.translate_string("kill_stalker_and_delivery_out_task_update_2"))
+			            news_manager.send_tip(db.actor, str, 0, "death", 5000)
+			            xr_sound.set_sound_play(db.actor:id(), "pda_beep_2")
+                    end
+                end
+                return
+            end
+
+            -- This block iterates the player and erases object if we have one than going to stage 6 forcelly
+            if tsk.stage == 5 and task_data then
+                local item = task_data.pick_up_item_sec and db.actor:object(task_data.pick_up_item_sec)
+                if item then
+                    -- Return new or changed it if item was dropped by another player or like spawned
+                    task_data.pick_up_item_id = item:id()
+                    local str = strformat(game.translate_string("kill_stalker_and_delivery_out_task_update_2"))
+			        news_manager.send_tip(db.actor, str, 0, "death", 5000)
+			        xr_sound.set_sound_play(db.actor:id(), "pda_beep_2")
+			        tsk.stage = 6
+                    return
+                end
+            elseif tsk.stage == 7 or tsk.stage == 8 and task_data then
+                local item = task_data.item_sec and db.actor:object(task_data.item_sec)
+                if item then
+                    -- Return new or changed it if item was dropped by another player or like spawned
+                    task_data.item_id = item:id()
+                    tsk.stage = 9
+                end
+            elseif tsk.stage == 2 and task_data and task_data.stalker_killed then
+                local str = strformat(game.translate_string("kill_stalker_and_delivery_out_task_update_1"), ui_options.curr_player_name())
+                news_manager.send_tip(db.actor, str, 0, "death", 9000)
+                xr_sound.set_sound_play(db.actor:id(), "pda_beep_2")
+                task_data.is_display = task_data.killed_by_actor
+                tsk.stage = 3
+                return
+            end
+
+            local NeedSync = tsk.stage == 0 or tsk.stage == 4 or tsk.stage == 6
+
+            -- Original code.
+            math.random = NEWRANDOMRT
+            local ret = OLDGRAKILLSA(tsk, task_id)
+            math.random = OLDRANDOMRT
+
+            -- Sync after stage 0 or 6
+            if NeedSync and IIsHost() then
+                task_data = task_data or raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+                local se_item = task_data.item_id and alife_object(task_data.item_id)
+                task_data.item_sec = se_item and se_item:section_name()
+                task_data.pick_up_item_sec = "raid_item_with_stash"
+                GameManager:OnICustomScriptAction("raid_utils", "sync_task_vars", serialize_table_simple({ task_id, task_data }), false)
+            end
+            return ret
+        end
+    end
+    if raid_task_rf_find_and_delivery_out then
+        task_status_functor.raid_task_rf_find_and_delivery_out_status_functor = function (tsk, task_id)
+            local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+            if not (db.actor and tsk) then return end
+
+            -- Stage 2 and check for need item obj blah
+            if tsk.stage ~= 0 and task_data then
+                local item = task_data.item_sec and db.actor:object(task_data.item_sec)
+                if item then
+                    if not IIsHost() then
+                        -- Transfer all to host. We can't manage that!
+                        task_data.item_id = 65535
+                        local str = "alife_create_item(%q, db.actor); news_manager.relocate_item(db.actor, 'in', %q)"
+                        local cmd = string.format(str, task_data.item_sec, task_data.item_sec)
+                        GameManager:OnICustomScriptAction(cmd, true)
+                        news_manager.relocate_item(db.actor, 'out', task_data.item_sec)
+                        alife_release(item)
+                        return
+                    end
+                    -- Return new or changed it if item was dropped by another player or like spawned
+                    task_data.item_id = item:id()
+                    if level.name() == raid_utils.raid_home_level then
+                        raid_tasks_main.end_raid_task(task_id, "complete")
+                        return
+                    end
+                end
+            end
+
+            -- Host can setup data for quest. But client need to search position maybe
+            if not IIsHost() then
+                if (tsk.stage == 0 or tsk.stage == 5 or tsk.stage == 3 or tsk.stage == 4 or not task_data) then return end
+                if task_data.item_id and alife_object(task_data.item_id) then
+                    task_data.stash_id = task_data.item_id
+                elseif task_data.smart_id and alife_object(task_data.smart_id) then
+                    task_data.stash_id = task_data.smart_id
+                else -- Can't find smart or stash id
+                    return
+                end
+            end
+
+            -- Host can setup data for quest
+            local NeedSync = tsk.stage == 0
+            local NeedSyncMark = tsk.stage == 2 and task_data and task_data.stash_id and level.map_has_object_spot(task_data.stash_id, "treasure") == 0
+
+            -- Iterate pos based players
+            math.random = NEWRANDOMRT
+            if tsk.stage == 1 and IIsHost() then
+                local oldactor = actor
+                for k, v in pairs(db.actors) do
+                    if v and v.object then
+                        actor = v.object
+                        OLGRARFFDLVR(tsk, task_id)
+                    end
+                end
+                actor = oldactor
+            end
+
+            -- Default call for setup
+            local ret = OLGRARFFDLVR(tsk, task_id)
+            math.random = OLDRANDOMRT
+
+            NeedSyncMark = task_data and task_data.stash_id and level.map_has_object_spot(task_data.stash_id, "treasure") ~= 0
+
+            -- Sync if it's was stage == 0
+            if IIsHost() then
+                task_data = task_data or raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+                if NeedSync then
+                    local se_object = alife_object(task_data.smart_id) or alife_object(task_data.stash_id) or alife_object(task_data.item_id)
+                    if se_object then 
+                        task_data.target_position = { se_object.position.x, se_object.position.y, se_object.position.z, se_object.position.w }
+                        for _, t in pairs(raid_tasks_main.raid_tasks_t) do
+                            if t.tasks[task_id] then
+                                task_data.target_freq = t.tasks[task_id].target_freq
+                                break
+                            end
+                        end
+                    else
+                        printe("! [Server] Failed to set position for client side. Due we can't find any of this object!")
+                    end
+                    GameManager:OnICustomScriptAction("raid_utils", "sync_task_vars", serialize_table_simple({ task_id, task_data }), false)
+                elseif NeedSyncMark then
+                    local se_box = task_data.stash_id and alife_object(task_data.stash_id)
+                    if not se_box then
+                        printe("! [Server] Failed to sync mark of %s stash!", task_data.stash_id or 65535)
+                        return
+                    end
+                    local payload = { se_box.id, se_box.position, se_box.m_level_vertex_id, se_box.m_game_vertex_id, treasure_manager.get_stash_spot_type(se_box.id) }
+                    GameManager:OnICustomScriptAction("treasure_manager", "remote_add_map_spot", serialize_table_simple(payload), false)
+                end
+            end
+            return ret
+        end
+    end
+    if raid_task_rf_scout_and_delivery_out then
+        task_status_functor.raid_task_rf_scout_and_delivery_out_status_functor = function (tsk, task_id)
+            local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+            if not (db.actor and tsk) then return end
+            -- Host thing that if we got item somehow return it to host
+            -- Stage 2 and check for need item obj blah
+            if tsk.stage ~= 0 and task_data then
+                local item = task_data.item_sec and db.actor:object(task_data.item_sec)
+                if item then
+                    if not IIsHost() then
+                        -- Transfer all to host. We can't manage that!
+                        task_data.item_id = 65535
+                        local str = "alife_create_item(%q, db.actor); news_manager.relocate_item(db.actor, 'in', %q)"
+                        local cmd = string.format(str, task_data.item_sec, task_data.item_sec)
+                        GameManager:OnICustomScriptAction(cmd, true)
+                        news_manager.relocate_item(db.actor, 'out', task_data.item_sec)
+                        alife_release(item)
+                        return
+                    end
+                    -- Return new or changed it if item was dropped by another player or like spawned
+                    task_data.item_id = item:id()
+                    if level.name() == raid_utils.raid_home_level then
+                        raid_tasks_main.end_raid_task(task_id, "complete")
+                        return
+                    end
+                end
+            end
+
+            -- Host can setup data for quest. But client need to search position maybe
+            if not IIsHost() and (tsk.stage == 0 or tsk.stage == 4 or tsk.stage == 3 or not task_data) then return end
+
+            -- Host can setup data for quest
+            local NeedSync = tsk.stage == 0
+            local NeedSyncMark = task_data and task_data.stash_id and level.map_has_object_spot(task_data.stash_id, "treasure") == 0
+
+            -- Iterate pos based players
+            math.random = NEWRANDOMRT
+            if tsk.stage == 1 and IIsHost() then
+                local oldactor = actor
+                for k, v in pairs(db.actors) do
+                    if v and v.object then
+                        actor = v.object
+                        OLGRARFFDRVR(tsk, task_id)
+                    end
+                end
+                actor = oldactor
+            end
+            
+            -- Default call for setup
+            local ret = OLGRARFFDRVR(tsk, task_id)
+            math.random = OLDRANDOMRT
+
+            NeedSyncMark = task_data and task_data.stash_id and level.map_has_object_spot(task_data.stash_id, "treasure") ~= 0
+            
+            -- Sync if it's was stage == 0
+            if IIsHost() then
+                task_data = task_data or raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+                if NeedSync then
+                    local se_object = alife_object(task_data.smart_id) or alife_object(task_data.stash_id) or alife_object(task_data.item_id)
+                    if se_object then 
+                        task_data.target_position = { se_object.position.x, se_object.position.y, se_object.position.z, se_object.position.w }
+                        for _, t in pairs(raid_tasks_main.raid_tasks_t) do
+                            if t.tasks[task_id] then
+                                task_data.target_freq = t.tasks[task_id].target_freq
+                                break
+                            end
+                        end
+                    else
+                        printe("! [Server] Failed to set position for client side. Due we can't find any of this object!")
+                    end
+                    GameManager:OnICustomScriptAction("raid_utils", "sync_task_vars", serialize_table_simple({ task_id, task_data }), false)
+                elseif NeedSyncMark then
+                    local se_box = task_data.stash_id and alife_object(task_data.stash_id)
+                    if not se_box then
+                        printe("! [Server] Failed to sync mark of %s stash!", task_data.stash_id or 65535)
+                        return
+                    end
+                    local payload = { se_box.id, se_box.position, se_box.m_level_vertex_id, se_box.m_game_vertex_id, treasure_manager.get_stash_spot_type(se_box.id) }
+                    GameManager:OnICustomScriptAction("treasure_manager", "remote_add_map_spot", serialize_table_simple(payload), false)
+                end
+            end
+            return ret
+        end
+    end
+    if raid_tasks_deliveries then
+        task_status_functor.raid_task_delivery_in_status_functor = function (tsk, task_id)
+            local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+            if not (db.actor and tsk) then return end
+            -- Some fixes due it's something wrong
+            if tsk.stage ~= 0 and tsk.stage ~= 3 and task_data then
+                local stash_obj = level.object_by_id(task_data.stash_id)
+                if stash_obj then
+                    local item = stash_obj:object(task_data.item_sec)
+                    if item then 
+                        alife_release(item)
+                        tsk.stage = 3
+                    elseif not xr_conditions.actor_has_item(db.actor, db.actor, { task_data.item_sec }) then
+                        tsk.stage = 2
+                    else
+                        tsk.stage = 1
+                    end
+                end
+            end
+
+            -- Status other stuff
+            if not IIsHost() and tsk.stage == 0 then return end
+            local NeedSync = tsk.stage == 0
+            math.random = NEWRANDOMRT
+            local ret = OLDGRADELISI(tsk, task_id)
+            math.random = OLDRANDOMRT
+
+            -- Sync if it's was stage == 0
+            if NeedSync and IIsHost() then
+                task_data = task_data or raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+                GameManager:OnICustomScriptAction("raid_utils", "sync_task_vars", serialize_table_simple({ task_id, task_data }), false)
+            end
+            return ret
+        end
+    end
+    if raid_sudden_task_find_squad_and_delivery_out then
+        task_status_functor.raid_sudden_task_find_squad_and_delivery_out_status_functor = function (tsk, task_id)
+            local task_data = raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+            if not (db.actor and tsk) then return end
+
+            -- Status other stuff
+            if not IIsHost() then return end
+            local NeedSync = tsk.stage == 0
+            local ret = OLGRARFFSQIT(tsk, task_id)
+
+            -- Sync if it's was stage == 0
+            if NeedSync and IIsHost() then
+                task_data = task_data or raid_tasks_main.raid_active_tasks and raid_tasks_main.raid_active_tasks[task_id]
+                local se_object = alife_object(task_data.smart_id) or alife_object(task_data.stash_id) or alife_object(task_data.item_id)
+                if se_object then
+                    task_data.target_position = { se_object.position.x, se_object.position.y, se_object.position.z, se_object.position.w }
+                    for _, t in pairs(raid_tasks_main.raid_tasks_t) do
+                        if t.tasks[task_id] then
+                            task_data.target_freq = t.tasks[task_id].target_freq
+                            break
+                        end
+                    end
+                else
+                    printe("! [Server] Failed to set position for client side. Due we can't find any of this object!")
+                end
+                GameManager:OnICustomScriptAction("raid_utils", "sync_task_vars", serialize_table_simple({ task_id, task_data }), false)
+            end
+            return ret
+        end
+    end
+    if raid_simulation_lab then
+        raid_simulation_lab.create_lab_restrictors = function ()
+            if not IIsHost() then return end
+            for lab_name, r_sim in pairs(raid_simulation_lab.raid_restr_lab) do 
+                for tier_name, r_zones in pairs(r_sim) do 
+                    for zone_name, zone in pairs(r_zones) do
+                        local size_x = zone.p2.x - zone.p1.x
+                        local size_y = zone.p2.y - zone.p1.y
+                        local size_z = zone.p2.z - zone.p1.z
+                        local pos = vector():set(zone.p1.x + size_x / 2, zone.p1.y + size_y / 2, zone.p1.z + size_z / 2)
+                        local se_obj = alife_create("raid_lab_restrictor_" .. tier_name, pos, zone.lvid, zone.gvid)
+                        if se_obj then
+                            local data = utils_stpk.get_space_restrictor_data(se_obj)
+                            if data then
+                                data.shapes = {}
+                                data.shapes[1] = {}
+                                data.shapes[1].shtype = 1
+                                data.shapes[1].v1 = vector():set(size_x, 0, 0)
+                                data.shapes[1].v2 = vector():set(0, size_y + zone.size.y, 0)
+                                data.shapes[1].v3 = vector():set(0, 0, size_z)
+                                data.shapes[1].offset = vector():set(0, 0, 0)
+                                local strcs = string.format([[
+                                    [logic]
+                                    active = sr_idle@run
+
+                                    [sr_idle@run]
+                                    on_info = %% =raid_restr_lab_restrictor_run(%s:%s) %%
+                                ]], se_obj:name(), tier_name)
+                                data.custom_data = strcs
+                            end
+                            utils_stpk.set_space_restrictor_data(data, se_obj)
+                        end
+                    end
+                end
+            end
+        end
+        xr_effects.raid_restr_lab_restrictor_run = function (actor, npc, p)
+            if not (IIsHost() and p) then return false end
+            if raid_simulation_lab.tiers_lab_is_spawned[p[2]] then return true end
+            -- Iterate only one zone and check conds
+            local name = p[1]
+            local tier = p[2]
+            local zone = db.zone_by_name[name]
+            if not zone then return false end
+            -- MC in zone
+            if zone:inside(actor:position()) then
+                printf("[Client] Player [%s] triggered the [%s][%s] zone", ui_options.curr_player_name(), name, tier)
+                raid_simulation_lab.lab_spawn(tier)
+                return true
+            end
+            -- Check other players in zone...
+            for _, v in pairs(db.actors) do
+                if v and v.object and zone:inside(v.object:position()) then
+                    printf("[Client] Player [%s] triggered the [%s][%s] zone", v.object:name(), name, tier)
+                    raid_simulation_lab.lab_spawn(tier)
+                    return true
+                end
+            end
+            return false
+        end
+    end
+    if raid_travel_manager then
+        function ui_sr_teleport.msg_box_ui:ModdedMPTeleport()
+            if not self.name then return end
+
+            -- return if blacklisted
+            if raid_travel_manager.out_blacklisted_restr_t[self.name] then
+                actor_menu.set_msg(1, game.translate_string("st_route_unknown"),5)
+                ui_sr_teleport.msg_box_ui.OnMsgCancel(self)
+                return
+            end
+
+            -- return if transition is blocked
+            if raid_simulation_dungeons.raid_sim_dunge[level.name()] then
+                if z_raid_item_travel_dungeons.nearest_restrictor_id then
+                    local se_obj = alife_object(z_raid_item_travel_dungeons.nearest_restrictor_id)
+                    if se_obj and se_obj:name() == self.name then
+                        actor_menu.set_msg(1, game.translate_string("st_raid_route_unavailable"),5)
+                        ui_sr_teleport.msg_box_ui.OnMsgCancel(self)
+                        return
+                    end
+                end
+            end
+            
+            -- Raid home position_data
+            local pos = vector():set(618.37, -43.845, 197.48)
+            local look = vector():set(622.48, -43.8, 195.15)
+            local lvid = 222305
+            local gvid = 2531
+            
+            --teleport to home
+            printf("raid_teleport, tp to home level")
+
+            local dir = vector():set(vec_sub(look, pos):normalize())
+
+            db.actor:hide_weapon()
+        
+            -- change time
+            CreateTimeEvent("raid_time_forward_e", "raid_time_forward_a", 2.5, function()
+                local tier = raid_utils.get_raid_sim(level.name()) and raid_utils.get_raid_sim(level.name()).level_tier or 1
+                local hour = raid_utils.calc_travel_time(tier)
+
+                -- hit radiation + bleeding travel
+                local rad_hit = raid_utils.raid_get_rad_hit(hour)
+                raid_rad_hit_damage = rad_hit
+                local bleeding_hit = db.actor.bleeding / 1.7
+                
+                -- Health damage
+                db.actor.health = db.actor.health - rad_hit - bleeding_hit
+                db.actor.radiation = 0
+                db.actor.bleeding = 999
+                arszi_psy.set_psy_health(1)
+                
+                -- Set flags idk why
+                if db.actor.health <= 0 and bleeding_hit <= 0.03 then
+                    raid_travel_manager.flag_died_radiation_during_travel = true
+                elseif (rad_hit >= 0.05) then
+                    raid_travel_manager.flag_hit_radiation_during_travel = true			
+                end
+
+                -- Changing weather and times
+                level.change_game_time(0, hour, 0)
+                raid_travel_manager.weather_change()
+                return true
+            end)
+
+            -- teleport fade screen
+            level.add_pp_effector("sleep_fade.ppe", 1313, false)
+            CreateTimeEvent("raid_delay_travel_e", "raid_delay_travel_a", 3, function()
+                ChangeLevel(pos, lvid, gvid, VEC_ZERO)
+                return true
+            end)
+
+            SendScriptCallback("on_before_level_changing")
+        end
+    end
+    if grok_loot_claim then
+        grok_loot_claim.npc_on_death_callback = function (victim, killer)
+            if not (victim and killer) then return end
+            if IsActor(killer) and killer:id() ~= db.actor:id() then return end
+            return OLDLRCLAIMSP(victim, killer)
+        end
+    end
+    if demonized_ledge_grabbing and not demonized_ledge_grabbing.grap_in_tsync then
+        demonized_ledge_grabbing.grap_in_tsync = function()
+            CreateTimeEvent(0, "act_climb_start_sync", 1.1, function()
+                GameManager:OnICustomAnimation("turnik_out", "", true, 1)
+                return true
+            end)
+        end
+        RegisterScriptCallback("actor_on_climb_start", demonized_ledge_grabbing.grap_in_tsync)
+    end
+    if agdd_voiced_actor then
+        agdd_voiced_actor.actor_speak_client = function (packet)
+            for k, v in pairs(db.actors) do
+                if v and v.object and v.object:GetNetID() == packet[1] then
+                    local snd = sound_object(packet[2])
+                    snd.volume = packet[3]
+                    snd:play_no_feedback(v.object, 0, 0, v.object:position(), 1.0, 1.0)
+                    break
+                end
+            end
+        end
+        if agdd_voiced_actor.actor_speak_base then
+            agdd_voiced_actor.actor_speak_base = function (file, sound_volume, ...)
+                if not (file and db.actor) then return end
+                if not OLDACTVOICEN(file, sound_volume, ...) then return end
+                -- Sync voice from actor by button or just screams
+                local payload = { GameManager:GetMySNETID(), file, sound_volume }
+                GameManager:OnICustomScriptAction("agdd_voiced_actor", "actor_speak_client", serialize_table_simple(payload), false)
+            end
+        else
+            agdd_voiced_actor.actor_speak = function (file, sound_volume, ...)
+                if not (file and db.actor) then return end
+                if not OLDACTVOICEO(file, sound_volume, ...) then return end
+                -- Sync voice from actor by button or just screams
+                local payload = { GameManager:GetMySNETID(), file, sound_volume }
+                GameManager:OnICustomScriptAction("agdd_voiced_actor", "actor_speak_client", serialize_table_simple(payload), false)
+            end
+        end
+    end
+    if zz_glowstick_mcm then zz_glowstick_mcm.spawn_glowstick = NOP end -- WERASIK2AA Avoid drop
+    if grok_drop_item_press_key_mcm then
+        grok_drop_item_press_key_mcm.sync_fuck_hacks = function ()
+            if grok_drop_item_press_key_mcm.obj_to_drop then
+                GameManager:OnIDrop(grok_drop_item_press_key_mcm.obj_to_drop:id(), 65535)
+                grok_drop_item_press_key_mcm.obj_to_drop = nil
+            end
+        end
+        RegisterScriptCallback("on_key_press", grok_drop_item_press_key_mcm.sync_fuck_hacks)
+    end
+    if operacia_monolith then
+        operacia_monolith.timer = 0
+        operacia_monolith.actor_on_update = function ()
+            if not IIsHost() then return end
+
+            -- Timed checks. Why that idk.
+            local tg = time_global()
+            if operacia_monolith.timer - tg < 2000 then return end
+            operacia_monolith.timer = tg
+
+            -- TM get class
+            local tm = task_manager.get_task_manager()
+            if not tm then return end
+
+            -- We check all players for item.
+            -- cs informer pda
+            if xr_conditions.actor_has_item(db.actor, db.actor, { "cs_informer_pda" }) and 
+                not has_alife_info("cs_task2_start") and has_alife_info("cs_task1_start") then
+                db.actor:give_info_portion("cs_task2_start")
+                tm:give_task("cs_story_task2")
+                return
+            end
+            -- bar case
+            if xr_conditions.actor_has_item(db.actor, db.actor, { "bar_case" }) and not has_alife_info("bar_case_have") then
+		        db.actor:give_info_portion("bar_case_have")
+                alife_create("snork_cs_strong",vector():set(-61.414897918701,1.2449436187744,-148.25701904297),39582,2223)
+                alife_create("m_controller_normal2",vector():set(-38.140983581543,0.48093682527542,-146.32695007324),50578,2258)
+                return
+            end
+            -- cs deshefrator
+            if xr_conditions.actor_has_item(db.actor, db.actor, { "cs_deshefrator" }) and not has_alife_info("cs_task8_storytask_start") then
+                tm:give_task("cs_task8_storytask")	
+                news_manager.send_tip(db.actor, game.translate_string("cs_task8_news3"), 1, nil, 15000)
+                db.actor:give_info_portion("cs_task8_storytask_start")
+                return
+            end
+            -- pda shmatko
+            if xr_conditions.actor_has_item(db.actor, db.actor, { "pda_shmatko" }) and not has_alife_info("dolg_story_task_3_dop_started") then
+                tm:give_task("dolg_story_task_3_dop")			
+                db.actor:give_info_portion("dolg_story_task_3_dop_started")
+                return
+            end
+            -- pda pinya
+            if xr_conditions.actor_has_item(db.actor, db.actor, { "pda_pinya" }) and not has_alife_info("dolg_story_task_4_dop_started") then
+                tm:give_task("dolg_story_task_4_dop")			
+                db.actor:give_info_portion("dolg_story_task_4_dop_started")
+                return
+            end
+            -- pda barbos
+            if xr_conditions.actor_has_item(db.actor, db.actor, { "pda_barbos" }) and not has_alife_info("pda_barbos_found") then
+                db.actor:give_info_portion("pda_barbos_found")
+                alife_create("snork_cs_strong",vector():set(-15.210734367371,-2.5547621250153,-219.93609619141),52999,2764)
+                return
+            end
+            -- pda tango
+            if xr_conditions.actor_has_item(db.actor, db.actor, { "pda_tango" }) and not has_alife_info("pda_tango_found") then
+                db.actor:give_info_portion("pda_tango_found")
+                alife_create("bloodsucker_cs_normal",vector():set(116.27769470215,-2.9433076381683,-314.80520629883),102209,2785)		
+                return
+            end
+            -- pda tribun
+            if db.actor:object("pda_tribun") and not has_alife_info("pda_tribun_found") then
+                db.actor:give_info_portion("pda_tribun_found")
+                alife_create("burer_cs_normal",vector():set(176.04179382324,-0.21944612264633,-207.09704589844),116088,2805)		
+                return
+            end
+            -- some conditions 4 zaver
+            if has_alife_info("kuznecov_task_4_zavercheno") and has_alife_info("document_x10_kuznecov") and not has_alife_info("come_to_aes_vidan") then
+                tm:give_task("come_to_aes")
+                news_manager.send_tip(db.actor, game.translate_string("kvartet_1"), 4, army, 30000)
+                db.actor:give_info_portion("come_to_aes_vidan")
+                return
+            end
+            -- some defense sq for assault
+            if has_alife_info("monolith_defense_squad_1_death") and has_alife_info("monolith_defense_squad_2_death") and 
+                has_alife_info("monolith_defense_squad_3_death") and not has_alife_info("road_clear") then
+                db.actor:give_info_portion("road_clear")
+                tm:give_task("assault_gen")
+                news_manager.send_tip(db.actor, game.translate_string("kvartet_3"), 4, army, 30000)
+                return
+            end
+            -- sq defense quest done
+            if has_alife_info("monolith_defense_squad_gen_death") and not has_alife_info("zadacha_vipolnena") then
+                db.actor:give_info_portion("zadacha_vipolnena")
+                news_manager.send_tip(db.actor, game.translate_string("kvartet_4"), 4, army, 30000)
+                return
+            end
+            -- SQ alife
+            if has_alife_info("mil_smart_terrain_7_7_freedom_leader_stalker_squad_dead") and not has_alife_info("zadacha_vipolnena_1") then
+                db.actor:give_info_portion("zadacha_vipolnena_1")
+                news_manager.send_tip(db.actor, game.translate_string("st_cherep_1"), 4, nil, 30000)
+                return
+            end
+            -- Check time or kill the informer...
+            if hours >= 21 and hours < 23 and not has_alife_info("cs_task1_start") and has_alife_info("cs_story_task0_done") then
+                news_manager.send_tip(db.actor, game.translate_string("cs_task1_news"), 4, csky, 30000)
+                news_manager.send_tip(db.actor, game.translate_string("cs_task1_news1"), 7, csky, 30000)
+                db.actor:give_info_portion("cs_task1_start")
+                tm:give_task("cs_story_task1")
+                -- Spawn and call function logic of se obj
+                local se_obj = alife_create("cs_informer",vector():set(105.97696685791,1.1209254264832,332.66290283203),201708,84)
+                if se_obj then se_obj:on_death() else printf("![ERROR] Failed to create 'cs_informer'!") end
+            elseif hours >= 12 and hours < 22 and not has_alife_info("holod_soobshil") and has_alife_info("cs_story_task2_done") then
+                news_manager.send_tip(db.actor, game.translate_string("cs_task1_news2"), 1, csky, 30000)
+                db.actor:give_info_portion("holod_soobshil")
+                tm:give_task("cs_story_task3_start")
+            elseif hours >= 5 and hours < 12 and not has_alife_info("cs1_fail") and has_alife_info("cs_task1_start") then
+		        db.actor:give_info_portion("cs1_fail")
+            end
+        end
+    end
+end
+
+function Patch_Client()
+    if operacia_monolith then
+        operacia_monolith.cs_story_task0 = function ()
+            GameManager:OnICustomScriptAction("operacia_monolith.cs_story_task0()", true)
+        end
+        operacia_monolith.barmen_task1 = function ()
+            GameManager:OnICustomScriptAction("operacia_monolith.barmen_task1()", true)
+        end
+        operacia_monolith.ohotnik_task1 = function ()
+            GameManager:OnICustomScriptAction("operacia_monolith.ohotnik_task1()", true)
+        end
+        operacia_monolith.dolg_story_task_1_dop = function ()
+            GameManager:OnICustomScriptAction("operacia_monolith.dolg_story_task_1_dop()", true)
+        end
+        operacia_monolith.give_task_esc_military_docs_poisk = function ()
+            GameManager:OnICustomScriptAction("operacia_monolith.give_task_esc_military_docs_poisk()", true)
+        end
+    end
+    if ammo_maker then
+        ammo_maker.breakdown = item_parts.disassembly_item
+    end
+    -- This remove randoms wpo on client side
+    if zzzz_arti_jamming_repairs then
+        zzzz_arti_jamming_repairs.weapon_eval_parts = zzzz_arti_jamming_repairs.EvaluateParts
+    end
+    if passive_income then
+        task_functor.passinc_task_title_f = function(task_id, field, p, tsk)
+            return tsk.current_title
+        end
+        task_functor.passinc_task_descr_f = function(task_id, field, p, tsk)
+            return tsk.current_descr
+        end
+    end
+    if tasks_vengence_amplified then
+        tasks_vengence_amplified.monster_on_death = function(monster, killer)
+            if tasks_vengence_amplified.is_chimera(monster) and killer and IsActor(killer) and nta_utils.is_axe() then
+                state.succeeded = true
+            end
+        end
+    end
+    if tasks_urgent_orders then
+        xr_effects.urgent_orders_clear_eco_squad = NOP
+        task_functor.urgent_orders_target_functor = RDEF
+    end
+    if tasks_the_living_fire then
+        tasks_the_living_fire.spawn_corpses = NOP
+        task_functor.the_living_fire_task_target_functor = RDEF
+    end
+    if tasks_nta_stash then
+        xr_effects.spawn_stash_and_quest_item = NOP
+        xr_effects.nta_stash_task_completed = NOP
+        task_functor.nta_stash_task_target_functor = RDEF
+    end
+    if tasks_skyfall then
+        tasks_skyfall.spawn_dynamic_heli = NOP
+        tasks_skyfall.spawn_static_heli = NOP
+    end
+    if tasks_big_game then
+        task_status_functor.big_game_task_status_functor = NOP
+        task_functor.big_game_task_target_functor = RDEF
+    end
+    if tasks_mystery_of_the_swamps then
+        tasks_mystery_of_the_swamps.spawn_garbage_ghost = NOP
+        tasks_mystery_of_the_swamps.mystery_of_the_swamps_task_target_functor = RDEF
+    end
+    if tasks_dead_night then
+        tasks_dead_night.spawn = NOP
+        tasks_dead_night.dead_night_task_target_functor = RDEF
+    end
+    if tasks_no_step_back then
+        tasks_no_step_back.spawn = NOP
+    end
+    if tasks_hold_the_ground then
+        tasks_hold_the_ground.spawn = NOP
+        task_functor.hold_the_ground_task_target_functor = RDEF
+    end
+    if tasks_baba_yaga then
+        tasks_baba_yaga.spawn = NOP
+        task_functor.baba_yaga_task_target_functor = RDEF
+    end
+    if tasks_mirage then
+        tasks_mirage.spawn_burer = NOP
+        tasks_mirage.spawn_mirages = NOP
+        tasks_mirage.spawn_sidor = NOP
+        tasks_mirage.npc_on_choose_weapon = NOP
+        task_functor.mirage_task_target_functor = RDEF
+    end
+    if kd_tree then
+        kd_tree.updateObjPositions = NOP
+    end
+    if surge_rush_scheme_evaluator_inside then
+        function surge_rush_scheme_evaluator_inside.evaluator_stalker_surge_rush_inside:evaluate()
+            return false
+        end
+        function surge_rush_scheme_evaluator_inside.action_stalker_surge_rush_inside:execute()
+            return false
+        end
+        function surge_rush_scheme_evaluator_inside.evaluator_stalker_surge_rush_inside:execute()
+            action_base.execute(self)
+        end
+    end
+    if surge_rush_scheme_evaluator_outside then
+        function surge_rush_scheme_evaluator_outside.evaluator_stalker_surge_rush_outside:evaluate()
+            return false
+        end
+        function surge_rush_scheme_evaluator_outside.action_stalker_surge_rush_outside:execute()
+            return false
+        end
+        function surge_rush_scheme_evaluator_outside.evaluator_stalker_surge_rush_outside:execute()
+            action_base.execute(self)
+        end
+    end
+    if dynamic_faction_relations_customizer then
+        dynamic_faction_relations_customizer.evaluate_npc_on_death = NOP
+    end
+    if nta_utils then
+        nta_utils.spawn_at_position = NOP
+        nta_utils.spawn_helper = NOP
+        nta_utils.mass_spawn_helper = NOP
+    end
+    if liz_wounded_redone then
+        liz_wounded_redone.npc_on_before_hit = NOP
+    end
+    if gameplay_silent_kills then
+        gameplay_silent_kills.npc_on_before_hit = NOP
+    end
+    if stealth_kill_detection then
+        stealth_kill_detection.trigger_stealth_kill_callback = NOP
+        stealth_kill_detection.on_game_start = NOP
+    end
+    if western_goods_module_npcs then
+        western_goods_module_npcs.spawn_squads = NOP
+        western_goods_module_npcs.eval_ignore_npcs = NOP
+        western_goods_module_npcs.set_relation = NOP
+        western_goods_module_npcs.on_game_start = NOP
+    end
+    if western_goods_utils then
+        western_goods_utils.spawn_squad = NOP
+        western_goods_utils.spawn_story_squad = NOP
+        western_goods_utils.spawn_squad_smart = NOP
+        western_goods_utils.spawn_dead_squad = NOP
+    end
+    if western_goods_module_tasks then
+        task_status_functor.act_1_task_1_status_f = NOP
+        task_status_functor.act_1_task_2_status_f = NOP
+        task_status_functor.act_1_task_3_status_f = NOP
+        task_status_functor.act_2_task_1_status_f = NOP
+        task_status_functor.act_2_task_2_status_f = NOP
+        task_status_functor.act_3_task_1_status_f = NOP
+        task_status_functor.act_3_task_2_status_f = NOP
+        task_status_functor.act_3_task_3_status_f = NOP
+        task_status_functor.act_3_task_4_status_f = NOP
+        xr_effects.act_2_task_1_init = NOP
+    end
+    if western_goods_tasks_act_2 then
+        western_goods_tasks_act_2.task_2_clear_smart_terrain = NOP
+    end
+    if western_goods_tasks_act_3 then western_goods_tasks_act_3.task_2_spawn_quest_item = NOP end
+    if western_goods_loot then western_goods_loot.spawn_corpse_loot = NOP end
+    if tasks_intercept_artifact then
+        xr_effects.intercept_artifact_completed = NOP
+        xr_conditions.intercept_artifact_check = NOP
+        xr_effects.spawn_intercept_artifact_artifact = NOP
+        xr_effects.dispatch_intercept_artifact_task_details = NOP
+        task_functor.intercept_artifact_task_target_functor = RDEF
+    end
+    if haru_skills then haru_skills.scavanger_effect = NOP end
+    if roguelite_module_stashes then roguelite_module_stashes.physic_object_on_use_callback = NOP end
+    if stalker_cloning_utility then stalker_cloning_utility.clone_stalker = NOP end
+    if xrs_rnd_npc_loadout then
+        xrs_rnd_npc_loadout.create_item_on_npc = NOP
+        xrs_rnd_npc_loadout.on_creation = NOP
+        xrs_rnd_npc_loadout.on_game_start = NOP
+    end
+    if exo_loot then exo_loot.spawn_gear = NOP end
+    if trader_autoinject then
+        trader_autoinject.spawn_items = NOP
+        trader_autoinject.update = NOP
+    end
+    if npe_actions then npe_actions.add_to_stash = NOP end
+    if z_rftip_note_spawner then z_rftip_note_spawner.rftip_note_spawner = NOP end
+    if raid_objects_arranger then
+        raid_objects_arranger.spawn_object_rand_point = NOP
+    end
+    if raid_small_treasures then
+        raid_small_treasures.spawn_small_treasures = NOP
+    end
+    if z_raid_item_travel_dungeons then
+        function z_raid_item_travel_dungeons.raid_msg_box_ui:OnMsgOk()
+            local hud = get_hud()
+            if hud then
+                hud:AddCustomStatic("text_on_screen_center", true)
+                local static = hud:GetCustomStatic("text_on_screen_center")
+                if static then
+                    static:wnd():TextControl():SetText("CLIENT CAN'T ACCEPT THIS TYPE OF TASK\n PLEASE DROP IT TO HOST")
+                    CreateTimeEvent(0, "remove_warn_travel", 3, function()
+                        hud:RemoveCustomStatic("text_on_screen_center")
+                        return true
+                    end)
+                end
+            end
+            self:OnMsgCancel()
+        end
+    end
+    if raid_radio then
+        -- Client can't spawn radio. Need to send to host
+        raid_radio.spawn_radio = function(mode)
+            raid_radio.find_and_release("raid_shelter_radio_radio")
+            GameManager:OnICustomScriptAction("raid_radio", "spawn_radio", string.format("%q", mode), true)
+        end
+        -- TODO: Switch state in radio UI.
+    end
+    if raid_travel_manager then
+        raid_travel_manager.raid_teleport = function(level_name)
+            -- Block another teleporting. System antidebil!
+            raid_map_gui.RaidMap.OnClickMap = NOP
+            -- Send to host
+            GameManager:OnICustomScriptAction("raid_travel_manager", "raid_teleport", string.format("%q", level_name),
+                true)
+            -- Show message
+            local hud = get_hud()
+            if hud then
+                -- If host teleporting need to send message that event is sent.
+                -- For players to prevent click map again due like happens nothing
+                hud:AddCustomStatic("text_on_screen_center", true)
+                local static = hud:GetCustomStatic("text_on_screen_center")
+                if static then
+                    static:wnd():TextControl():SetText("Please wait host is teleporting to raid!")
+                    CreateTimeEvent(0, "remove_warn_teleport", 3, function()
+                        hud:RemoveCustomStatic("text_on_screen_center")
+                        return true
+                    end)
+                end
+            end
+        end
+    end
+    if raid_notebook_gui_shelter then
+        raid_notebook_gui_shelter.spawn_heli_radio = NOP
+        raid_notebook_gui_shelter.spawn_psi_emitter_info = NOP
+        raid_notebook_gui_shelter.spawn_clock_and_give_info = NOP
+        raid_notebook_gui_shelter.spawn_mechanic = NOP
+        raid_notebook_gui_shelter.spawn_bed = NOP
+        raid_notebook_gui_shelter.spawn_butcher = NOP
+    end
+    if raid_notebook_gui then
+        function raid_notebook_gui.RaidNotebook:OnAcceptTask(i)
+            GameManager:OnICustomScriptAction("raid_notebook_gui", "remote_raid_accept_quest", tostring(i), true)
+        end
+
+        function raid_notebook_gui.RaidNotebook:OnClickTaskMenu()
+            printf("[Client] Awaiting task data...")
+            GameManager:OnICustomScriptAction("raid_notebook_gui", "request_tasks_data",
+                tostring(GameManager:GetMySNETID()), true)
+        end
+
+        raid_notebook_gui.receive_tasks_data = function(tbl)
+            printf("[Client] Received task data... Refreshing list!")
+            raid_tasks_main.raid_tasks_t = tbl
+            local GUIS = raid_notebook_gui.get_ui_silent()
+            if not GUIS then return end
+            -- hide everything
+            GUIS:HideAll()
+            -- show task menu
+            GUIS.task_menu_cont:Show(true)
+            -- update tasks
+            GUIS:UpdateTaskMenu()
+        end
+    end
+    if raid_tasks_deliveries then
+        -- TODO: AWFULL REALIZATION
+        raid_tasks_deliveries.func_mines = function(obj)
+            local data = raid_tasks_deliveries.get_mines_info(obj:id())
+            local task_id = data[1]
+            local smart = alife_object(data[2])
+            if smart and smart.position:distance_to_sqr(db.actor:position()) < 400 then
+                GameManager:OnICustomScriptAction("raid_tasks_deliveries", "remote_set_flag",
+                    string.format('%q', task_id), false)
+                alife_release(obj)
+            end
+        end
+    end
+    if raid_anomalys then
+        raid_anomalys.spawn_anomalys = NOP
+        raid_anomalys.spawner_anomals = NOP
+        raid_anomalys.spawner_anomals_zones = NOP
+        raid_anomalys.spawn_artefact_in_zone = NOP
+        raid_anomalys.raid_art_create_item_in_death = NOP
+    end
+    if raid_spawn_psi_emitter_plan then
+        raid_spawn_psi_emitter_plan.spawn_psi_emitter_shelters = NOP
+        raid_spawn_psi_emitter_plan.spawn_psi_emitter_plan = NOP
+        raid_spawn_psi_emitter_plan.actor_on_first_update = NOP
+        raid_spawn_psi_emitter_plan.actor_on_update = NOP
+    end
+    if raid_simulation_lab then
+        raid_simulation_lab.lab_spawn = NOP
+        raid_simulation_lab.spawn_squad = NOP
+        raid_simulation_lab.spawn_squads = NOP
+        raid_simulation_lab.spawn_squad_rand_point = NOP
+        raid_simulation_lab.raid_restr_lab_restrictor = NOP
+        raid_simulation_lab.squad_on_first_update = NOP
+        raid_simulation_lab.create_lab_restrictors = NOP
+        raid_simulation_lab.alife_create_item = NOP
+        raid_simulation_lab.actor_on_first_update = NOP
+    end
+    if raid_companions then raid_companions.actor_on_update = NOP end
+    if raid_artefacts then 
+        raid_artefacts.raid_art_create_item = NOP
+        raid_artefacts.actor_on_update = NOP
+    end
+    if raid_dospawn then
+        raid_dospawn.actor_on_first_update = NOP
+        raid_dospawn.raid_start_spawn = NOP
+        raid_dospawn.actor_on_update = NOP
+        raid_dospawn.on_game_start = NOP
+    end
+    if raid_trade then
+        raid_trade.set_profile_general = function (a, b, profile)
+            OLDGRARAIDPR(a, b, profile)
+	        local npc = dialogs.who_is_npc(a, b)
+            if not npc then return end
+            local args = string.format("db.actor, level.object_by_id(%s), %s", GameManager:GetServerIDByLocalID(npc:id()), profile)
+            GameManager:OnICustomScriptAction("raid_trade", "set_profile_general", args, true)
+            raid_trade.current_trade_profile = profile
+        end
+    end
+    if raid_shelter_objects then
+        raid_shelter_objects.actor_on_first_update = NOP
+        raid_shelter_objects.spawner_anomalys = NOP
+        raid_shelter_objects.spawn_raid_trader = NOP
+        raid_shelter_objects.create_shelter_items = NOP
+        raid_shelter_objects.create_shelter_exit_restrictor = NOP
+    end
+    if raid_utils then
+        task_status_functor.raid_task_scout_status_functor = NOP
+        task_status_functor.raid_task_kill_strong_mutant_squad_status_functor = NOP
+        task_status_functor.raid_task_kill_strong_stalker_squad_status_functor = NOP
+        task_status_functor.raid_task_kill_mutant_squad_status_functor = NOP
+        task_status_functor.raid_task_kill_stalker_squad_status_functor = NOP
+        task_status_functor.raid_task_kill_stalker_status_functor = NOP
+        task_status_functor.raid_task_evacuation_status_functor = NOP
+        task_status_functor.raid_task_guide_status_functor = NOP
+        task_functor.raid_task_delivery_in_target_functor = RDEF
+        task_functor.raid_task_delivery_out_target_functor = RDEF
+        task_functor.raid_task_delivery_out_world_target_functor = RDEF
+        task_functor.raid_task_delivery_mines_target_functor = RDEF
+        task_functor.raid_sudden_task_find_squad_and_delivery_out_target_functor = RDEF
+        task_functor.raid_task_anomaly_scan_target_functor = RDEF
+        task_functor.raid_task_kill_stalker_and_delivery_out_target_functor = RDEF
+        task_functor.raid_task_rf_find_and_delivery_out_target_functor = RDEF
+        task_functor.raid_task_rf_scout_and_delivery_out_target_functor = RDEF
+        task_functor.raid_task_scout_target_functor = RDEF
+        task_functor.raid_task_guide_target_functor = RDEF
+        task_functor.raid_task_kill_stalker_target_functor = RDEF
+        function task_manager.CRandomTask:task_fail(p1)
+            if not db.actor or device().precache_frame > 1 then return false end
+            local tsk = self.task_info[p1]
+            if not tsk then
+                printe("!ERROR: CRandomTask:task_fail %s task is nil!", p1)
+                return false
+            end
+            if tsk.forced_status == "fail" then
+                tsk.forced_status = nil
+                tsk.last_check_task = "fail"
+            end
+            return tsk.last_check_task == "fail"
+        end
+    end
+    xr_effects.dispatch_nta_stash_task_details = NOP
+    if tb_rf_receiver_packages then
+        tb_rf_receiver_packages.failsafepackagespawn = NOP
+        tb_rf_receiver_packages.spawn_some_badguys = NOP
+        tb_rf_receiver_packages.tb_radio_thing = NOP
+        tb_rf_receiver_packages.actor_on_update = NOP
+    end
+    if ish_kill_tracker then ish_kill_tracker.new_kill = NOP end
+    if pda_inter_inc then
+        pda_inter_inc.squad_on_npc_death = NOP
+        pda_inter_inc.manage_sos_event = NOP
+    end
+    if tasks_house_of_horrors then
+        task_status_functor.house_of_horrors_task_status_functor = NOP
+    end
+    if arti_handlers then
+        arti_handlers.apply_flinch = NOP
+        arti_handlers.slug = NOP
+        arti_handlers.is_actor = IsActor
+    end
+    if talents_functions then
+        talents_functions.modified_bullets_update = NOP
+        talents_functions.deep_wound_update = NOP
+    end
+    if trader_autoinject and trader_autoinject.timed_update then trader_autoinject.timed_update = NOP end
+    if arszi_mutant_bleeding then
+        arszi_mutant_bleeding.on_game_start = NOP
+        arszi_mutant_bleeding.update_health = NOP
+    end
+    if ballistics_mcm then
+        _G.CAI_Stalker__BeforeHitCallback = function(npc, shit, bone_id)
+            flags.ret_value = true
+            SendScriptCallback("npc_on_before_hit", npc, shit, bone_id, flags)
+            return flags.ret_value
+        end
+    end
+    if gameplay_duty_outpost then
+        gameplay_duty_outpost.save_state = function(m_data)
+            m_data.gameplay_duty_outpost_storage_data = {}
+        end
+    end
+    if xr_dynamic_object then
+        xr_dynamic_object.dynamic_object = NOP
+        xr_dynamic_object.save_state = NOP
+        xr_dynamic_object.load_state = NOP
+        xr_dynamic_object.on_game_start = NOP
+    end
+    if xr_logic_ex then xr_logic_ex.on_game_start = NOP end
+    if redone_xr_logic_ex then redone_xr_logic_ex.on_game_start = NOP end
+    if idiots_combat_support then
+        function idiots_combat_support.evaluator_combat_type:evaluate()
+            return false
+        end
+
+        function idiots_combat_snipe.evaluator_combat_type:evaluate()
+            return false
+        end
+
+        function idiots_combat_guard.evaluator_combat_type:evaluate()
+            return false
+        end
+
+        function idiots_combat_assault.evaluator_combat_type:evaluate()
+            return false
+        end
+
+        function idiots_surge.evaluator_surge:evaluate()
+            return false
+        end
+    end
+    if a_idiots_mdata then
+        a_idiots_mdata.onNpcSpawn = NOP
+        a_idiots_mdata.onSaveState = NOP
+        a_idiots_mdata.onLoadState = function()
+            a_idiots_mdata.initStorage()
+        end
+    end
+    if demonized_mugging_squads then
+        function demonized_mugging_squads.evaluator_muggingSquadBehaviour:evaluate()
+            return false
+        end
+
+        demonized_mugging_squads.save_state = NOP
+        demonized_mugging_squads.load_state = NOP
+        demonized_mugging_squads.on_game_start = NOP
+    end
+    if schemes_ai_gamma then
+        schemes_ai_gamma.npc_on_hit_callback = NOP
+        schemes_ai_gamma.save_state = NOP
+        schemes_ai_gamma.load_state = NOP
+        schemes_ai_gamma.on_game_start = NOP
+    end
+    if night_mutants then
+        night_mutants.spawn_mutants = NOP
+        night_mutants.squad_on_npc_death = NOP
+        night_mutants.delete_mutants = NOP
+        night_mutants.save_mutant_smarts = NOP
+        night_mutants.get_se_obj_level_name = function() return level.name() end
+        night_mutants.se_obj_outside_spawn_radius = function() return false end
+        night_mutants.try_to_spawn = NOP
+        night_mutants.server_entity_on_unregister = NOP
+        night_mutants.on_game_start = NOP
+        night_mutants.save_state = function(m_data)
+            m_data.spawned_mutants = {}
+            m_data.xspawn_time = {}
+        end
+    end
+    if smr_civil_war then smr_civil_war.on_game_start = NOP end
+    if surge_rush_scheme then surge_rush_scheme.on_game_start = NOP end
+    death_manager.save_state = NOP
+    death_manager.load_state = NOP
+    death_manager.on_before_level_changing = NOP
+    if drx_da_main then
+        bind_anomaly_field.anomaly_field_binder.update = function(self, delta)
+            drx_da_main.bind_anomaly_field_update(self, delta)
+        end
+        if drx_da_main.npc_on_near_anomalies_functions then
+            drx_da_main.npc_on_near_anomalies_functions.zone_mine_sphere = function(npc)
+                if not (db.actor and npc) then return end
+                if IsActor(npc) and npc:id() ~= db.actor:id() then return end
+                local key = "zone_mine_sphere_" .. npc:name()
+                drx_da_main.add_simple_timed_effect(0.7, nil, function()
+                    drx_da_main.unregister_callback(key)
+                end, key, 1)
+            end
+        end
+        drx_da_main.save_anomalies = function(m_data)
+            m_data.drx_da_effects = {}
+            m_data.drx_da_updated_anomaly_levels = {}
+            m_data.drx_da_last_surge_time = {}
+            m_data.drx_da_opened_articles = {}
+        end
+        -- FUCK ME BUT NOT HERE
+        drx_da_main.drx_da_spawn_anomaly = NOP
+        drx_da_main.drx_da_spawn_anomaly_on_smart = NOP
+        drx_da_main.drx_da_update_dynamic_anomalies = NOP
+        drx_da_main.spawn_artefacts_on_level = NOP
+        drx_da_main.spawn_artefact_on_smart = NOP
+        drx_da_main.update_dynamic_anomalies_on_level_after_surge = NOP
+    end
+    if grok_artefacts_random_spawner then
+        grok_artefacts_random_spawner.grok_artefact_spawner = NOP
+    end
+    if smr_loot then
+        smr_loot.on_game_start = NOP
+        smr_loot.try_spawn_mag = NOP
+        smr_loot.try_spawn_lootbox = NOP
+        smr_loot.try_spawn_repair = NOP
+        smr_loot.try_spawn_repair_minor = NOP
+        smr_loot.try_spawn_ammo = NOP
+        smr_loot.try_spawn_meds = NOP
+        smr_loot.try_spawn_useful = NOP
+        smr_loot.try_spawn = NOP
+    end
+    if grok_bo then
+        grok_bo.npc_on_before_hit = NOP
+        grok_bo.monster_on_before_hit = NOP
+    end
+    if gameplay_disguise then
+        gameplay_disguise.NOPmake_npcs_forget_actor_in_engine = NOP
+        gameplay_disguise.on_game_start = NOP
+        gameplay_disguise.try_to_disguise = NOP
+        gameplay_disguise.expose_actor = NOP
+    end
+    if grok_killing_friends_reduces_goodwill then
+        grok_killing_friends_reduces_goodwill.on_game_start = NOP
+    end
+    if guards_spawner then
+        guards_spawner.delete_all_guards = NOP
+        guards_spawner.spawn_guard = NOP
+        guards_spawner.on_game_start = NOP
+        guards_spawner.load_state = NOP
+        guards_spawner.save_state = function(m_data)
+            m_data.guarded_smarts = {}
+            m_data.prev_time = nil
+        end
+        guards_spawner.on_enemy_eval = NOP
+    end
+    -- USELES PORTIONS. HOST CAN USE IT
+    if task_brotherhood then
+        task_status_functor.give_task_kill_pack_boars_1_status_f = NOP
+        task_status_functor.give_task_kill_pack_snorks_1_status_f = NOP
+        task_status_functor.give_task_kill_pack_dogs_1_status_f = NOP
+        task_status_functor.give_alyosha_shyogolov_trouble_1_status_f = NOP
+        task_status_functor.give_alyosha_shyogolov_trouble_2_status_f = NOP
+        task_status_functor.give_alyosha_shyogolov_trouble_3_status_f = NOP
+        task_status_functor.give_alyosha_shyogolov_trouble_4_status_f = NOP
+        task_status_functor.give_alyosha_shyogolov_trouble_5_status_f = NOP
+        task_status_functor.give_vybegallo_satisfied_man_status_f = NOP
+        task_status_functor.give_task_kill_pack_snorks_2_status_f = NOP
+        task_status_functor.give_sidorovich_railway_assault_status_f = NOP
+        task_status_functor.give_sidorovich_railway_assault_2_status_f = NOP
+        task_status_functor.give_shlitzer_smuggling_1_status_f = NOP
+        task_status_functor.give_shlitzer_smuggling_2_status_f = NOP
+        task_status_functor.give_shlitzer_smuggling_3_status_f = NOP
+        task_status_functor.give_dolg_bloodsucker_village_1_status_f = NOP
+        task_status_functor.give_dolg_bloodsucker_village_2_status_f = NOP
+        task_status_functor.give_dolg_bloodsucker_village_3_status_f = NOP
+        task_status_functor.give_task_bellerophon_chimera_1_status_f = NOP
+        task_status_functor.give_task_trapper_chimera_1_status_f = NOP
+        task_status_functor.give_task_trapper_chimera_2_status_f = NOP
+        task_status_functor.give_task_trapper_missing_hunter_1_status_f = NOP
+        task_status_functor.give_task_trapper_missing_hunter_2_status_f = NOP
+        task_status_functor.give_task_trapper_missing_hunter_3_status_f = NOP
+        task_status_functor.give_hunt_legendary_1_status_f = NOP
+        task_status_functor.give_hunt_legendary_2_status_f = NOP
+        task_status_functor.give_rescue_orion_quest_status_f = NOP
+        task_status_functor.give_rpg_missile_in_the_sky_status_f = NOP
+        task_status_functor.give_task_fanat_rookie_training_1_status_f = NOP
+        task_status_functor.give_task_join_scamlok_1_status_f = NOP
+        task_status_functor.give_task_escort_sorokin_1_status_f = NOP
+        task_status_functor.give_task_bezsonik_1_status_f = NOP
+        task_status_functor.give_task_bh_gutalin_1_status_f = NOP
+        task_status_functor.give_task_nr_strange_meat_status_f = NOP
+        task_status_functor.give_like_rats_trap_1_status_f = NOP
+        -- OTHER SHIT
+        task_status_functor.give_task_blue_winter_quest_1_status_f = NOP
+        task_status_functor.give_task_blue_winter_quest_1_status_f = NOP
+    end
+    if task_duty_girl then
+        task_status_functor.duty_girl_task_status = NOP
+        task_functor.duty_girl_task_target = RDEF
+    end
+end
+
+function on_game_start()
+    if raid_utils and raid_notebook_gui_shelter and raid_notebook_gui_items and raid_tasks_main and raid_main then
+        -- Register raid sync values
+        RegisterScriptCallback("onmp_player_connected_server", function(PlayerNetID, nick)
+            -- This is big arrays, need to wait for buffer flush in another thread of steam.
+            CreateTimeEvent(PlayerNetID, "raid_utils_sync", 1, function()
+                local upgrades_payload = serialize_table_simple(raid_notebook_gui_shelter.raid_shelter_upgrades)
+                local riditems_payload = serialize_table_simple(raid_notebook_gui_items.raid_items)
+                local taskdata_payload = serialize_table_simple(raid_tasks_main.raid_active_tasks)
+                local taskdung_payload = serialize_table_simple(raid_tasks_dungeons.raid_dunge_active_tasks)..", true"
+                local rewardsi_payload = serialize_table_simple(raid_utils.money_to_sync)
+                local timerstr_payload = tostring(raid_main.raid_timer)
+                -- Sync raid got upgrades
+                GameManager:OnICustomScriptAction("raid_notebook_gui_shelter.raid_shelter_upgrades = " .. upgrades_payload, false, PlayerNetID)
+                -- Sync raid bough ritems
+                GameManager:OnICustomScriptAction("raid_notebook_gui_items.raid_items = " .. riditems_payload, false, PlayerNetID)
+                -- Sync raid task rewards
+                if LastSyncMoney ~= PlayerNetID then
+                    GameManager:OnICustomScriptAction("raid_utils", "sync_raid_reward", rewardsi_payload, false, PlayerNetID)
+                    LastSyncMoney = PlayerNetID
+                end
+                -- Sync active tasks vars
+                GameManager:OnICustomScriptAction("raid_utils", "sync_task_vars", taskdata_payload, false, PlayerNetID)
+                GameManager:OnICustomScriptAction("raid_utils", "sync_task_vars", taskdung_payload, false, PlayerNetID)
+                -- Sync raid surgem timer
+                if level.name() ~= "fake_start" then
+                    GameManager:OnICustomScriptAction("raid_main.raid_timer = " .. timerstr_payload, false, PlayerNetID)
+                end
+                return true
+            end)
+        end)
+    end
+end

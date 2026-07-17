@@ -1,0 +1,11 @@
+--[[
+[================]
+C++ Programmer & Author: Werasik2aa
+Project Creator: Monokit
+Description: Patch for host only things. Like weathers, physics and other registrator
+[================]
+--]]
+local GameManager = SteamGameManager()
+function Patch()
+    log("![Server] Patching game for server...")
+end

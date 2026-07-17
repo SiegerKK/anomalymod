@@ -1,0 +1,68 @@
+--[[
+[================]
+C++ Programmer & Author: Werasik2aa
+Author: Werasik2aa
+Project Creator: Monokit
+Description: rf-reciever for a client!
+Used to patch anomaly 1.5.3 script files.
+[================]
+--]]
+
+local rf_beep_snd = sound_object("detectors\\RF\\beep_02")
+local last_update = 0
+local freq_beep = 400
+local mintmr = 300
+local PATCOOPADDONS = mpmain_gamepatches_addons_stogether
+function actor_on_update()
+    -- Delay of sound due so much iterations
+    local tg = time_global()
+    if tg - last_update < freq_beep then return end
+    last_update = tg
+
+    -- We can't do that...
+    if not (db.actor and rf_beep_snd) then return end
+    if PATCOOPADDONS and PATCOOPADDONS.addoned_rf_client() then return end
+
+    -- Checking the active detector
+    if not db.actor:active_detector() then return end
+
+    -- Begin scan location for freq
+    local tm = task_manager.get_task_manager()
+    for id, _ in pairs(tm.task_info) do
+        local q_tbl = load_var(actor, id)
+        if type(q_tbl) == "table" and q_tbl.freq and q_tbl.target_position and q_tbl.map then
+            local mpos = vector():set(q_tbl.target_position[1], q_tbl.target_position[2], q_tbl.target_position[3])
+            local dist = db.actor:position():distance_to(mpos)
+            if dist < 250 and q_tbl.map == level.name() then
+                set_beep_freq(dist)
+                local dist_ratio = dist / 250
+                local pass_range = item_radio.is_in_range(q_tbl.freq)
+                local vol_range = item_radio.get_vol_range(q_tbl.freq)
+                local vol_signal = pass_range and clamp((1 - dist_ratio) * vol_range, 0, 1) or 0
+                if not rf_beep_snd:playing() then
+                    rf_beep_snd:play(db.actor, 0, sound_object.s2d)
+                    rf_beep_snd.volume = vol_signal
+                end
+            end
+        end
+    end
+end
+function set_beep_freq(value)
+    if value < mintmr then
+        value = mintmr
+    elseif value > 1000 then
+        value = 1000
+    end
+    freq_beep = value
+end
+function get_sounder()
+    return rf_beep_snd
+end
+function on_game_start()
+    RegisterScriptCallback("on_game_load", function ()
+        -- this stuff on game load became true idk why on_game_start is always false
+        if not IIsHost() then
+            RegisterScriptCallback("actor_on_update", actor_on_update)
+        end
+    end)
+end

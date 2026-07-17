@@ -1,0 +1,12 @@
+function on_xml_read()
+    RegisterScriptCallback("on_xml_read", function(xml_file_name, xml)
+        if string.find(xml_file_name, "ui_keybinding.xml") then
+			local new_group = [[
+				<group name="kb_chat_team">
+					<command id="kb_chat" exe="chat"/>
+				</group>
+			]]
+            xml:insertFromXMLString(new_group)
+        end
+    end)
+end

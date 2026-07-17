@@ -1,0 +1,117 @@
+<string_table>
+    <string id="ui_mcm_werasik2aa_show_marks">
+		<text>Show player marks</text>
+	</string>
+    <string id="ui_mcm_werasik2aa_show_name">
+		<text>Show nickname near mark</text>
+	</string>
+    <string id="ui_mcm_werasik2aa_clear_inv">
+		<text>Clear inventory after death</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_drop_inv">
+		<text>Drop items after death</text>
+	</string>
+    <string id="ui_mcm_werasik2aa_max_players">
+		<text>[Server] Max players</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_friendly_fire">
+		<text>[Server] Friendly fire</text>
+	</string>
+		<string id="ui_mcm_werasik2aa_transferalltolevel">
+		<text>[Server] Transfer players to another level</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_resurrect_allow">
+		<text>Allow Revival</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_revive_mode">
+		<text>Revive mode</text>
+	</string>
+	<string id="ui_mcm_lst_mp_manual_revive">
+		<text>Manual Revive</text>
+	</string>
+	<string id="ui_mcm_lst_mp_auto_revive">
+		<text>Auto Revive</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_resurrect_timeout">
+		<text>Time to revive self (Auto Revive)</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_time_to_revive_others">
+		<text>Time to revive others (Manual Revive)</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_auto_revive_delay">
+		<text>Automatic revive self delay (Manual Revive)</text>
+	</string>
+	<string id="st_mp_auto_reviving">
+		<text>Downed - auto-reviving in %d seconds</text>
+	</string>
+	<string id="st_mp_dead_respawning">
+		<text>Critically injured - respawning in %d seconds</text>
+	</string>
+	<string id="st_mp_reviving">
+		<text>Reviving %s in %d seconds</text>
+	</string>
+	<string id="st_mp_being_revived">
+		<text>%s is reviving you (%d seconds)</text>
+	</string>
+	<string id="st_mp_revived">
+		<text>You have been revived!</text>
+	</string>
+	<string id="st_mp_revive_tip">
+		<text>Press [Use] to revive</text>
+	</string>
+	<string id="st_mp_player_down">
+		<text>%s is down!</text>
+	</string>
+	<string id="st_mp_player_revived">
+		<text>%s was revived.</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_show_stats">
+		<text>Show network statistic</text>
+	</string>
+	<string id="ui_mcm_werasik2aa_sections_check">
+		<text>Ignore missing addon objects and items</text>
+	</string>
+	<string id="ui_radmp_title">
+		<text>Anomaly Together 2.0</text>
+	</string>
+    <string id="ui_mcm_menu_werasik2aa">
+		<text>Anomaly Together</text>
+	</string>
+
+	<string id="mm_mp_host_port">
+		<text>Server IP</text>
+	</string>
+	<string id="mm_mp_password">
+		<text>Default port 44139</text>
+	</string>
+    <string id="ui_mm_user_name">
+		<text>Nickname:</text>
+	</string>
+	<string id="ui_mm_newgames">
+		<text>New profile</text>
+	</string>
+	<string id="ui_mm_createserver">
+		<text>Load profile</text>
+	</string>
+	<string id="ui_st_connecting_to_server">
+		<text>Please wait, connecting to server...</text>
+	</string>
+	<string id="ui_cons_failed">
+		<text>Failed to connect to the server, the server did not send packets in the required time. Timed Out</text>
+	</string>
+	<string id="ui_cons_failed_kick">
+		<text>You have been kicked!</text>
+	</string>
+	<string id="ui_mm_resc_con_game">
+		<text>Resurrect</text>
+	</string>
+	<string id="ui_mm_conn_to_game">
+		<text>Connect by IP</text>
+	</string>
+	<string id="ui_mm_load_game">
+		<text>Select profile</text>
+	</string>
+	<string id="ui_mm_ads_game">
+		<text>Our discord</text>
+	</string>
+</string_table>
