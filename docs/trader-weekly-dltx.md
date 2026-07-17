@@ -64,3 +64,14 @@ The following profiles should not be patched generically until their source sect
 ## Multiplayer authority
 
 The host remains the only authority that performs trader restock and MagsRedux stock injection. Clients receive the resulting `trade_manager` state through the existing Anomaly Together synchronization.
+
+## Audit/runtime notes for this phase
+
+- Phase 1 is limited to **Remove merchandise progression gates**. The patch only combines the original commercial tiers that already exist in AOEngine/Anomaly 1.5.3; it does **not** claim seven-day quantities are balanced.
+- The intended DLTX form uses `![trader]` to override `buy_supplies` and `@[supplies_weekly]:...` to add a section with inheritance. The audit script now treats `[section]`, `![section]`, and `@[section]` as section declarations and validates inherited parents against the effective source tree.
+- Parent validation requires the real AOEngine/Anomaly 1.5.3 source tree. Run `tools/audit_trade_configs.py --source-root <aoengine-anomaly-1.5.3>` so the vanilla `trade_*.ltx` files are present beside these minimal `mod_trade_*_weekly_stock.ltx` patches.
+- No profile-specific missing tier exception is documented yet because this repository snapshot does not include the AOEngine 1.5.3 vanilla trade sources. If the audit reports a missing `supplies_N` for a specific profile when run with `--source-root`, remove that parent from that profile's `@[supplies_weekly]` line and add the exception here.
+
+## Smoke-test status
+
+The in-game smoke-test matrix still needs to be run in a real AOEngine/Anomaly Together environment: new game, existing save, host, client, each changed trader UI, no missing-section logs, no goodwill/Heavy Pockets condlist use, host-side MagsRedux restock injection, and no client-side `trader_autoinject` execution.

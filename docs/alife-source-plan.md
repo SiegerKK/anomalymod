@@ -1,6 +1,6 @@
 # ALife source import plan
 
-Do not import the whole vanilla script tree. Start with a read-only reference snapshot under `references/anomaly-1.5.3/` or a documentation manifest, then copy only files that are actually patched.
+Do not import the whole vanilla script tree. Start with a read-only reference snapshot under `references/aoengine-anomaly-1.5.3/` or a documentation manifest, then copy only files that are actually patched.
 
 ## Phase 1: squad target selection and smart-terrain routing
 
@@ -12,7 +12,8 @@ Reference/import candidates:
 - `gamedata/configs/ai_tweaks/simulation_objects.ltx`
 - `gamedata/scripts/smart_terrain.script`
 - `gamedata/scripts/smart_terrain_control.script` if used by the selected baseline
-- the actual squad helper/manager scripts used by Anomaly 1.5.3
+- `gamedata/scripts/squad_manager.script` if present
+- otherwise, the actual module that performs squad-manager duties in this AOEngine baseline
 
 These files cover target evaluation, target preconditions, squad-to-smart assignment, occupancy and smart properties.
 
@@ -27,7 +28,7 @@ Reference/import candidates:
 - `gamedata/scripts/state_mgr.script`
 - `gamedata/scripts/state_lib.script`
 - `gamedata/scripts/job_manager.script`
-- the smart-terrain job module used by the selected baseline
+- the smart-terrain jobs module actually used by this AOEngine baseline
 - relevant smart-terrain LTX files only for test locations
 
 These files cover logic-section switching, movement/animation states, job selection and arrival behavior.
