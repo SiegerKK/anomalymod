@@ -447,6 +447,21 @@ function Patch()
             return type(id) == "number"
         end
 
+        local function normalize_netid(value)
+            local numeric = tonumber(value)
+
+            if numeric then
+                return numeric
+            end
+
+            return tostring(value)
+        end
+
+        local function same_netid(left, right)
+            return normalize_netid(left)
+                == normalize_netid(right)
+        end
+
         local function copy_loaded(loaded)
             local result = {}
 
@@ -466,32 +481,6 @@ function Patch()
             end
 
             return "object"
-        end
-
-        local function host_actor_for_netid(netid)
-            netid = tonumber(netid)
-
-            if not netid then
-                return nil
-            end
-
-            if tonumber(
-                GameManager:GetMySNETID()
-            ) == netid
-            then
-                return db.actor
-            end
-
-            for _, record in pairs(db.actors or {}) do
-                if record
-                and record.object
-                and tonumber(record.netid) == netid
-                then
-                    return record.object
-                end
-            end
-
-            return nil
         end
 
         local function finish_local_unload(magazine_server_id)
@@ -705,6 +694,25 @@ function Patch()
             return true
         end
 
+        local function get_authoritative_loaded_safe(magazine)
+            local ok, loaded = pcall(function()
+                local data =
+                    magazines.get_mag_data(
+                        magazine:id()
+                    )
+
+                if not data
+                or type(data.loaded) ~= "table"
+                then
+                    return {}
+                end
+
+                return copy_loaded(data.loaded)
+            end)
+
+            return ok and loaded or {}
+        end
+
         local function send_unload_result(
             requester_netid,
             magazine_server_id,
@@ -715,6 +723,7 @@ function Patch()
             mode
         )
             local payload = {
+                requester_netid,
                 magazine_server_id,
                 request_sequence,
                 success and true or false,
@@ -723,15 +732,51 @@ function Patch()
                 mode
             }
 
-            if requester_netid == GameManager:GetMySNETID() then
-                magazines.unload_operation_result(payload)
-            else
+            if same_netid(
+                requester_netid,
+                GameManager:GetMySNETID()
+            )
+            then
+                mags_mp_log(
+                    "local ACK dispatch requester=%s mag=%s seq=%s",
+                    tostring(requester_netid),
+                    tostring(magazine_server_id),
+                    tostring(request_sequence)
+                )
+
+                local ok, err = pcall(
+                    magazines.unload_operation_result,
+                    payload
+                )
+
+                if not ok then
+                    mags_mp_log(
+                        "local ACK failed mag=%s seq=%s error=%s",
+                        tostring(magazine_server_id),
+                        tostring(request_sequence),
+                        tostring(err)
+                    )
+                end
+
+                return ok
+            end
+
+            local ok, err = pcall(function()
                 GameManager:OnICustomScriptAction(
                     "magazines",
                     "unload_operation_result",
                     serialize_table_simple(payload),
-                    false,
-                    requester_netid
+                    false
+                )
+            end)
+
+            if not ok then
+                mags_mp_log(
+                    "ACK transport failed requester=%s mag=%s seq=%s error=%s",
+                    tostring(requester_netid),
+                    tostring(magazine_server_id),
+                    tostring(request_sequence),
+                    tostring(err)
                 )
             end
 
@@ -745,6 +790,8 @@ function Patch()
                 tostring(error_code),
                 tostring(#(authoritative_loaded or {}))
             )
+
+            return ok
         end
 
         local function execute_host_unload_step(magazine, expected_round_count)
@@ -931,22 +978,6 @@ function Patch()
             )
 
             if parent_kind == "actor" then
-                local requester_actor = host_actor_for_netid(requester_netid)
-
-                if not requester_actor then
-                    return false, "actor_not_found"
-                end
-
-                mags_mp_log(
-                    "requester actor resolved requester=%s actor=%s",
-                    tostring(requester_netid),
-                    tostring(requester_actor:id())
-                )
-
-                if parent:id() ~= requester_actor:id() then
-                    return false, "actor_parent_mismatch"
-                end
-
                 return true
             end
 
@@ -1122,23 +1153,33 @@ function Patch()
 
             unload_in_progress[result_key] = true
 
-            local success, error_code, loaded, ammo_section
+            local ok, result_success, result_error, result_loaded, result_ammo = pcall(function()
+                if mode == "step" then
+                    return execute_host_unload_step(
+                        magazine,
+                        expected_round_count
+                    )
+                end
 
-            if mode == "step" then
-                success, error_code, loaded, ammo_section =
-                    execute_host_unload_step(
-                        magazine,
-                        expected_round_count
-                    )
-            else
-                success, error_code, loaded =
-                    execute_host_unload_all(
-                        magazine,
-                        expected_round_count
-                    )
-            end
+                return execute_host_unload_all(
+                    magazine,
+                    expected_round_count
+                )
+            end)
 
             unload_in_progress[result_key] = nil
+
+            local success = result_success
+            local error_code = result_error
+            local loaded = result_loaded
+            local ammo_section = result_ammo
+
+            if not ok then
+                success = false
+                error_code = "runtime_error:"..tostring(result_success)
+                loaded = get_authoritative_loaded_safe(magazine)
+                ammo_section = nil
+            end
 
             mags_mp_log(
                 "%s host committed mag=%s requester=%s seq=%s success=%s error=%s ammo=%s remaining=%s",
@@ -1152,16 +1193,14 @@ function Patch()
                 tostring(#(loaded or {}))
             )
 
-            if success then
-                host_unload_results[result_key] = {
-                    sequence = request_sequence,
-                    success = true,
-                    error_code = "",
-                    loaded = copy_loaded(loaded),
-                    mode = mode,
-                    expected_count = expected_round_count
-                }
-            end
+            host_unload_results[result_key] = {
+                sequence = request_sequence,
+                success = success and true or false,
+                error_code = error_code or "",
+                loaded = copy_loaded(loaded),
+                mode = mode,
+                expected_count = expected_round_count
+            }
 
             send_unload_result(
                 requester_netid,
@@ -1241,11 +1280,7 @@ function Patch()
             local session = local_unload_sessions[magazine_server_id]
 
             if session then
-                ResetTimeEvent(
-                    "mag_redux",
-                    session.timeout_event_id,
-                    0
-                )
+                session.awaiting_ack = false
             end
         end
 
@@ -1258,7 +1293,7 @@ function Patch()
 
             CreateTimeEvent(
                 "mag_redux",
-                session.timeout_event_id,
+                session.timeout_event_id.."_"..tostring(sequence),
                 5,
                 function()
                     local active = local_unload_sessions[magazine_server_id]
@@ -1430,15 +1465,25 @@ function Patch()
                 return
             end
 
-            local magazine_server_id = tonumber(data[1])
-            local sequence = tonumber(data[2])
-            local success = data[3] and true or false
-            local error_code = tostring(data[4] or "")
-            local loaded = data[5] or {}
-            local mode = data[6]
+            local target_netid = data[1]
+
+            if not same_netid(
+                target_netid,
+                GameManager:GetMySNETID()
+            ) then
+                return
+            end
+
+            local magazine_server_id = tonumber(data[2])
+            local sequence = tonumber(data[3])
+            local success = data[4] and true or false
+            local error_code = tostring(data[5] or "")
+            local loaded = data[6] or {}
+            local mode = data[7]
 
             mags_mp_log(
-                "ACK received mag=%s seq=%s mode=%s success=%s error=%s remaining=%s",
+                "ACK received target=%s mag=%s seq=%s mode=%s success=%s error=%s remaining=%s",
+                tostring(target_netid),
                 tostring(magazine_server_id),
                 tostring(sequence),
                 tostring(mode),
@@ -1517,6 +1562,13 @@ function Patch()
                     finish_local_unload(magazine_server_id)
                     return
                 end
+
+                mags_mp_log(
+                    "next step after ACK mag=%s seq=%s expected=%s",
+                    tostring(magazine_server_id),
+                    tostring(sequence),
+                    tostring(active.expected_count)
+                )
 
                 schedule_next_unload_step(magazine_server_id)
             end
