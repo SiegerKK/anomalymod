@@ -434,7 +434,7 @@ function Patch()
         end
 
         local function is_valid_server_id(id)
-            return id and id > 0
+            return type(id) == "number"
         end
 
         local function get_created_object_id(obj)
@@ -466,15 +466,28 @@ function Patch()
         end
 
         local function host_create_ammo_checked(ammo_section, parent, count, created_ids)
-            local ok, created_objects = pcall(
-                create_ammo,
-                ammo_section,
-                parent:position(),
-                parent:level_vertex_id(),
-                parent:game_vertex_id(),
-                parent:id(),
-                count
-            )
+            local box_size =
+                SYS_GetParam(2, ammo_section, "box_size", 1)
+
+            box_size = tonumber(box_size) or 1
+
+            if box_size < 1 then
+                box_size = 1
+            end
+
+            local expected_boxes =
+                math.ceil(count / box_size)
+
+            local ok, created_objects = pcall(function()
+                return create_ammo(
+                    ammo_section,
+                    parent:position(),
+                    parent:level_vertex_id(),
+                    parent:game_vertex_id(),
+                    parent:id(),
+                    count
+                )
+            end)
 
             if not ok
             or type(created_objects) ~= "table"
@@ -495,7 +508,7 @@ function Patch()
                 created_now = created_now + 1
             end
 
-            return created_now > 0
+            return created_now == expected_boxes
         end
 
         local function host_release_created_ammo(created_ids)
@@ -511,58 +524,75 @@ function Patch()
         end
 
         local function execute_host_magazine_unload(magazine, magazine_server_id)
-            local parent = magazine:parent()
+            local created_ids = {}
+            local parent
+            local mag_data
 
-            if not parent then
+            local ok, committed = pcall(function()
+                parent = magazine:parent()
+
+                if not parent then
+                    return true
+                end
+
+                mag_data = magazines.get_mag_data(magazine:id())
+
+                if not mag_data
+                or type(mag_data.loaded) ~= "table"
+                or #mag_data.loaded == 0
+                then
+                    return true
+                end
+
+                local original_loaded = {}
+
+                for i = 1, #mag_data.loaded do
+                    original_loaded[i] = mag_data.loaded[i]
+                end
+
+                local ammo_to_make = {}
+
+                for i = 1, #original_loaded do
+                    local ammo_section = original_loaded[i]
+
+                    if type(ammo_section) ~= "string"
+                    or ammo_section == ""
+                    then
+                        return false
+                    end
+
+                    ammo_to_make[ammo_section] =
+                        (ammo_to_make[ammo_section] or 0) + 1
+                end
+
+                for ammo_section, count in pairs(ammo_to_make) do
+                    local created =
+                        host_create_ammo_checked(
+                            ammo_section,
+                            parent,
+                            count,
+                            created_ids
+                        )
+
+                    if not created then
+                        return false
+                    end
+                end
+
                 return true
-            end
+            end)
 
-            local mag_data = magazines.get_mag_data(magazine:id())
+            if not ok
+            or not committed
+            then
+                host_release_created_ammo(created_ids)
+                return false
+            end
 
             if not mag_data
-            or type(mag_data.loaded) ~= "table"
-            or #mag_data.loaded == 0
+            or not parent
             then
                 return true
-            end
-
-            local original_loaded = {}
-
-            for i = 1, #mag_data.loaded do
-                original_loaded[i] = mag_data.loaded[i]
-            end
-
-            local ammo_to_make = {}
-
-            for i = 1, #original_loaded do
-                local ammo_section = original_loaded[i]
-
-                if type(ammo_section) ~= "string"
-                or ammo_section == ""
-                then
-                    return false
-                end
-
-                ammo_to_make[ammo_section] =
-                    (ammo_to_make[ammo_section] or 0) + 1
-            end
-
-            local created_ids = {}
-
-            for ammo_section, count in pairs(ammo_to_make) do
-                local created =
-                    host_create_ammo_checked(
-                        ammo_section,
-                        parent,
-                        count,
-                        created_ids
-                    )
-
-                if not created then
-                    host_release_created_ammo(created_ids)
-
-                    return false
-                end
             end
 
             mag_data.loaded = {}
