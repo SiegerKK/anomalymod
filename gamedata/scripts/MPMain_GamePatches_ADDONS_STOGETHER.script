@@ -478,6 +478,10 @@ function Patch()
             return nil
         end
 
+        local function finish_local_unload(magazine_server_id)
+            local_unload_in_progress[magazine_server_id] = nil
+        end
+
         local function loaded_matches_snapshot(loaded, snapshot)
             if type(loaded) ~= "table"
             or #loaded ~= #snapshot
@@ -953,7 +957,7 @@ function Patch()
                     or 0
             end
 
-            local parent_server_id
+            local parent_server_id = 0
 
             if parent_kind == "object" then
                 parent_server_id =
@@ -1073,125 +1077,158 @@ function Patch()
                 event_id,
                 delay,
                 function()
-                    local current_local_id =
-                        GameManager:GetLocalIDByServerID(
-                            magazine_server_id
+                    local ok, finished = pcall(function()
+                        local current_local_id =
+                            GameManager:GetLocalIDByServerID(
+                                magazine_server_id
+                            )
+
+                        if not current_local_id then
+                            mags_mp_log(
+                                "slow unload cancelled: magazine changed role=local mag=%s requester=%s kind=%s rounds=%s",
+                                tostring(magazine_server_id),
+                                tostring(requester_netid),
+                                tostring(parent_kind),
+                                tostring(rounds_total)
+                            )
+                            return true
+                        end
+
+                        local magazine =
+                            level.object_by_id(
+                                current_local_id
+                            )
+
+                        if not magazine then
+                            mags_mp_log(
+                                "slow unload cancelled: magazine changed role=local mag=%s requester=%s kind=%s rounds=%s",
+                                tostring(magazine_server_id),
+                                tostring(requester_netid),
+                                tostring(parent_kind),
+                                tostring(rounds_total)
+                            )
+                            return true
+                        end
+
+                        if ui_inventory.GUI
+                        and not ui_inventory.GUI:IsShown()
+                        then
+                            mags_mp_log(
+                                "slow unload cancelled: UI closed role=local mag=%s requester=%s kind=%s rounds=%s",
+                                tostring(magazine_server_id),
+                                tostring(requester_netid),
+                                tostring(parent_kind),
+                                tostring(rounds_total)
+                            )
+
+                            return true
+                        end
+
+                        local current_parent =
+                            magazine and magazine:parent()
+
+                        if not current_parent
+                        or current_parent:id()
+                            ~= initial_parent_id
+                        then
+                            mags_mp_log(
+                                "slow unload cancelled: parent changed role=local mag=%s requester=%s kind=%s rounds=%s",
+                                tostring(magazine_server_id),
+                                tostring(requester_netid),
+                                tostring(parent_kind),
+                                tostring(rounds_total)
+                            )
+
+                            return true
+                        end
+
+                        local current_data =
+                            magazines.get_mag_data(
+                                magazine:id()
+                            )
+
+                        if not current_data
+                        or not loaded_matches_snapshot(
+                            current_data.loaded,
+                            loaded_snapshot
+                        )
+                        then
+                            mags_mp_log(
+                                "slow unload cancelled: magazine changed role=local mag=%s requester=%s kind=%s rounds=%s",
+                                tostring(magazine_server_id),
+                                tostring(requester_netid),
+                                tostring(parent_kind),
+                                tostring(rounds_total)
+                            )
+
+                            return true
+                        end
+
+                        rounds_elapsed =
+                            rounds_elapsed + 1
+
+                        local snd_obj = sound_object(
+                            "magazines\\ammo_load"
+                            .. math.random(1, 7)
                         )
 
-                    local magazine =
-                        current_local_id
-                        and level.object_by_id(
-                            current_local_id
+                        if snd_obj then
+                            snd_obj:play_no_feedback(
+                                current_parent,
+                                0,
+                                0,
+                                current_parent:position(),
+                                1.0,
+                                1.0
+                            )
+                        end
+
+                        if rounds_elapsed < rounds_total then
+                            ResetTimeEvent(
+                                "mag_redux",
+                                event_id,
+                                delay
+                            )
+
+                            return false
+                        end
+
+                        local requested = request_multiplayer_unload(
+                            magazine,
+                            rounds_total,
+                            true
                         )
 
-                    magazine = magazine or obj
+                        if not requested then
+                            mags_mp_log(
+                                "slow unload cancelled: request failed role=local mag=%s requester=%s kind=%s rounds=%s",
+                                tostring(magazine_server_id),
+                                tostring(requester_netid),
+                                tostring(parent_kind),
+                                tostring(rounds_total)
+                            )
+                        end
 
-                    if ui_inventory.GUI
-                    and not ui_inventory.GUI:IsShown()
-                    then
-                        local_unload_in_progress[
-                            magazine_server_id
-                        ] = nil
+                        return true
+                    end)
+
+                    if not ok then
+                        finish_local_unload(magazine_server_id)
 
                         mags_mp_log(
-                            "slow unload cancelled: UI closed role=local mag=%s requester=%s kind=%s rounds=%s",
+                            "slow unload cancelled: runtime error mag=%s error=%s",
                             tostring(magazine_server_id),
-                            tostring(requester_netid),
-                            tostring(parent_kind),
-                            tostring(rounds_total)
+                            tostring(finished)
                         )
 
                         return true
                     end
 
-                    local current_parent =
-                        magazine and magazine:parent()
-
-                    if not current_parent
-                    or current_parent:id()
-                        ~= initial_parent_id
-                    then
-                        local_unload_in_progress[
-                            magazine_server_id
-                        ] = nil
-
-                        mags_mp_log(
-                            "slow unload cancelled: parent changed role=local mag=%s requester=%s kind=%s rounds=%s",
-                            tostring(magazine_server_id),
-                            tostring(requester_netid),
-                            tostring(parent_kind),
-                            tostring(rounds_total)
-                        )
-
-                        return true
+                    if finished then
+                        finish_local_unload(magazine_server_id)
                     end
 
-                    local current_data =
-                        magazines.get_mag_data(
-                            magazine:id()
-                        )
-
-                    if not current_data
-                    or not loaded_matches_snapshot(
-                        current_data.loaded,
-                        loaded_snapshot
-                    )
-                    then
-                        local_unload_in_progress[
-                            magazine_server_id
-                        ] = nil
-
-                        mags_mp_log(
-                            "slow unload cancelled: magazine changed role=local mag=%s requester=%s kind=%s rounds=%s",
-                            tostring(magazine_server_id),
-                            tostring(requester_netid),
-                            tostring(parent_kind),
-                            tostring(rounds_total)
-                        )
-
-                        return true
-                    end
-
-                    rounds_elapsed =
-                        rounds_elapsed + 1
-
-                    local snd_obj = sound_object(
-                        "magazines\\ammo_load"
-                        .. math.random(1, 7)
-                    )
-
-                    if snd_obj then
-                        snd_obj:play_no_feedback(
-                            current_parent,
-                            0,
-                            0,
-                            current_parent:position(),
-                            1.0,
-                            1.0
-                        )
-                    end
-
-                    if rounds_elapsed < rounds_total then
-                        ResetTimeEvent(
-                            "mag_redux",
-                            event_id,
-                            delay
-                        )
-
-                        return false
-                    end
-
-                    local_unload_in_progress[
-                        magazine_server_id
-                    ] = nil
-
-                    request_multiplayer_unload(
-                        magazine,
-                        rounds_total,
-                        true
-                    )
-
-                    return true
+                    return finished
                 end
             )
         end
