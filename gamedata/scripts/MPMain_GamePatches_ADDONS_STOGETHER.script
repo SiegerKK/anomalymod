@@ -401,6 +401,7 @@ function Patch()
                         end
                     end
                     magazines.set_mag_data(id, mag_data)
+                    magazines.timed_refresh()
                 end
                 return
             end
@@ -425,90 +426,292 @@ function Patch()
             return magazines.ejectmug_remote_event(weapon:id(), weapon)
         end
         -- Remote unload behavior
-        -- WERASIK2AA TODO: MAKE GLOBAL
-        magazines.host_spawn_ammo = function (data)
-            data[2] = vector():set(data[2][1], data[2][2], data[2][3])
-            create_ammo(data[1], data[2], data[3], data[4], data[5], data[6])
+        local unload_in_progress = {}
+
+        local function mags_mp_active()
+            return (IIsHosted and IIsHosted())
+                or (IIsConnected and IIsConnected())
         end
-        magazines.func_unload_ammo = function (obj)
-            if not (obj and obj:parent() and magazines.is_magazine(obj)) then return end
-            -- Fuck the syncing timed update. Fast eject_magazine
-            local mag_parent = obj:parent()
-            local pos = mag_parent:position()
-            local lv = mag_parent:level_vertex_id()
-            local gv = mag_parent:game_vertex_id()
-            local flagfast = IsInvbox(mag_parent) or not magazines_mcm or magazines_mcm.get_config("unload_behavior") == 1
-            local flaglocal = mag_parent:id() == db.actor:id()
-            if flagfast then
-                local mag_data = magazines.get_mag_data(obj:id())
-                if not mag_data then return end
-                local ammo_to_make = {}
-                while #mag_data.loaded > 0 do
-                    local round = stack.pop(mag_data.loaded)
-                    ammo_to_make[round] = (ammo_to_make[round] or 0) + 1
-                end
-                -- Play Sound
-                local snd_obj = sound_object("magazines\\ammo_load"..math.random(1, 7))
-	            if snd_obj then snd_obj:play_no_feedback(mag_parent, 0, 0, pos, 1.0, 1.0) end
-                -- Host spawns ammo in that box
-                if IIsHost() or flaglocal then
-                    for k, v in pairs(ammo_to_make) do
-                        create_ammo(k, pos, lv, gv, mag_parent:id(), v)
-                    end
-                else
-                    for k, v in pairs(ammo_to_make) do
-                        local payload = { k, pos, lv, gv, mag_parent:id(), v }
-                        GameManager:OnICustomScriptAction("magazines", "host_spawn_ammo", serialize_table_simple(payload), false)
-                    end
-                end
-                -- Save mag data
-                magazines.set_mag_data(obj:id(), mag_data)
-                magazines.timed_refresh()
-                -- Sync mag data
-                if not flaglocal then
-                    local payload = { GameManager:GetServerIDByLocalID(obj:id()), { #mag_data.loaded,  mag_data.loaded[1] } }
-                    GameManager:OnICustomScriptAction("magazines", "remote_set_mag_or_ammo", serialize_table_simple(payload), false)
-                end
-            else -- Timed unloading...
-                local msection = obj:section()
-                local delay = magazines.get_mag_time(msection, true)
-                CreateTimeEvent("mag_redux", "unload_mag_remote_"..msection, delay, function (magazine)
-                    if not magazine then return true end
-                    -- Check and interrup if it's our action (like we can interrup that)
-                    if ui_inventory.GUI and not ui_inventory.GUI:IsShown() then
-                        printf("== Player interrupt that unload")
-                        return true
-                    end
-                    -- All stuff works below
-                    local mag_data = magazines.get_mag_data(magazine:id())
-                    if not mag_data or #mag_data.loaded == 0 then return true end
-                    local mag_rounds = stack.pop(mag_data.loaded)
-                    if not (mag_parent and mag_rounds) then return true end
-                    -- Spawn ammo if we host
-                    local magpid = mag_parent:id()
-                    if IIsHost() or magpid == db.actor:id() then
-                        create_ammo(mag_rounds, pos, lv, gv, magpid, 1)
-                        local payload = { mag_rounds, pos, lv, gv, magpid, 1 }
-                        GameManager:OnICustomScriptAction("magazines", "host_spawn_ammo", serialize_table_simple(payload), false)
-                    end
-                    -- Play sound near that box/npc
-                    local snd_obj = sound_object("magazines\\ammo_load"..math.random(1, 7))
-	                if snd_obj then
-                        snd_obj:play_no_feedback(mag_parent, 0, 0, pos, 1.0, 1.0)
-                    end
-                    -- Save data
-                    magazines.set_mag_data(magazine:id(), mag_data)
-                    magazines.timed_refresh()
-                    -- Reset timer due delay...
-                    ResetTimeEvent("mag_redux", "unload_mag_remote_"..msection, delay)
-                    -- Sync mag data
-                    if not flaglocal then
-                        local payload = { GameManager:GetServerIDByLocalID(obj:id()), { #mag_data.loaded,  mag_data.loaded[1] } }
-                        GameManager:OnICustomScriptAction("magazines", "remote_set_mag_or_ammo", serialize_table_simple(payload), false)
-                    end
-                    return false
-                end, obj)
+
+        local function is_valid_server_id(id)
+            return id and id > 0
+        end
+
+        local function get_created_object_id(obj)
+            if type(obj) == "number" then
+                return obj
             end
+
+            if not obj then
+                return nil
+            end
+
+            local ok_field, field_id = pcall(function()
+                return obj.id
+            end)
+
+            if ok_field and field_id then
+                return field_id
+            end
+
+            local ok_method, method_id = pcall(function()
+                return obj:id()
+            end)
+
+            if ok_method and method_id then
+                return method_id
+            end
+
+            return nil
+        end
+
+        local function host_create_ammo_checked(ammo_section, parent, count, created_ids)
+            local ok, created_objects = pcall(
+                create_ammo,
+                ammo_section,
+                parent:position(),
+                parent:level_vertex_id(),
+                parent:game_vertex_id(),
+                parent:id(),
+                count
+            )
+
+            if not ok
+            or type(created_objects) ~= "table"
+            then
+                return false
+            end
+
+            local created_now = 0
+
+            for _, created_object in pairs(created_objects) do
+                local id = get_created_object_id(created_object)
+
+                if not id then
+                    return false
+                end
+
+                created_ids[#created_ids + 1] = id
+                created_now = created_now + 1
+            end
+
+            return created_now > 0
+        end
+
+        local function host_release_created_ammo(created_ids)
+            for _, id in ipairs(created_ids or {}) do
+                if id then
+                    pcall(
+                        alife_release_id,
+                        id,
+                        "MagsRedux unload rollback"
+                    )
+                end
+            end
+        end
+
+        local function execute_host_magazine_unload(magazine, magazine_server_id)
+            local parent = magazine:parent()
+
+            if not parent then
+                return true
+            end
+
+            local mag_data = magazines.get_mag_data(magazine:id())
+
+            if not mag_data
+            or type(mag_data.loaded) ~= "table"
+            or #mag_data.loaded == 0
+            then
+                return true
+            end
+
+            local original_loaded = {}
+
+            for i = 1, #mag_data.loaded do
+                original_loaded[i] = mag_data.loaded[i]
+            end
+
+            local ammo_to_make = {}
+
+            for i = 1, #original_loaded do
+                local ammo_section = original_loaded[i]
+
+                if type(ammo_section) ~= "string"
+                or ammo_section == ""
+                then
+                    return false
+                end
+
+                ammo_to_make[ammo_section] =
+                    (ammo_to_make[ammo_section] or 0) + 1
+            end
+
+            local created_ids = {}
+
+            for ammo_section, count in pairs(ammo_to_make) do
+                local created =
+                    host_create_ammo_checked(
+                        ammo_section,
+                        parent,
+                        count,
+                        created_ids
+                    )
+
+                if not created then
+                    host_release_created_ammo(created_ids)
+
+                    return false
+                end
+            end
+
+            mag_data.loaded = {}
+
+            magazines.set_mag_data(magazine:id(), mag_data)
+            magazines.timed_refresh()
+
+            local sync_payload = {
+                magazine_server_id,
+                { 0 }
+            }
+
+            GameManager:OnICustomScriptAction(
+                "magazines",
+                "remote_set_mag_or_ammo",
+                serialize_table_simple(sync_payload),
+                false
+            )
+
+            local snd_obj = sound_object("magazines\\ammo_load"..math.random(1, 7))
+            if snd_obj then
+                snd_obj:play_no_feedback(
+                    parent,
+                    0,
+                    0,
+                    parent:position(),
+                    1.0,
+                    1.0
+                )
+            end
+
+            return true
+        end
+
+        magazines.request_unload_magazine = function(data)
+            if not IIsHost() then
+                return
+            end
+
+            if type(data) ~= "table" then
+                return
+            end
+
+            local magazine_server_id = tonumber(data[1])
+            local expected_parent_server_id = tonumber(data[2])
+
+            if not magazine_server_id
+            or not expected_parent_server_id
+            then
+                return
+            end
+
+            if not is_valid_server_id(magazine_server_id)
+            or not is_valid_server_id(expected_parent_server_id)
+            then
+                return
+            end
+
+            local magazine_local_id =
+                GameManager:GetLocalIDByServerID(
+                    magazine_server_id
+                )
+
+            local magazine =
+                magazine_local_id
+                and level.object_by_id(magazine_local_id)
+
+            if not magazine
+            or not magazines.is_magazine(magazine)
+            then
+                return
+            end
+
+            local parent = magazine:parent()
+
+            if not parent then
+                return
+            end
+
+            local actual_parent_server_id =
+                GameManager:GetServerIDByLocalID(parent:id())
+
+            if actual_parent_server_id
+                ~= expected_parent_server_id
+            then
+                return
+            end
+
+            if unload_in_progress[magazine_server_id] then
+                return
+            end
+
+            unload_in_progress[magazine_server_id] = true
+
+            local ok, result = pcall(
+                execute_host_magazine_unload,
+                magazine,
+                magazine_server_id
+            )
+
+            unload_in_progress[magazine_server_id] = nil
+
+            if not ok then
+                printf("! COOP: STOGETHER : MagsRedux unload failed: %s", tostring(result))
+                return
+            end
+        end
+
+        magazines.func_unload_ammo = function(obj)
+            if not (obj and obj:parent() and magazines.is_magazine(obj)) then
+                return
+            end
+
+            if not mags_mp_active() then
+                return OLDUNJECMAGS and OLDUNJECMAGS(obj)
+            end
+
+            local parent = obj:parent()
+
+            local magazine_server_id =
+                GameManager:GetServerIDByLocalID(obj:id())
+
+            local parent_server_id =
+                GameManager:GetServerIDByLocalID(parent:id())
+
+            if not is_valid_server_id(magazine_server_id)
+            or not is_valid_server_id(parent_server_id)
+            then
+                return
+            end
+
+            local payload = {
+                magazine_server_id,
+                parent_server_id
+            }
+
+            if IIsHost() then
+                magazines.request_unload_magazine(payload)
+                return
+            end
+
+            GameManager:OnICustomScriptAction(
+                "magazines",
+                "request_unload_magazine",
+                serialize_table_simple(payload),
+                true
+            )
+
+            return
         end
         -- Load ammo functos
         magazines.fast_load_magazine = function (obj, ammo_obj, load_one)
