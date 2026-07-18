@@ -466,16 +466,77 @@ function Patch()
                 return db.actor
             end
 
-            for _, record in pairs(db.actors or {}) do
-                if record
-                and record.object
-                and record.netid == netid
+            local direct = db.actors and db.actors[netid]
+
+            if direct
+            and direct.object
+            then
+                return direct.object
+            end
+
+            for key, record in pairs(db.actors or {}) do
+                local object = record and record.object
+                local object_netid
+
+                if object then
+                    local ok_netid, live_netid = pcall(function()
+                        return object:GetNetID()
+                    end)
+
+                    if ok_netid then
+                        object_netid = live_netid
+                    end
+                end
+
+                if object
+                and (
+                    record.netid == netid
+                    or record.snetid == netid
+                    or object_netid == netid
+                    or key == netid
+                )
                 then
-                    return record.object
+                    return object
                 end
             end
 
             return nil
+        end
+
+        local function log_host_actor_records()
+            for key, record in pairs(db.actors or {}) do
+                local object = record and record.object
+                local object_id
+                local object_netid
+
+                if object then
+                    local ok_id, id = pcall(function()
+                        return object:id()
+                    end)
+
+                    if ok_id then
+                        object_id = id
+                    end
+
+                    local ok_netid, netid = pcall(function()
+                        return object:GetNetID()
+                    end)
+
+                    if ok_netid then
+                        object_netid = netid
+                    end
+                end
+
+                mags_mp_log(
+                    "actor record key=%s netid=%s snetid=%s object_netid=%s object=%s object_id=%s",
+                    tostring(key),
+                    tostring(record and record.netid),
+                    tostring(record and record.snetid),
+                    tostring(object_netid),
+                    tostring(object),
+                    tostring(object_id)
+                )
+            end
         end
 
         local function finish_local_unload(magazine_server_id)
@@ -835,6 +896,7 @@ function Patch()
                         tostring(parent_kind),
                         tostring(expected_round_count)
                     )
+                    log_host_actor_records()
                     return
                 end
 
