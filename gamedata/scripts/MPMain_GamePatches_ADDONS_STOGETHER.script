@@ -401,6 +401,7 @@ function Patch()
                         end
                     end
                     magazines.set_mag_data(id, mag_data)
+                    magazines.timed_refresh()
                 end
                 return
             end
@@ -425,90 +426,1999 @@ function Patch()
             return magazines.ejectmug_remote_event(weapon:id(), weapon)
         end
         -- Remote unload behavior
-        -- WERASIK2AA TODO: MAKE GLOBAL
-        magazines.host_spawn_ammo = function (data)
-            data[2] = vector():set(data[2][1], data[2][2], data[2][3])
-            create_ammo(data[1], data[2], data[3], data[4], data[5], data[6])
+        local unload_in_progress = {}
+        local host_unload_results = {}
+        local host_unload_sessions = {}
+        local host_remote_sessions = {}
+        local local_unload_sessions = {}
+
+        local function mags_mp_log(fmt, ...)
+            printf(
+                "! COOP: STOGETHER : MagsRedux : "
+                .. fmt,
+                ...
+            )
         end
-        magazines.func_unload_ammo = function (obj)
-            if not (obj and obj:parent() and magazines.is_magazine(obj)) then return end
-            -- Fuck the syncing timed update. Fast eject_magazine
-            local mag_parent = obj:parent()
-            local pos = mag_parent:position()
-            local lv = mag_parent:level_vertex_id()
-            local gv = mag_parent:game_vertex_id()
-            local flagfast = IsInvbox(mag_parent) or not magazines_mcm or magazines_mcm.get_config("unload_behavior") == 1
-            local flaglocal = mag_parent:id() == db.actor:id()
-            if flagfast then
-                local mag_data = magazines.get_mag_data(obj:id())
-                if not mag_data then return end
-                local ammo_to_make = {}
-                while #mag_data.loaded > 0 do
-                    local round = stack.pop(mag_data.loaded)
-                    ammo_to_make[round] = (ammo_to_make[round] or 0) + 1
+
+        local function mags_mp_active()
+            return (IIsHosted and IIsHosted())
+                or (IIsConnected and IIsConnected())
+        end
+
+        local function is_valid_server_id(id)
+            return type(id) == "number"
+        end
+
+        local function normalize_netid(value)
+            local numeric = tonumber(value)
+
+            if numeric then
+                return numeric
+            end
+
+            return tostring(value)
+        end
+
+        local function same_netid(left, right)
+            return normalize_netid(left)
+                == normalize_netid(right)
+        end
+
+        local function copy_loaded(loaded)
+            local result = {}
+
+            for i = 1, #(loaded or {}) do
+                result[i] = loaded[i]
+            end
+
+            return result
+        end
+
+        local function get_unload_parent_kind(parent)
+            if db.actor
+            and parent
+            and parent:id() == db.actor:id()
+            then
+                return "actor"
+            end
+
+            return "object"
+        end
+
+        local function finish_local_unload(magazine_server_id)
+            local_unload_sessions[magazine_server_id] = nil
+        end
+
+        local function cancel_local_unload(magazine_server_id, reason)
+            local session = local_unload_sessions[magazine_server_id]
+
+            mags_mp_log(
+                "session cancelled mag=%s requester=%s seq=%s expected=%s reason=%s",
+                tostring(magazine_server_id),
+                tostring(session and session.requester_netid),
+                tostring(session and session.sequence),
+                tostring(session and session.expected_count),
+                tostring(reason)
+            )
+
+            finish_local_unload(magazine_server_id)
+        end
+
+        local function get_created_object_id(obj)
+            if type(obj) == "number" then
+                return obj
+            end
+
+            if not obj then
+                return nil
+            end
+
+            local ok_field, field_id = pcall(function()
+                return obj.id
+            end)
+
+            if ok_field
+            and type(field_id) == "number"
+            then
+                return field_id
+            end
+
+            local ok_method, method_id = pcall(function()
+                return obj:id()
+            end)
+
+            if ok_method
+            and type(method_id) == "number"
+            then
+                return method_id
+            end
+
+            return nil
+        end
+
+        local function host_create_ammo_checked(ammo_section, parent, count, created_ids)
+            local box_size = SYS_GetParam(2, ammo_section, "box_size", 1)
+            box_size = tonumber(box_size) or 1
+
+            if box_size < 1 then
+                box_size = 1
+            end
+
+            local expected_boxes = math.ceil(count / box_size)
+
+            local ok, created_objects = pcall(function()
+                return create_ammo(
+                    ammo_section,
+                    parent:position(),
+                    parent:level_vertex_id(),
+                    parent:game_vertex_id(),
+                    parent:id(),
+                    count
+                )
+            end)
+
+            if not ok
+            or type(created_objects) ~= "table"
+            then
+                return false
+            end
+
+            local created_now = 0
+
+            for _, created_object in pairs(created_objects) do
+                local id = get_created_object_id(created_object)
+
+                if not id then
+                    return false
                 end
-                -- Play Sound
-                local snd_obj = sound_object("magazines\\ammo_load"..math.random(1, 7))
-	            if snd_obj then snd_obj:play_no_feedback(mag_parent, 0, 0, pos, 1.0, 1.0) end
-                -- Host spawns ammo in that box
-                if IIsHost() or flaglocal then
-                    for k, v in pairs(ammo_to_make) do
-                        create_ammo(k, pos, lv, gv, mag_parent:id(), v)
-                    end
+
+                created_ids[#created_ids + 1] = id
+                created_now = created_now + 1
+            end
+
+            return created_now == expected_boxes
+        end
+
+        local function host_release_created_ammo(created_ids)
+            for _, id in ipairs(created_ids or {}) do
+                if id then
+                    pcall(
+                        alife_release_id,
+                        id,
+                        "MagsRedux unload rollback"
+                    )
+                end
+            end
+        end
+
+        local function host_actor_for_netid(netid)
+            if not netid then
+                return nil
+            end
+
+            if same_netid(netid, GameManager:GetMySNETID()) then
+                return db.actor
+            end
+
+            for object_id, record in pairs(db.actors or {}) do
+                if record
+                and record.object
+                and same_netid(record.netid, netid)
+                then
+                    mags_mp_log(
+                        "remote actor resolved requester=%s actor=%s record=%s",
+                        tostring(netid),
+                        tostring(record.object:id()),
+                        tostring(object_id)
+                    )
+                    return record.object
+                end
+            end
+
+            return nil
+        end
+
+        local function host_find_existing_partial_ammo(parent, ammo_section, box_size)
+            local found
+
+            local function itr_box(_, item)
+                if found
+                or not item
+                or item:section() ~= ammo_section
+                or not item.ammo_get_count
+                or not item.ammo_set_count
+                then
+                    return
+                end
+
+                local count = item:ammo_get_count()
+
+                if count < box_size then
+                    found = item
+                end
+            end
+
+            pcall(function()
+                if IsInvbox(parent) then
+                    parent:iterate_inventory_box(itr_box)
                 else
-                    for k, v in pairs(ammo_to_make) do
-                        local payload = { k, pos, lv, gv, mag_parent:id(), v }
-                        GameManager:OnICustomScriptAction("magazines", "host_spawn_ammo", serialize_table_simple(payload), false)
+                    parent:iterate_inventory(itr_box)
+                end
+            end)
+
+            return found
+        end
+
+        local function host_find_credit_box(parent, ammo_section, host_session)
+            local credit = host_session
+                and host_session.ammo_boxes
+                and host_session.ammo_boxes[ammo_section]
+
+            if not credit
+            or not credit.local_id
+            then
+                return nil, nil
+            end
+
+            local ammo_obj = level.object_by_id(credit.local_id)
+
+            if not ammo_obj
+            or ammo_obj:section() ~= ammo_section
+            or not ammo_obj:parent()
+            or ammo_obj:parent():id() ~= parent:id()
+            or not ammo_obj.ammo_get_count
+            or not ammo_obj.ammo_set_count
+            then
+                return nil, nil
+            end
+
+            local current_count = ammo_obj:ammo_get_count()
+
+            if current_count >= credit.box_size then
+                return nil, nil
+            end
+
+            credit.count = current_count
+            return ammo_obj, credit
+        end
+
+        local function host_credit_one_round(parent, ammo_section, host_session)
+            if not host_session
+            or not parent
+            then
+                return false, nil
+            end
+
+            host_session.ammo_boxes = host_session.ammo_boxes or {}
+
+            local box_size = SYS_GetParam(2, ammo_section, "box_size", 1)
+            box_size = tonumber(box_size) or 1
+
+            if box_size < 1 then
+                box_size = 1
+            end
+
+            local ammo_obj, credit = host_find_credit_box(
+                parent,
+                ammo_section,
+                host_session
+            )
+
+            if not ammo_obj then
+                ammo_obj = host_find_existing_partial_ammo(
+                    parent,
+                    ammo_section,
+                    box_size
+                )
+
+                if ammo_obj then
+                    local local_id = ammo_obj:id()
+                    credit = {
+                        local_id = local_id,
+                        server_id = GameManager:GetServerIDByLocalID(local_id),
+                        count = ammo_obj:ammo_get_count(),
+                        box_size = box_size
+                    }
+                    host_session.ammo_boxes[ammo_section] = credit
+                end
+            end
+
+            if ammo_obj and credit then
+                local old_count = ammo_obj:ammo_get_count()
+                local new_count = old_count + 1
+
+                if new_count > box_size then
+                    host_session.ammo_boxes[ammo_section] = nil
+                    ammo_obj = nil
+                    credit = nil
+                else
+                    ammo_obj:ammo_set_count(new_count)
+
+                    credit.count = new_count
+                    credit.server_id = GameManager:GetServerIDByLocalID(credit.local_id)
+
+                    return true, {
+                        ammo_server_id = credit.server_id,
+                        ammo_local_id = credit.local_id,
+                        old_count = old_count,
+                        new_count = new_count,
+                        created_new = false,
+                        rollback = function()
+                            pcall(function()
+                                ammo_obj:ammo_set_count(old_count)
+                            end)
+                            credit.count = old_count
+                        end
+                    }
+                end
+            end
+
+            local created_ids = {}
+            local created = host_create_ammo_checked(
+                ammo_section,
+                parent,
+                1,
+                created_ids
+            )
+
+            if not created then
+                host_release_created_ammo(created_ids)
+                return false, nil
+            end
+
+            local created_id = created_ids[1]
+            local server_id = GameManager:GetServerIDByLocalID(created_id)
+
+            host_session.ammo_boxes[ammo_section] = {
+                local_id = created_id,
+                server_id = server_id,
+                count = 1,
+                box_size = box_size
+            }
+
+            return true, {
+                ammo_server_id = server_id,
+                ammo_local_id = created_id,
+                old_count = 0,
+                new_count = 1,
+                created_new = true,
+                rollback = function()
+                    host_release_created_ammo({ created_id })
+                    if host_session.ammo_boxes[ammo_section]
+                    and host_session.ammo_boxes[ammo_section].local_id == created_id
+                    then
+                        host_session.ammo_boxes[ammo_section] = nil
                     end
                 end
-                -- Save mag data
-                magazines.set_mag_data(obj:id(), mag_data)
-                magazines.timed_refresh()
-                -- Sync mag data
-                if not flaglocal then
-                    local payload = { GameManager:GetServerIDByLocalID(obj:id()), { #mag_data.loaded,  mag_data.loaded[1] } }
-                    GameManager:OnICustomScriptAction("magazines", "remote_set_mag_or_ammo", serialize_table_simple(payload), false)
+            }
+        end
+
+        local function sync_credited_ammo(credit)
+            if not credit
+            or not credit.ammo_server_id
+            then
+                return
+            end
+
+            local payload = {
+                credit.ammo_server_id,
+                credit.new_count,
+                true
+            }
+
+            pcall(function()
+                GameManager:OnICustomScriptAction(
+                    "magazines",
+                    "remote_set_mag_or_ammo",
+                    serialize_table_simple(payload),
+                    false
+                )
+            end)
+
+            if magazines.inventory_refresh then
+                pcall(magazines.inventory_refresh, 2)
+            end
+
+            pcall(magazines.timed_refresh)
+        end
+
+        local function play_unload_step_sound(magazine_server_id)
+            local local_id = GameManager:GetLocalIDByServerID(magazine_server_id)
+            local session = local_unload_sessions[magazine_server_id]
+
+            if not local_id
+            and session
+            and session.local_magazine_id
+            then
+                local_id = session.local_magazine_id
+            end
+
+            local magazine = local_id and level.object_by_id(local_id)
+            local parent = magazine and magazine:parent()
+
+            if not parent then
+                return false
+            end
+
+            local ok = pcall(function()
+                local snd_obj = sound_object("magazines\\ammo_load"..math.random(1, 7))
+                if snd_obj then
+                    snd_obj:play_no_feedback(
+                        parent,
+                        0,
+                        0,
+                        parent:position(),
+                        1.0,
+                        1.0
+                    )
                 end
-            else -- Timed unloading...
-                local msection = obj:section()
-                local delay = magazines.get_mag_time(msection, true)
-                CreateTimeEvent("mag_redux", "unload_mag_remote_"..msection, delay, function (magazine)
-                    if not magazine then return true end
-                    -- Check and interrup if it's our action (like we can interrup that)
-                    if ui_inventory.GUI and not ui_inventory.GUI:IsShown() then
-                        printf("== Player interrupt that unload")
+            end)
+
+            return ok
+        end
+
+        local function apply_authoritative_mag_state(
+            magazine_server_id,
+            loaded,
+            attempt,
+            on_applied,
+            on_failed
+        )
+            attempt = attempt or 1
+
+            local local_id = GameManager:GetLocalIDByServerID(magazine_server_id)
+            local magazine = local_id and level.object_by_id(local_id)
+
+            if not magazine then
+                if attempt < 10 then
+                    CreateTimeEvent(
+                        "mag_redux",
+                        "apply_mag_state_"..tostring(magazine_server_id).."_"..tostring(attempt),
+                        0.1,
+                        function()
+                            apply_authoritative_mag_state(
+                                magazine_server_id,
+                                loaded,
+                                attempt + 1,
+                                on_applied,
+                                on_failed
+                            )
+
+                            return true
+                        end
+                    )
+
+                    return nil
+                end
+
+                mags_mp_log(
+                    "state apply failed: magazine missing mag=%s",
+                    tostring(magazine_server_id)
+                )
+
+                if on_failed then
+                    on_failed("magazine_missing")
+                end
+
+                return false
+            end
+
+            local mag_data = magazines.get_mag_data(magazine:id())
+
+            if not mag_data then
+                if attempt < 10 then
+                    CreateTimeEvent(
+                        "mag_redux",
+                        "apply_mag_data_"..tostring(magazine_server_id).."_"..tostring(attempt),
+                        0.1,
+                        function()
+                            apply_authoritative_mag_state(
+                                magazine_server_id,
+                                loaded,
+                                attempt + 1,
+                                on_applied,
+                                on_failed
+                            )
+
+                            return true
+                        end
+                    )
+
+                    return nil
+                end
+
+                mags_mp_log(
+                    "state apply failed: mag data missing mag=%s",
+                    tostring(magazine_server_id)
+                )
+
+                if on_failed then
+                    on_failed("mag_data_missing")
+                end
+
+                return false
+            end
+
+            local ok_apply, apply_err = pcall(function()
+                mag_data.loaded = copy_loaded(loaded)
+
+                magazines.set_mag_data(
+                    magazine:id(),
+                    mag_data
+                )
+
+                magazines.timed_refresh()
+
+                mags_mp_log(
+                    "state applied mag=%s remaining=%s",
+                    tostring(magazine_server_id),
+                    tostring(#mag_data.loaded)
+                )
+
+                if on_applied then
+                    on_applied()
+                end
+            end)
+
+            if not ok_apply then
+                mags_mp_log(
+                    "state apply runtime error mag=%s error=%s",
+                    tostring(magazine_server_id),
+                    tostring(apply_err)
+                )
+
+                if on_failed then
+                    on_failed(tostring(apply_err))
+                end
+
+                return false
+            end
+
+            return true
+        end
+
+        local function get_authoritative_loaded_safe(magazine)
+            local ok, loaded = pcall(function()
+                local data =
+                    magazines.get_mag_data(
+                        magazine:id()
+                    )
+
+                if not data
+                or type(data.loaded) ~= "table"
+                then
+                    return {}
+                end
+
+                return copy_loaded(data.loaded)
+            end)
+
+            return ok and loaded or {}
+        end
+
+        local function send_unload_result(
+            requester_netid,
+            magazine_server_id,
+            request_sequence,
+            success,
+            error_code,
+            authoritative_loaded,
+            mode,
+            ammo_section
+        )
+            local payload = {
+                requester_netid,
+                magazine_server_id,
+                request_sequence,
+                success and true or false,
+                error_code or "",
+                type(authoritative_loaded) == "table"
+                    and copy_loaded(authoritative_loaded)
+                    or false,
+                mode,
+                ammo_section
+            }
+
+            if same_netid(
+                requester_netid,
+                GameManager:GetMySNETID()
+            )
+            then
+                mags_mp_log(
+                    "local ACK dispatch requester=%s mag=%s seq=%s",
+                    tostring(requester_netid),
+                    tostring(magazine_server_id),
+                    tostring(request_sequence)
+                )
+
+                local ack_event_id =
+                    "mags_unload_local_ack_"
+                    .. tostring(magazine_server_id)
+                    .. "_"
+                    .. tostring(request_sequence)
+
+                CreateTimeEvent(
+                    "mag_redux",
+                    ack_event_id,
+                    0.01,
+                    function()
+                        local ok, err = pcall(
+                            magazines.unload_operation_result,
+                            payload
+                        )
+
+                        if not ok then
+                            mags_mp_log(
+                                "local ACK failed mag=%s seq=%s error=%s",
+                                tostring(magazine_server_id),
+                                tostring(request_sequence),
+                                tostring(err)
+                            )
+
+                            cancel_local_unload(
+                                magazine_server_id,
+                                "local ACK failed: "
+                                    .. tostring(err)
+                            )
+                        end
+
                         return true
                     end
-                    -- All stuff works below
-                    local mag_data = magazines.get_mag_data(magazine:id())
-                    if not mag_data or #mag_data.loaded == 0 then return true end
-                    local mag_rounds = stack.pop(mag_data.loaded)
-                    if not (mag_parent and mag_rounds) then return true end
-                    -- Spawn ammo if we host
-                    local magpid = mag_parent:id()
-                    if IIsHost() or magpid == db.actor:id() then
-                        create_ammo(mag_rounds, pos, lv, gv, magpid, 1)
-                        local payload = { mag_rounds, pos, lv, gv, magpid, 1 }
-                        GameManager:OnICustomScriptAction("magazines", "host_spawn_ammo", serialize_table_simple(payload), false)
-                    end
-                    -- Play sound near that box/npc
-                    local snd_obj = sound_object("magazines\\ammo_load"..math.random(1, 7))
-	                if snd_obj then
-                        snd_obj:play_no_feedback(mag_parent, 0, 0, pos, 1.0, 1.0)
-                    end
-                    -- Save data
-                    magazines.set_mag_data(magazine:id(), mag_data)
-                    magazines.timed_refresh()
-                    -- Reset timer due delay...
-                    ResetTimeEvent("mag_redux", "unload_mag_remote_"..msection, delay)
-                    -- Sync mag data
-                    if not flaglocal then
-                        local payload = { GameManager:GetServerIDByLocalID(obj:id()), { #mag_data.loaded,  mag_data.loaded[1] } }
-                        GameManager:OnICustomScriptAction("magazines", "remote_set_mag_or_ammo", serialize_table_simple(payload), false)
-                    end
-                    return false
-                end, obj)
+                )
+
+                return true
             end
+
+            local ok, err = pcall(function()
+                GameManager:OnICustomScriptAction(
+                    "magazines",
+                    "unload_operation_result",
+                    serialize_table_simple(payload),
+                    false
+                )
+            end)
+
+            if not ok then
+                mags_mp_log(
+                    "ACK transport failed requester=%s mag=%s seq=%s error=%s",
+                    tostring(requester_netid),
+                    tostring(magazine_server_id),
+                    tostring(request_sequence),
+                    tostring(err)
+                )
+            end
+
+            mags_mp_log(
+                "ACK sent mag=%s requester=%s seq=%s mode=%s success=%s error=%s remaining=%s",
+                tostring(magazine_server_id),
+                tostring(requester_netid),
+                tostring(request_sequence),
+                tostring(mode),
+                tostring(success),
+                tostring(error_code),
+                tostring(type(authoritative_loaded) == "table" and #authoritative_loaded or "nil")
+            )
+
+            return ok
+        end
+
+        local function execute_host_unload_step(magazine, expected_round_count, host_session)
+            local parent = magazine:parent()
+            local mag_data = magazines.get_mag_data(magazine:id())
+
+            if not parent
+            or not mag_data
+            or type(mag_data.loaded) ~= "table"
+            then
+                return false, "invalid_state", get_authoritative_loaded_safe(magazine)
+            end
+
+            if #mag_data.loaded == 0 then
+                return false, "already_empty", copy_loaded(mag_data.loaded)
+            end
+
+            if #mag_data.loaded ~= expected_round_count then
+                return false, "stale_count", copy_loaded(mag_data.loaded)
+            end
+
+            local original_loaded = copy_loaded(mag_data.loaded)
+            local ammo_section = mag_data.loaded[#mag_data.loaded]
+
+            if type(ammo_section) ~= "string"
+            or ammo_section == ""
+            then
+                return false, "invalid_ammo", copy_loaded(mag_data.loaded)
+            end
+
+            local credited, credit = host_credit_one_round(
+                parent,
+                ammo_section,
+                host_session
+            )
+
+            if not credited then
+                return false, "ammo_credit_failed", copy_loaded(mag_data.loaded)
+            end
+
+            stack.pop(mag_data.loaded)
+
+            local save_ok = pcall(
+                magazines.set_mag_data,
+                magazine:id(),
+                mag_data
+            )
+
+            if not save_ok then
+                if credit and credit.rollback then
+                    credit.rollback()
+                end
+
+                mag_data.loaded = original_loaded
+                pcall(
+                    magazines.set_mag_data,
+                    magazine:id(),
+                    mag_data
+                )
+                return false, "save_failed", copy_loaded(mag_data.loaded)
+            end
+
+            sync_credited_ammo(credit)
+            pcall(magazines.timed_refresh)
+
+            return true, nil, copy_loaded(mag_data.loaded), ammo_section, credit
+        end
+
+        local function execute_host_unload_all(magazine, expected_round_count)
+            local created_ids = {}
+            local original_loaded = {}
+            local parent
+            local mag_data
+            local had_rounds = false
+            local state_committed = false
+
+            local ok, err = pcall(function()
+                parent = magazine:parent()
+
+                if not parent then
+                    return true
+                end
+
+                mag_data = magazines.get_mag_data(magazine:id())
+
+                if not mag_data
+                or type(mag_data.loaded) ~= "table"
+                then
+                    return true
+                end
+
+                if #mag_data.loaded == 0 then
+                    return true
+                end
+
+                if #mag_data.loaded ~= expected_round_count then
+                    return false
+                end
+
+                had_rounds = true
+                original_loaded = copy_loaded(mag_data.loaded)
+
+                local ammo_to_make = {}
+
+                for i = 1, #original_loaded do
+                    local ammo_section = original_loaded[i]
+
+                    if type(ammo_section) ~= "string"
+                    or ammo_section == ""
+                    then
+                        return false
+                    end
+
+                    ammo_to_make[ammo_section] =
+                        (ammo_to_make[ammo_section] or 0) + 1
+                end
+
+                for ammo_section, count in pairs(ammo_to_make) do
+                    local created = host_create_ammo_checked(
+                        ammo_section,
+                        parent,
+                        count,
+                        created_ids
+                    )
+
+                    if not created then
+                        return false
+                    end
+                end
+
+                mag_data.loaded = {}
+                magazines.set_mag_data(magazine:id(), mag_data)
+                state_committed = true
+
+                return true
+            end)
+
+            if not ok
+            or err == false
+            then
+                if not state_committed then
+                    host_release_created_ammo(created_ids)
+
+                    if mag_data
+                    and had_rounds
+                    then
+                        mag_data.loaded = original_loaded
+                        pcall(
+                            magazines.set_mag_data,
+                            magazine:id(),
+                            mag_data
+                        )
+                    end
+                end
+
+                return false, "transaction_failed"
+            end
+
+            if not had_rounds then
+                return false, "already_empty", {}
+            end
+
+            pcall(magazines.timed_refresh)
+
+            return true, nil, {}, nil
+        end
+
+        local function execute_host_remote_unload_step(
+            shadow,
+            expected_round_count,
+            parent
+        )
+            if not shadow
+            or type(shadow.loaded) ~= "table"
+            then
+                return false, "invalid_shadow", {}
+            end
+
+            if #shadow.loaded == 0 then
+                return false, "already_empty", copy_loaded(shadow.loaded)
+            end
+
+            if #shadow.loaded ~= expected_round_count then
+                return false, "stale_count", copy_loaded(shadow.loaded)
+            end
+
+            local original_loaded = copy_loaded(shadow.loaded)
+            local ammo_section = shadow.loaded[#shadow.loaded]
+
+            if type(ammo_section) ~= "string"
+            or ammo_section == ""
+            then
+                return false, "invalid_ammo", copy_loaded(shadow.loaded)
+            end
+
+            local credited, credit = host_credit_one_round(
+                parent,
+                ammo_section,
+                shadow
+            )
+
+            if not credited then
+                return false, "ammo_credit_failed", copy_loaded(shadow.loaded)
+            end
+
+            stack.pop(shadow.loaded)
+            sync_credited_ammo(credit)
+
+            return true, nil, copy_loaded(shadow.loaded), ammo_section, credit
+        end
+
+        local function execute_host_remote_unload_all(
+            shadow,
+            expected_round_count,
+            parent
+        )
+            if not shadow
+            or type(shadow.loaded) ~= "table"
+            then
+                return false, "invalid_shadow", {}
+            end
+
+            if #shadow.loaded == 0 then
+                return false, "already_empty", copy_loaded(shadow.loaded)
+            end
+
+            if #shadow.loaded ~= expected_round_count then
+                return false, "stale_count", copy_loaded(shadow.loaded)
+            end
+
+            local rollback = {}
+            local last_ammo_section
+
+            while #shadow.loaded > 0 do
+                local ammo_section = shadow.loaded[#shadow.loaded]
+
+                if type(ammo_section) ~= "string"
+                or ammo_section == ""
+                then
+                    for i = #rollback, 1, -1 do
+                        pcall(rollback[i])
+                    end
+                    return false, "invalid_ammo", copy_loaded(shadow.loaded)
+                end
+
+                local credited, credit = host_credit_one_round(
+                    parent,
+                    ammo_section,
+                    shadow
+                )
+
+                if not credited then
+                    for i = #rollback, 1, -1 do
+                        pcall(rollback[i])
+                    end
+                    return false, "ammo_credit_failed", copy_loaded(shadow.loaded)
+                end
+
+                rollback[#rollback + 1] = credit.rollback
+                stack.pop(shadow.loaded)
+                sync_credited_ammo(credit)
+                last_ammo_section = ammo_section
+            end
+
+            return true, nil, copy_loaded(shadow.loaded), last_ammo_section, nil
+        end
+
+        local function validate_unload_parent(
+            magazine,
+            expected_parent_server_id,
+            requester_netid,
+            parent_kind
+        )
+            local parent = magazine:parent()
+
+            if not parent then
+                return false, "parent_missing"
+            end
+
+            mags_mp_log(
+                "parent resolved requester=%s kind=%s parent=%s",
+                tostring(requester_netid),
+                tostring(parent_kind),
+                tostring(parent:id())
+            )
+
+            if parent_kind == "actor" then
+                if IsInvbox(parent)
+                or (
+                    IsStalker(parent)
+                    and not parent:alive()
+                )
+                then
+                    return false, "actor_kind_mismatch"
+                end
+
+                return true
+            end
+
+            if parent_kind == "object" then
+                if not is_valid_server_id(expected_parent_server_id) then
+                    return false, "parent_server_id_invalid"
+                end
+
+                local actual_parent_server_id =
+                    GameManager:GetServerIDByLocalID(parent:id())
+
+                if actual_parent_server_id ~= expected_parent_server_id then
+                    return false, "object_parent_mismatch"
+                end
+
+                local allowed =
+                    IsInvbox(parent)
+                    or (
+                        IsStalker(parent)
+                        and not parent:alive()
+                    )
+
+                if not allowed then
+                    return false, "parent_not_allowed"
+                end
+
+                return true
+            end
+
+            return false, "parent_kind_invalid"
+        end
+
+        magazines.request_unload_operation = function(data)
+            if not IIsHost() then
+                return
+            end
+
+            if type(data) ~= "table" then
+                return
+            end
+
+            local magazine_server_id = tonumber(data[1])
+            local expected_parent_server_id = tonumber(data[2])
+            local requester_netid = tonumber(data[3])
+            local parent_kind = data[4]
+            local request_sequence = tonumber(data[5])
+            local expected_round_count = tonumber(data[6])
+            local mode = data[7]
+            local owner_scope = data[8]
+            local session_id = data[9]
+            local initial_loaded = data[10]
+
+            mags_mp_log(
+                "%s request received mag=%s requester=%s seq=%s expected=%s kind=%s",
+                tostring(mode),
+                tostring(magazine_server_id),
+                tostring(requester_netid),
+                tostring(request_sequence),
+                tostring(expected_round_count),
+                tostring(parent_kind)
+            )
+
+            if not is_valid_server_id(magazine_server_id)
+            or not requester_netid
+            or not request_sequence
+            or not expected_round_count
+            or (mode ~= "step" and mode ~= "all" and mode ~= "step_remote_actor")
+            then
+                return
+            end
+
+            if parent_kind ~= "actor"
+            and parent_kind ~= "object"
+            then
+                return
+            end
+
+            local result_key =
+                tostring(requester_netid)
+                .. ":"
+                .. tostring(session_id or magazine_server_id)
+
+            local previous = host_unload_results[result_key]
+
+            if previous
+            and request_sequence <= previous.sequence
+            and expected_round_count == previous.expected_count
+            then
+                if request_sequence == previous.sequence then
+                    send_unload_result(
+                        requester_netid,
+                        magazine_server_id,
+                        request_sequence,
+                        previous.success,
+                        previous.error_code,
+                        previous.loaded,
+                        previous.mode,
+                        previous.ammo_section
+                    )
+                else
+                    send_unload_result(
+                        requester_netid,
+                        magazine_server_id,
+                        request_sequence,
+                        false,
+                        "stale_sequence",
+                        previous.loaded,
+                        mode
+                    )
+                end
+
+                return
+            end
+
+            if owner_scope == "remote_actor"
+            or mode == "step_remote_actor"
+            then
+                if not session_id then
+                    send_unload_result(
+                        requester_netid,
+                        magazine_server_id,
+                        request_sequence,
+                        false,
+                        "session_missing",
+                        {},
+                        mode
+                    )
+                    return
+                end
+
+                local shadow_key = result_key
+                local shadow = host_remote_sessions[shadow_key]
+
+                if not shadow then
+                    if type(initial_loaded) ~= "table" then
+                        send_unload_result(
+                            requester_netid,
+                            magazine_server_id,
+                            request_sequence,
+                            false,
+                            "shadow_missing",
+                            {},
+                            mode
+                        )
+                        return
+                    end
+
+                    shadow = {
+                        requester_netid = requester_netid,
+                        session_id = session_id,
+                        loaded = copy_loaded(initial_loaded),
+                        last_sequence = 0,
+                        cached_results = {},
+                        ammo_boxes = {}
+                    }
+
+                    host_remote_sessions[shadow_key] = shadow
+
+                    mags_mp_log(
+                        "remote session started requester=%s session=%s count=%s",
+                        tostring(requester_netid),
+                        tostring(session_id),
+                        tostring(#shadow.loaded)
+                    )
+                end
+
+                if not same_netid(shadow.requester_netid, requester_netid) then
+                    send_unload_result(
+                        requester_netid,
+                        magazine_server_id,
+                        request_sequence,
+                        false,
+                        "requester_mismatch",
+                        copy_loaded(shadow.loaded),
+                        mode
+                    )
+                    return
+                end
+
+                local requester_actor = host_actor_for_netid(requester_netid)
+
+                if not requester_actor then
+                    send_unload_result(
+                        requester_netid,
+                        magazine_server_id,
+                        request_sequence,
+                        false,
+                        "remote_actor_missing",
+                        copy_loaded(shadow.loaded),
+                        mode
+                    )
+                    return
+                end
+
+                mags_mp_log(
+                    "remote actor parent requester=%s actor=%s session=%s",
+                    tostring(requester_netid),
+                    tostring(requester_actor:id()),
+                    tostring(session_id)
+                )
+
+                if unload_in_progress[result_key] then
+                    send_unload_result(
+                        requester_netid,
+                        magazine_server_id,
+                        request_sequence,
+                        false,
+                        "in_progress",
+                        copy_loaded(shadow.loaded),
+                        mode
+                    )
+                    return
+                end
+
+                unload_in_progress[result_key] = true
+
+                local ok, result_success, result_error, result_loaded, result_ammo = pcall(function()
+                    if mode == "all" then
+                        return execute_host_remote_unload_all(
+                            shadow,
+                            expected_round_count,
+                            requester_actor
+                        )
+                    end
+
+                    return execute_host_remote_unload_step(
+                        shadow,
+                        expected_round_count,
+                        requester_actor
+                    )
+                end)
+
+                unload_in_progress[result_key] = nil
+
+                local success = result_success
+                local error_code = result_error
+                local loaded = result_loaded or copy_loaded(shadow.loaded)
+                local ammo_section = result_ammo
+
+                if not ok then
+                    success = false
+                    error_code = "runtime_error:"..tostring(result_success)
+                    loaded = copy_loaded(shadow.loaded)
+                    ammo_section = nil
+                end
+
+                host_unload_results[result_key] = {
+                    sequence = request_sequence,
+                    success = success and true or false,
+                    error_code = error_code or "",
+                    loaded = copy_loaded(loaded),
+                    mode = mode,
+                    expected_count = expected_round_count,
+                    ammo_section = ammo_section
+                }
+
+                mags_mp_log(
+                    "remote shadow committed requester=%s session=%s seq=%s success=%s error=%s ammo=%s remaining=%s",
+                    tostring(requester_netid),
+                    tostring(session_id),
+                    tostring(request_sequence),
+                    tostring(success),
+                    tostring(error_code),
+                    tostring(ammo_section),
+                    tostring(#(loaded or {}))
+                )
+
+                if success and type(loaded) == "table" and #loaded == 0 then
+                    host_remote_sessions[shadow_key] = nil
+                end
+
+                send_unload_result(
+                    requester_netid,
+                    magazine_server_id,
+                    request_sequence,
+                    success,
+                    error_code,
+                    loaded,
+                    mode,
+                    ammo_section
+                )
+                return
+            end
+
+            local magazine_local_id =
+                GameManager:GetLocalIDByServerID(magazine_server_id)
+
+            local magazine =
+                magazine_local_id
+                and level.object_by_id(magazine_local_id)
+
+            if not magazine
+            or not magazines.is_magazine(magazine)
+            then
+                send_unload_result(
+                    requester_netid,
+                    magazine_server_id,
+                    request_sequence,
+                    false,
+                    "magazine_missing",
+                    nil,
+                    mode
+                )
+                return
+            end
+
+            mags_mp_log(
+                "magazine resolved mag=%s local=%s requester=%s seq=%s",
+                tostring(magazine_server_id),
+                tostring(magazine_local_id),
+                tostring(requester_netid),
+                tostring(request_sequence)
+            )
+
+            local parent_ok, parent_error = validate_unload_parent(
+                magazine,
+                expected_parent_server_id,
+                requester_netid,
+                parent_kind
+            )
+
+            if not parent_ok then
+                send_unload_result(
+                    requester_netid,
+                    magazine_server_id,
+                    request_sequence,
+                    false,
+                    parent_error,
+                    nil,
+                    mode
+                )
+                return
+            end
+
+            if unload_in_progress[result_key] then
+                send_unload_result(
+                    requester_netid,
+                    magazine_server_id,
+                    request_sequence,
+                    false,
+                    "in_progress",
+                    nil,
+                    mode
+                )
+                return
+            end
+
+            unload_in_progress[result_key] = true
+
+            local host_session = host_unload_sessions[result_key] or { ammo_boxes = {} }
+            host_unload_sessions[result_key] = host_session
+
+            local ok, result_success, result_error, result_loaded, result_ammo, result_credit = pcall(function()
+                if mode == "step" then
+                    return execute_host_unload_step(
+                        magazine,
+                        expected_round_count,
+                        host_session
+                    )
+                end
+
+                return execute_host_unload_all(
+                    magazine,
+                    expected_round_count
+                )
+            end)
+
+            unload_in_progress[result_key] = nil
+
+            local success = result_success
+            local error_code = result_error
+            local loaded = result_loaded
+            local ammo_section = result_ammo
+
+            if not ok then
+                success = false
+                error_code = "runtime_error:"..tostring(result_success)
+                loaded = get_authoritative_loaded_safe(magazine)
+                ammo_section = nil
+            end
+
+            mags_mp_log(
+                "%s host committed mag=%s requester=%s seq=%s success=%s error=%s ammo=%s remaining=%s",
+                tostring(mode),
+                tostring(magazine_server_id),
+                tostring(requester_netid),
+                tostring(request_sequence),
+                tostring(success),
+                tostring(error_code),
+                tostring(ammo_section),
+                tostring(#(loaded or {}))
+            )
+
+            host_unload_results[result_key] = {
+                sequence = request_sequence,
+                success = success and true or false,
+                error_code = error_code or "",
+                loaded = type(loaded) == "table" and copy_loaded(loaded) or nil,
+                mode = mode,
+                expected_count = expected_round_count,
+                ammo_section = ammo_section
+            }
+
+            if success and (mode == "all" or (type(loaded) == "table" and #loaded == 0)) then
+                host_unload_sessions[result_key] = nil
+            end
+
+            send_unload_result(
+                requester_netid,
+                magazine_server_id,
+                request_sequence,
+                success,
+                error_code,
+                loaded,
+                mode,
+                ammo_section
+            )
+        end
+
+        local function send_unload_request(obj, request_sequence, expected_round_count, mode)
+            if not obj
+            or not obj:parent()
+            or not magazines.is_magazine(obj)
+            then
+                return false
+            end
+
+            local parent = obj:parent()
+            local magazine_server_id = GameManager:GetServerIDByLocalID(obj:id())
+            local requester_netid = GameManager:GetMySNETID()
+            local parent_kind = get_unload_parent_kind(parent)
+            local owner_scope
+
+            if IIsHost()
+            and db.actor
+            and parent:id() == db.actor:id()
+            then
+                owner_scope = "host_actor"
+            elseif not IIsHost()
+            and db.actor
+            and parent:id() == db.actor:id()
+            then
+                owner_scope = "remote_actor"
+            else
+                owner_scope = "object"
+            end
+
+            if owner_scope == "remote_actor"
+            and mode == "step"
+            then
+                mode = "step_remote_actor"
+            end
+
+            if not is_valid_server_id(magazine_server_id)
+            or not requester_netid
+            then
+                return false
+            end
+
+            local parent_server_id = 0
+
+            if parent_kind == "object" then
+                parent_server_id = GameManager:GetServerIDByLocalID(parent:id())
+
+                if not is_valid_server_id(parent_server_id) then
+                    return false
+                end
+            end
+
+            local session = local_unload_sessions[magazine_server_id]
+            local remote_session_id = session and session.session_id
+            local remote_initial_loaded = session and session.initial_loaded
+
+            if owner_scope == "remote_actor"
+            and not remote_session_id
+            then
+                local mag_data = magazines.get_mag_data(obj:id())
+
+                if not mag_data
+                or type(mag_data.loaded) ~= "table"
+                then
+                    return false
+                end
+
+                remote_session_id = tostring(requester_netid)
+                    .. ":"
+                    .. tostring(time_global())
+                    .. ":"
+                    .. tostring(obj:id())
+                remote_initial_loaded = copy_loaded(mag_data.loaded)
+            end
+
+            local payload = {
+                magazine_server_id,
+                parent_server_id,
+                requester_netid,
+                parent_kind,
+                request_sequence,
+                expected_round_count,
+                mode,
+                owner_scope,
+                remote_session_id,
+                remote_initial_loaded
+            }
+
+            if IIsHost() then
+                magazines.request_unload_operation(payload)
+            else
+                GameManager:OnICustomScriptAction(
+                    "magazines",
+                    "request_unload_operation",
+                    serialize_table_simple(payload),
+                    true
+                )
+            end
+
+            mags_mp_log(
+                "%s request sent mag=%s requester=%s seq=%s expected=%s kind=%s",
+                tostring(mode),
+                tostring(magazine_server_id),
+                tostring(requester_netid),
+                tostring(request_sequence),
+                tostring(expected_round_count),
+                tostring(parent_kind)
+            )
+
+            return true
+        end
+
+        local function remove_unload_ack_timeout(magazine_server_id)
+            local session = local_unload_sessions[magazine_server_id]
+
+            if session then
+                session.awaiting_ack = false
+            end
+        end
+
+        local function start_unload_ack_timeout(magazine_server_id, sequence)
+            local session = local_unload_sessions[magazine_server_id]
+
+            if not session then
+                return
+            end
+
+            CreateTimeEvent(
+                "mag_redux",
+                session.timeout_event_id.."_"..tostring(sequence),
+                5,
+                function()
+                    local active = local_unload_sessions[magazine_server_id]
+
+                    if active
+                    and active.awaiting_ack
+                    and active.sequence == sequence
+                    then
+                        active.ack_retries = (active.ack_retries or 0) + 1
+
+                        mags_mp_log(
+                            "ACK timeout mag=%s requester=%s seq=%s expected=%s retry=%s",
+                            tostring(magazine_server_id),
+                            tostring(active.requester_netid),
+                            tostring(sequence),
+                            tostring(active.expected_count),
+                            tostring(active.ack_retries)
+                        )
+
+                        if active.ack_retries <= 3 then
+                            local current_local_id =
+                                GameManager:GetLocalIDByServerID(
+                                    magazine_server_id
+                                )
+                            local current_magazine =
+                                current_local_id
+                                and level.object_by_id(current_local_id)
+
+                            if current_magazine then
+                                send_unload_request(
+                                    current_magazine,
+                                    sequence,
+                                    active.expected_count,
+                                    "step"
+                                )
+
+                                start_unload_ack_timeout(
+                                    magazine_server_id,
+                                    sequence
+                                )
+                            else
+                                cancel_local_unload(
+                                    magazine_server_id,
+                                    "magazine missing"
+                                )
+                            end
+                        else
+                            cancel_local_unload(
+                                magazine_server_id,
+                                "host timeout"
+                            )
+                        end
+                    end
+
+                    return true
+                end
+            )
+        end
+
+        local function schedule_next_unload_step(magazine_server_id)
+            local session = local_unload_sessions[magazine_server_id]
+
+            if not session
+            or session.awaiting_ack
+            then
+                return
+            end
+
+            local local_id = GameManager:GetLocalIDByServerID(magazine_server_id)
+            local magazine = local_id and level.object_by_id(local_id)
+
+            if not magazine then
+                cancel_local_unload(
+                    magazine_server_id,
+                    "magazine missing"
+                )
+                return
+            end
+
+            local delay = magazines.get_mag_time(magazine:section(), true)
+            local request_sequence = session.sequence + 1
+            local step_event_id =
+                session.event_id
+                .. "_"
+                .. tostring(request_sequence)
+
+            mags_mp_log(
+                "next step scheduled mag=%s requester=%s seq=%s expected=%s delay=%s",
+                tostring(magazine_server_id),
+                tostring(session.requester_netid),
+                tostring(request_sequence),
+                tostring(session.expected_count),
+                tostring(delay)
+            )
+
+            CreateTimeEvent(
+                "mag_redux",
+                step_event_id,
+                delay,
+                function()
+                    local ok, finished = pcall(function()
+                        local active = local_unload_sessions[magazine_server_id]
+
+                        if not active then
+                            return true
+                        end
+
+                        mags_mp_log(
+                            "step timer fired mag=%s requester=%s seq=%s expected=%s",
+                            tostring(magazine_server_id),
+                            tostring(active.requester_netid),
+                            tostring(active.sequence + 1),
+                            tostring(active.expected_count)
+                        )
+
+                        if ui_inventory.GUI
+                        and not ui_inventory.GUI:IsShown()
+                        then
+                            cancel_local_unload(
+                                magazine_server_id,
+                                "UI closed"
+                            )
+                            return true
+                        end
+
+                        local current_local_id =
+                            GameManager:GetLocalIDByServerID(magazine_server_id)
+                        local current_magazine =
+                            current_local_id
+                            and level.object_by_id(current_local_id)
+
+                        if not current_magazine then
+                            cancel_local_unload(
+                                magazine_server_id,
+                                "magazine missing"
+                            )
+                            return true
+                        end
+
+                        local parent = current_magazine:parent()
+
+                        if not parent
+                        or parent:id() ~= active.parent_local_id
+                        then
+                            cancel_local_unload(
+                                magazine_server_id,
+                                "parent changed"
+                            )
+                            return true
+                        end
+
+                        local current_data =
+                            magazines.get_mag_data(current_magazine:id())
+
+                        if not current_data
+                        or type(current_data.loaded) ~= "table"
+                        or #current_data.loaded ~= active.expected_count
+                        then
+                            cancel_local_unload(
+                                magazine_server_id,
+                                "local state changed"
+                            )
+                            return true
+                        end
+
+                        active.sequence = active.sequence + 1
+                        active.awaiting_ack = true
+                        active.ack_retries = 0
+
+                        local sent = send_unload_request(
+                            current_magazine,
+                            active.sequence,
+                            active.expected_count,
+                            "step"
+                        )
+
+                        if not sent then
+                            cancel_local_unload(
+                                magazine_server_id,
+                                "request failed"
+                            )
+                            return true
+                        end
+
+                        start_unload_ack_timeout(
+                            magazine_server_id,
+                            active.sequence
+                        )
+
+                        return true
+                    end)
+
+                    if not ok then
+                        cancel_local_unload(
+                            magazine_server_id,
+                            "runtime error: "..tostring(finished)
+                        )
+                        return true
+                    end
+
+                    return finished
+                end
+            )
+        end
+
+        magazines.unload_operation_result = function(data)
+            if type(data) ~= "table" then
+                return
+            end
+
+            local target_netid = data[1]
+
+            if not same_netid(
+                target_netid,
+                GameManager:GetMySNETID()
+            ) then
+                return
+            end
+
+            local magazine_server_id = tonumber(data[2])
+            local sequence = tonumber(data[3])
+            local success = data[4] and true or false
+            local error_code = tostring(data[5] or "")
+            local loaded = data[6]
+            local mode = data[7]
+            local ammo_section = data[8]
+            local loaded_count = type(loaded) == "table" and #loaded or "nil"
+
+            mags_mp_log(
+                "ACK received target=%s mag=%s seq=%s mode=%s success=%s error=%s remaining=%s",
+                tostring(target_netid),
+                tostring(magazine_server_id),
+                tostring(sequence),
+                tostring(mode),
+                tostring(success),
+                tostring(error_code),
+                tostring(loaded_count)
+            )
+
+            local session = local_unload_sessions[magazine_server_id]
+
+            if mode == "step"
+            or mode == "step_remote_actor"
+            then
+                if not session
+                or sequence ~= session.sequence
+                then
+                    return
+                end
+
+                session.awaiting_ack = false
+                remove_unload_ack_timeout(magazine_server_id)
+            end
+
+            if not success then
+                if type(loaded) == "table" then
+                    apply_authoritative_mag_state(
+                        magazine_server_id,
+                        loaded,
+                        nil,
+                        nil,
+                        function(reason)
+                            cancel_local_unload(
+                                magazine_server_id,
+                                "state_apply_failed:"..tostring(reason)
+                            )
+                        end
+                    )
+                end
+
+                cancel_local_unload(
+                    magazine_server_id,
+                    error_code
+                )
+                return
+            end
+
+            local function after_state_applied()
+                if mode == "step_remote_actor" then
+                    mags_mp_log(
+                        "remote actor ammo credited by host mag=%s seq=%s ammo=%s",
+                        tostring(magazine_server_id),
+                        tostring(sequence),
+                        tostring(ammo_section)
+                    )
+                end
+
+                if magazines.inventory_refresh then
+                    pcall(magazines.inventory_refresh, 2)
+                end
+
+                pcall(magazines.timed_refresh)
+
+                play_unload_step_sound(magazine_server_id)
+
+                mags_mp_log(
+                    "step sound played mag=%s seq=%s mode=%s remaining=%s",
+                    tostring(magazine_server_id),
+                    tostring(sequence),
+                    tostring(mode),
+                    tostring(type(loaded) == "table" and #loaded or "nil")
+                )
+
+                CreateTimeEvent(
+                    "mag_redux",
+                    "refresh_after_unload_"..tostring(magazine_server_id).."_"..tostring(sequence),
+                    0.25,
+                    function()
+                        magazines.timed_refresh()
+                        return true
+                    end
+                )
+
+                if mode ~= "step"
+                and mode ~= "step_remote_actor"
+                then
+                    return
+                end
+
+                local active = local_unload_sessions[magazine_server_id]
+
+                if not active then
+                    return
+                end
+
+                active.expected_count = type(loaded) == "table" and #loaded or 0
+
+                if active.expected_count == 0 then
+                    mags_mp_log(
+                        "session completed mag=%s seq=%s",
+                        tostring(magazine_server_id),
+                        tostring(sequence)
+                    )
+                    finish_local_unload(magazine_server_id)
+                    return
+                end
+
+                if ui_inventory.GUI
+                and not ui_inventory.GUI:IsShown()
+                then
+                    finish_local_unload(magazine_server_id)
+                    return
+                end
+
+                mags_mp_log(
+                    "next step after ACK mag=%s seq=%s expected=%s",
+                    tostring(magazine_server_id),
+                    tostring(sequence),
+                    tostring(active.expected_count)
+                )
+
+                schedule_next_unload_step(magazine_server_id)
+            end
+
+            local applied = apply_authoritative_mag_state(
+                magazine_server_id,
+                loaded,
+                nil,
+                after_state_applied,
+                function(reason)
+                    cancel_local_unload(
+                        magazine_server_id,
+                        "state_apply_failed:"..tostring(reason)
+                    )
+                end
+            )
+
+            if applied == false then
+                cancel_local_unload(
+                    magazine_server_id,
+                    "state_apply_failed"
+                )
+            end
+        end
+
+        local function start_slow_multiplayer_unload(obj)
+            if not obj
+            or not obj:parent()
+            or not magazines.is_magazine(obj)
+            then
+                return false
+            end
+
+            local mag_data = magazines.get_mag_data(obj:id())
+
+            if not mag_data
+            or type(mag_data.loaded) ~= "table"
+            or #mag_data.loaded == 0
+            then
+                return false
+            end
+
+            local magazine_server_id = GameManager:GetServerIDByLocalID(obj:id())
+
+            if type(magazine_server_id) ~= "number" then
+                return false
+            end
+
+            if local_unload_sessions[magazine_server_id] then
+                return false
+            end
+
+            local parent = obj:parent()
+
+            local session = {
+                session_id = tostring(GameManager:GetMySNETID())
+                    .. ":"
+                    .. tostring(time_global())
+                    .. ":"
+                    .. tostring(obj:id()),
+                local_magazine_id = obj:id(),
+                magazine_section = obj:section(),
+                initial_loaded = copy_loaded(mag_data.loaded),
+                expected_loaded = copy_loaded(mag_data.loaded),
+                sequence = time_global(),
+                awaiting_ack = false,
+                expected_count = #mag_data.loaded,
+                parent_local_id = parent:id(),
+                parent_kind = get_unload_parent_kind(parent),
+                requester_netid = GameManager:GetMySNETID(),
+                ammo_boxes = {},
+                event_id = "mags_unload_step_"..tostring(magazine_server_id),
+                timeout_event_id = "mags_unload_timeout_"..tostring(magazine_server_id)
+            }
+
+            local_unload_sessions[magazine_server_id] = session
+
+            mags_mp_log(
+                "slow session started mag=%s requester=%s expected=%s kind=%s parent=%s",
+                tostring(magazine_server_id),
+                tostring(session.requester_netid),
+                tostring(session.expected_count),
+                tostring(session.parent_kind),
+                tostring(session.parent_local_id)
+            )
+
+            schedule_next_unload_step(magazine_server_id)
+
+            return true
+        end
+
+        magazines.func_unload_ammo = function(obj)
+            if not (obj and obj:parent() and magazines.is_magazine(obj)) then
+                return
+            end
+
+            if not mags_mp_active() then
+                return OLDUNJECMAGS and OLDUNJECMAGS(obj)
+            end
+
+            local parent = obj:parent()
+
+            local fast_unload =
+                IsInvbox(parent)
+                or not magazines_mcm
+                or magazines_mcm.get_config(
+                    "unload_behavior"
+                ) == 1
+
+            if fast_unload then
+                local mag_data = magazines.get_mag_data(obj:id())
+                local expected_count =
+                    mag_data
+                    and type(mag_data.loaded) == "table"
+                    and #mag_data.loaded
+                    or 0
+
+                return send_unload_request(
+                    obj,
+                    time_global(),
+                    expected_count,
+                    "all"
+                )
+            end
+
+            return start_slow_multiplayer_unload(obj)
         end
         -- Load ammo functos
         magazines.fast_load_magazine = function (obj, ammo_obj, load_one)
