@@ -2,7 +2,6 @@
 local callbacks_registered = false
 local handlers_registered = false
 local wrapped_unload = nil
-local wrapped_original = nil
 local magazines_ref = nil
 local game_manager_ref = nil
 local create_ammo_at_load = _G.create_ammo
@@ -103,50 +102,50 @@ local function run_diagnostic(probe, phase, operation, fn)
     return ok
 end
 
-function safe_object_id(obj)
+local function safe_object_id(obj)
     if not obj then return nil end
     return safe_value(function() return obj:id() end)
 end
 
-function safe_server_id(local_id)
+local function safe_server_id(local_id)
     if local_id == nil or not game_manager_ref then return nil end
     return safe_value(function() return game_manager_ref:GetServerIDByLocalID(local_id) end)
 end
 
-function safe_local_id(server_id)
+local function safe_local_id(server_id)
     if server_id == nil or not game_manager_ref then return nil end
     return safe_value(function() return game_manager_ref:GetLocalIDByServerID(server_id) end)
 end
 
-function safe_section(obj)
+local function safe_section(obj)
     if not obj then return nil end
     return safe_value(function() return obj:section() end)
 end
 
-function safe_name(obj)
+local function safe_name(obj)
     if not obj then return nil end
     return safe_value(function() return obj:name() end)
 end
 
-function safe_parent(obj)
+local function safe_parent(obj)
     if not obj then return nil end
     return safe_value(function() return obj:parent() end)
 end
 
-function safe_parent_id(obj)
+local function safe_parent_id(obj)
     return safe_object_id(safe_parent(obj))
 end
 
-function safe_parent_server_id(obj)
+local function safe_parent_server_id(obj)
     return safe_server_id(safe_parent_id(obj))
 end
 
-function safe_get_netid(obj)
+local function safe_get_netid(obj)
     if not (obj and obj.GetNetID) then return nil end
     return safe_value(function() return obj:GetNetID() end)
 end
 
-function safe_position(obj)
+local function safe_position(obj)
     if not obj then return nil end
     local p = safe_value(function() return obj:position() end)
     if type(p) ~= "userdata" and type(p) ~= "table" then return p end
@@ -156,26 +155,19 @@ function safe_position(obj)
     return array_string({x, y, z})
 end
 
-function safe_level_vertex(obj)
+local function safe_level_vertex(obj)
     if not obj then return nil end
     return safe_value(function() return obj:level_vertex_id() end)
 end
 
-function safe_game_vertex(obj)
+local function safe_game_vertex(obj)
     if not obj then return nil end
     return safe_value(function() return obj:game_vertex_id() end)
 end
 
-function safe_ammo_count(obj)
+local function safe_ammo_count(obj)
     if not (obj and obj.ammo_get_count) then return nil end
     return safe_value(function() return obj:ammo_get_count() end)
-end
-
-function safe_mag_data(obj)
-    if not (obj and magazines_ref and magazines_ref.get_mag_data) then return nil end
-    local id = safe_object_id(obj)
-    if id == nil then return nil end
-    return safe_value(function() return magazines_ref.get_mag_data(id) end)
 end
 
 local function safe_loaded_state(obj)
@@ -188,29 +180,6 @@ local function safe_loaded_state(obj)
     if type(mag_data) ~= "table" then return { status = "missing", loaded = nil } end
     if type(mag_data.loaded) ~= "table" then return { status = "invalid_loaded", loaded = nil } end
     return { status = "ok", loaded = copy_array(mag_data.loaded), section = mag_data.section, is_weapon = mag_data.is_weapon }
-end
-
-function safe_loaded_copy(obj)
-    local state = safe_loaded_state(obj)
-    if state.status ~= "ok" then return nil end
-    return copy_array(state.loaded)
-end
-
-function safe_object_flags(obj)
-    local flags = {}
-    local function put(name, fn)
-        local value, err = safe_bool(fn)
-        flags[#flags + 1] = name .. ":" .. tostring(value)
-        if err then flags[#flags + 1] = name .. "_error:" .. err end
-    end
-    put("IsActor", function() return IsActor and IsActor(obj) end)
-    put("IsStalker", function() return IsStalker and IsStalker(obj) end)
-    put("IsInvbox", function() return IsInvbox and IsInvbox(obj) end)
-    put("IsAmmo", function() return IsAmmo and IsAmmo(obj) end)
-    put("IsWeapon", function() return IsWeapon and IsWeapon(obj) end)
-    put("magazines.is_magazine", function() return magazines_ref and magazines_ref.is_magazine and magazines_ref.is_magazine(obj) end)
-    if obj and obj.alive then put("alive", function() return obj:alive() end) end
-    return table.concat(flags, ",")
 end
 
 local function is_magazine_object(obj)
@@ -232,6 +201,23 @@ local function exact_array_equal(a, b)
     if type(a) ~= "table" or type(b) ~= "table" or #a ~= #b then return false end
     for i = 1, #a do if a[i] ~= b[i] then return false end end
     return true
+end
+
+local function safe_object_flags(obj)
+    local flags = {}
+    local function put(name, fn)
+        local value, err = safe_bool(fn)
+        flags[#flags + 1] = name .. ":" .. tostring(value)
+        if err then flags[#flags + 1] = name .. "_error:" .. err end
+    end
+    put("IsActor", function() return IsActor and IsActor(obj) end)
+    put("IsStalker", function() return IsStalker and IsStalker(obj) end)
+    put("IsInvbox", function() return IsInvbox and IsInvbox(obj) end)
+    put("IsAmmo", function() return IsAmmo and IsAmmo(obj) end)
+    put("IsWeapon", function() return IsWeapon and IsWeapon(obj) end)
+    put("magazines.is_magazine", function() return magazines_ref and magazines_ref.is_magazine and magazines_ref.is_magazine(obj) end)
+    if obj and obj.alive then put("alive", function() return obj:alive() end) end
+    return table.concat(flags, ",")
 end
 
 local function log_roundtrip(probe, phase, label, local_id)
@@ -262,21 +248,35 @@ local item_record
 
 local function collect_inventory(owner, probe, phase, owner_label)
     local items, count = {}, 0
+    local seen_ids = {}
+    local meta = { magazine_classification_errors = 0, ammo_classification_errors = 0, snapshot_complete = true }
     local function cb(_, item)
         count = count + 1
-        local is_mag = is_magazine_object(item)
-        local is_ammo = is_ammo_object(item)
-        if is_mag or is_ammo then items[#items + 1] = item_record(item, is_mag, is_ammo) end
+        local is_mag, mag_err = is_magazine_object(item)
+        local is_ammo, ammo_err = is_ammo_object(item)
+        if mag_err then meta.magazine_classification_errors = meta.magazine_classification_errors + 1; meta.snapshot_complete = false end
+        if ammo_err then meta.ammo_classification_errors = meta.ammo_classification_errors + 1; meta.snapshot_complete = false end
+        if is_mag or is_ammo then
+            local item_id = safe_object_id(item)
+            local key = tostring(item_id or ("unknown:" .. tostring(count)))
+            if not seen_ids[key] then
+                seen_ids[key] = true
+                items[#items + 1] = item_record(item, is_mag, is_ammo)
+            end
+        end
     end
-    if owner and owner.iterate_inventory then
-        local _, err = safe_value(function() owner:iterate_inventory(cb) end)
-        if err then log_line(probe, phase or "inventory_scan", "diagnostic_error", {{"operation", "iterate_inventory"}, {"error", err}, {"owner", owner_label}, {"owner_local_id", safe_object_id(owner)}}) end
-    end
+    local use_box_iter = false
     if owner and owner.iterate_inventory_box then
-        local _, err = safe_value(function() owner:iterate_inventory_box(cb) end)
-        if err then log_line(probe, phase or "inventory_scan", "diagnostic_error", {{"operation", "iterate_inventory_box"}, {"error", err}, {"owner", owner_label}, {"owner_local_id", safe_object_id(owner)}}) end
+        use_box_iter = safe_bool(function() return IsInvbox and IsInvbox(owner) end)
     end
-    return items, count
+    if use_box_iter then
+        local _, err = safe_value(function() owner:iterate_inventory_box(cb) end)
+        if err then meta.snapshot_complete = false; log_line(probe, phase or "inventory_scan", "diagnostic_error", {{"operation", "iterate_inventory_box"}, {"error", err}, {"owner", owner_label}, {"owner_local_id", safe_object_id(owner)}}) end
+    elseif owner and owner.iterate_inventory then
+        local _, err = safe_value(function() owner:iterate_inventory(cb) end)
+        if err then meta.snapshot_complete = false; log_line(probe, phase or "inventory_scan", "diagnostic_error", {{"operation", "iterate_inventory"}, {"error", err}, {"owner", owner_label}, {"owner_local_id", safe_object_id(owner)}}) end
+    end
+    return items, count, meta
 end
 
 item_record = function(item, known_is_mag, known_is_ammo)
@@ -304,11 +304,11 @@ item_record = function(item, known_is_mag, known_is_ammo)
     }
 end
 
-local function inventory_object_map(owner, probe, phase, owner_label, include_other)
+local function inventory_object_map(owner, probe, phase, owner_label)
     local map = {}
     if not owner then return map end
     for _, rec in ipairs(collect_inventory(owner, probe, phase, owner_label)) do
-        if (include_other or rec.is_magazine or rec.is_ammo) and rec.local_id ~= nil then map[tostring(rec.local_id)] = rec end
+        if (rec.is_magazine or rec.is_ammo) and rec.local_id ~= nil then map[tostring(rec.local_id)] = rec end
     end
     return map
 end
@@ -333,7 +333,7 @@ local function single_object_map(local_id)
 end
 
 local function dump_inventory(probe, phase, owner, owner_label)
-    local items, seen = collect_inventory(owner, probe, phase, owner_label)
+    local items, seen, meta = collect_inventory(owner, probe, phase, owner_label)
     local ammo, mags, ammos = {}, 0, 0
     for _, rec in ipairs(items) do
         local item = rec.obj
@@ -355,7 +355,7 @@ local function dump_inventory(probe, phase, owner, owner_label)
     for sec, data in pairs(ammo) do
         log_line(probe, phase, "ammo_summary", {{"owner", owner_label}, {"section", sec}, {"objects", #data.ids}, {"local_ids", array_string(data.ids)}, {"server_ids", array_string(data.sids)}, {"counts", array_string(data.counts)}, {"total", data.total}})
     end
-    log_line(probe, phase, "inventory_summary", {{"owner", owner_label}, {"seen", seen}, {"logged", #items}, {"magazines", mags}, {"ammo_objects", ammos}})
+    log_line(probe, phase, "inventory_summary", {{"owner", owner_label}, {"seen", seen}, {"logged", #items}, {"magazines", mags}, {"ammo_objects", ammos}, {"snapshot_complete", meta and meta.snapshot_complete}, {"magazine_classification_errors", meta and meta.magazine_classification_errors}, {"ammo_classification_errors", meta and meta.ammo_classification_errors}})
     return items
 end
 
@@ -376,8 +376,7 @@ end
 
 local function log_local_actor(probe, phase)
     local actor = db and db.actor
-    local items = dump_inventory(probe, phase, actor, "local_actor")
-    log_line(probe, phase, "local_actor", {{"local_id", safe_object_id(actor)}, {"server_id", safe_server_id(safe_object_id(actor))}, {"getnetid", safe_get_netid(actor)}, {"section", safe_section(actor)}, {"name", safe_name(actor)}, {"position", safe_position(actor)}, {"level_vertex", safe_level_vertex(actor)}, {"game_vertex", safe_game_vertex(actor)}, {"alive", actor and actor.alive and safe_bool(function() return actor:alive() end)}, {"has_iterate_inventory", actor and actor.iterate_inventory ~= nil}, {"inventory_logged", #items}})
+    log_line(probe, phase, "local_actor", {{"local_id", safe_object_id(actor)}, {"server_id", safe_server_id(safe_object_id(actor))}, {"getnetid", safe_get_netid(actor)}, {"section", safe_section(actor)}, {"name", safe_name(actor)}, {"position", safe_position(actor)}, {"level_vertex", safe_level_vertex(actor)}, {"game_vertex", safe_game_vertex(actor)}, {"alive", actor and actor.alive and safe_bool(function() return actor:alive() end)}, {"has_iterate_inventory", actor and actor.iterate_inventory ~= nil}})
     log_roundtrip(probe, phase, "local_actor", safe_object_id(actor))
 end
 
@@ -474,9 +473,16 @@ local function build_watcher_map(w)
     return {}
 end
 
+local function stop_watcher(key, reason)
+    local state = watchers[key]
+    if state and state.dedupe_key then owner_watcher_keys[state.dedupe_key] = nil end
+    if state and reason then log_line(state.probe, "watch_complete", "watcher_stopped", {{"target", state.target}, {"reason", reason}}) end
+    watchers[key] = nil
+end
+
 local function run_watcher_tick(key)
     local state = watchers[key]
-    if not state or not db or not db.actor then watchers[key] = nil; return end
+    if not state or not db or not db.actor then stop_watcher(key, "missing_actor_or_state"); return end
     local current_objects = build_watcher_map(state)
     local fp = watch_snapshot(state, current_objects)
     log_delta(state.probe, state.target, state.objects, current_objects)
@@ -487,7 +493,7 @@ local function run_watcher_tick(key)
         if state.owner then dump_inventory(state.probe, "watch_change", state.owner, state.target) end
         state.last = fp
     end
-    if now() - state.start >= 15000 then log_line(state.probe, "watch_complete", "watcher_done", {{"target", state.target}, {"elapsed", now() - state.start}}); if state.dedupe_key then owner_watcher_keys[state.dedupe_key] = nil end; watchers[key] = nil end
+    if now() - state.start >= 15000 then log_line(state.probe, "watch_complete", "watcher_done", {{"target", state.target}, {"elapsed", now() - state.start}}); stop_watcher(key) end
 end
 
 local function schedule_watcher_tick(key)
@@ -500,8 +506,7 @@ local function schedule_watcher_tick(key)
             state.error_count = (state.error_count or 0) + 1
             if state.error_count >= 3 then
                 log_line(state.probe, "watch_complete", "watcher_stopped_after_errors", {{"target", state.target}, {"error_count", state.error_count}})
-                if state.dedupe_key then owner_watcher_keys[state.dedupe_key] = nil end
-                watchers[key] = nil
+                stop_watcher(key)
                 return true
             end
         end
@@ -511,9 +516,15 @@ local function schedule_watcher_tick(key)
     end)
 end
 
-local function start_watcher(probe, target, local_id, owner, dedupe_key)
+local function records_to_map(records)
+    local map = {}
+    for _, rec in ipairs(records or {}) do if rec.local_id ~= nil then map[tostring(rec.local_id)] = rec end end
+    return map
+end
+
+local function start_watcher(probe, target, local_id, owner, dedupe_key, baseline_records)
     local key = probe .. ":" .. target
-    local initial = owner and inventory_object_map(owner, probe, "watch_change", target) or single_object_map(local_id)
+    local initial = baseline_records and records_to_map(baseline_records) or (owner and inventory_object_map(owner, probe, "watch_change", target) or single_object_map(local_id))
     local mags, ammo = object_map_counts(initial)
     local w = { probe = probe, target = target, local_id = local_id, owner = owner, start = now(), objects = initial, error_count = 0, dedupe_key = dedupe_key }
     w.last = watch_snapshot(w, initial)
@@ -522,7 +533,7 @@ local function start_watcher(probe, target, local_id, owner, dedupe_key)
     schedule_watcher_tick(key)
 end
 
-local function start_owner_watcher(probe, target, owner)
+local function start_owner_watcher(probe, target, owner, baseline_records)
     if not owner then return false end
     local owner_id = safe_object_id(owner)
     local dedupe_key = probe .. ":owner:" .. tostring(owner_id)
@@ -531,7 +542,7 @@ local function start_owner_watcher(probe, target, owner)
         return false
     end
     owner_watcher_keys[dedupe_key] = target
-    start_watcher(probe, target, nil, owner, dedupe_key)
+    start_watcher(probe, target, nil, owner, dedupe_key, baseline_records)
     return true
 end
 
@@ -588,7 +599,7 @@ local function install_handlers()
             if type(data) ~= "table" and deserialize_table_simple then data = deserialize_table_simple(data) end
             probe = data[1]
             if not (IIsHost and IIsHost()) then log_line(probe, "host_probe_received", "wrong_role", nil); return end
-            local requester, client_local, client_server, section, parent_netid, loaded, client_loaded_status = data[2], data[3], data[4], data[5], data[8], data[9], data[13] or (type(data[9]) == "table" and "ok" or "missing")
+            local requester, client_local, client_server, section, client_parent_server, parent_netid, loaded, client_loaded_status = data[2], data[3], data[4], data[5], data[7], data[8], data[9], data[13] or (type(data[9]) == "table" and "ok" or "missing")
             local client_loaded_state = { status = client_loaded_status, loaded = type(loaded) == "table" and loaded or nil, error = data[14] }
             if client_loaded_state.status == "ok" and type(client_loaded_state.loaded) ~= "table" then client_loaded_state.status = "invalid_loaded" end
             log_line(probe, "host_probe_received", "probe_request", {{"requester_netid", requester}, {"client_mag_local_id", client_local}, {"client_mag_server_id", client_server}, {"client_section", section}, {"client_parent_local_id", data[6]}, {"client_parent_server_id", data[7]}, {"client_parent_netid", parent_netid}, {"client_mag_data_status", client_loaded_state.status}, {"client_loaded", client_loaded_state.status == "ok" and array_string(client_loaded_state.loaded) or "<unavailable>"}})
@@ -598,20 +609,33 @@ local function install_handlers()
             local direct_obj = object_by_local_id(direct_local)
             log_magazine_snapshot(probe, "direct_resolution", "direct_object", direct_obj, {{"received_client_local_id", client_local}, {"received_client_server_id", client_server}, {"host_local_by_server", direct_local}})
             local host_loaded_state = safe_loaded_state(direct_obj)
-            local host_parent_netid = safe_get_netid(safe_parent(direct_obj))
+            local host_parent = safe_parent(direct_obj)
+            local host_parent_netid = safe_get_netid(host_parent)
+            local host_parent_server = safe_server_id(safe_object_id(host_parent))
+            local direct_server = safe_server_id(direct_local)
+            local object_server_match = client_server ~= nil and direct_local ~= nil and direct_server == client_server
+            local direct_object_resolution_ok = direct_local ~= nil and direct_obj ~= nil and object_server_match
             local section_match = section ~= nil and safe_section(direct_obj) ~= nil and section == safe_section(direct_obj)
-            local mag_data_status_match = client_loaded_state.status == "ok" and host_loaded_state.status == "ok"
-            local exact_loaded_match = mag_data_status_match and exact_array_equal(client_loaded_state.loaded, host_loaded_state.loaded)
-            local parent_netid_match = parent_netid ~= nil and host_parent_netid ~= nil and tonumber(parent_netid) == tonumber(host_parent_netid)
-            local direct_match = section_match and mag_data_status_match and exact_loaded_match and parent_netid_match
-            log_line(probe, "direct_resolution", "verdict", {{"client_section", section}, {"host_section", safe_section(direct_obj)}, {"section_match", section_match}, {"client_mag_data_status", client_loaded_state.status}, {"host_mag_data_status", host_loaded_state.status}, {"mag_data_status_match", mag_data_status_match}, {"client_loaded", client_loaded_state.status == "ok" and array_string(client_loaded_state.loaded) or "<unavailable>"}, {"host_loaded", host_loaded_state.status == "ok" and array_string(host_loaded_state.loaded) or "<unavailable>"}, {"exact_loaded_match", exact_loaded_match}, {"client_parent_netid", parent_netid}, {"host_parent_netid", host_parent_netid}, {"parent_netid_match", parent_netid_match}, {"direct_resolution_match", direct_match}})
+            local parent_match_method = "none"
+            local parent_identity_match = false
+            if parent_netid ~= nil and host_parent_netid ~= nil then
+                parent_match_method = "netid"
+                parent_identity_match = tonumber(parent_netid) == tonumber(host_parent_netid)
+            elseif client_parent_server ~= nil and host_parent_server ~= nil then
+                parent_match_method = "server_id"
+                parent_identity_match = client_parent_server == host_parent_server
+            end
+            local direct_identity_match = direct_object_resolution_ok and section_match and parent_identity_match
+            local direct_state_match = client_loaded_state.status == "ok" and host_loaded_state.status == "ok" and exact_array_equal(client_loaded_state.loaded, host_loaded_state.loaded)
+            log_line(probe, "direct_resolution", "verdict", {{"client_section", section}, {"host_section", safe_section(direct_obj)}, {"section_match", section_match}, {"client_server_id", client_server}, {"host_direct_server_id", direct_server}, {"object_server_match", object_server_match}, {"direct_object_resolution_ok", direct_object_resolution_ok}, {"client_mag_data_status", client_loaded_state.status}, {"host_mag_data_status", host_loaded_state.status}, {"client_loaded", client_loaded_state.status == "ok" and array_string(client_loaded_state.loaded) or "<unavailable>"}, {"host_loaded", host_loaded_state.status == "ok" and array_string(host_loaded_state.loaded) or "<unavailable>"}, {"direct_state_match", direct_state_match}, {"client_parent_netid", parent_netid}, {"host_parent_netid", host_parent_netid}, {"client_parent_server_id", client_parent_server}, {"host_parent_server_id", host_parent_server}, {"parent_match_method", parent_match_method}, {"parent_identity_match", parent_identity_match}, {"direct_identity_match", direct_identity_match}})
             local remote_actors = find_remote_actors(requester)
             local candidates, exact = 0, 0
             log_line(probe, "candidate_scan", "remote_actor_matches", {{"requester_netid", requester}, {"match_count", #remote_actors}, {"remote_actor_ambiguous", #remote_actors > 1}})
             for _, actor_rec in ipairs(remote_actors) do
                 local remote_actor = actor_rec.object
                 local actor_label = "remote_actor_inventory:" .. tostring(safe_object_id(remote_actor))
-                for _, candidate_rec in ipairs(dump_inventory(probe, "inventory_scan", remote_actor, actor_label)) do
+                local remote_baseline = dump_inventory(probe, "inventory_scan", remote_actor, actor_label)
+                for _, candidate_rec in ipairs(remote_baseline) do
                     local item = candidate_rec.obj
                     if candidate_rec.is_magazine then
                         candidates = candidates + 1
@@ -623,12 +647,12 @@ local function install_handlers()
                         log_line(probe, "candidate_scan", "magazine_candidate", {{"actor_record_key", actor_rec.key}, {"actor_local_id", safe_object_id(remote_actor)}, {"candidate_local_id", candidate_rec.local_id}, {"candidate_server_id", candidate_rec.server_id}, {"section", candidate_rec.section}, {"parent_local_id", candidate_rec.parent_local_id}, {"mag_data_status", state.status}, {"mag_data_error", state.error}, {"loaded", state.status == "ok" and array_string(state.loaded) or "<unavailable>"}, {"section_match", section_ok}, {"loaded_count_match", count_ok}, {"exact_loaded_match", exact_ok}, {"reported_server_id_match", candidate_rec.server_id ~= nil and client_server ~= nil and candidate_rec.server_id == client_server}})
                     end
                 end
-                start_owner_watcher(probe, actor_label, remote_actor)
+                start_owner_watcher(probe, actor_label, remote_actor, remote_baseline)
             end
             if #remote_actors == 0 then log_line(probe, "watch_complete", "watcher_not_started", {{"target", "remote_actor_inventory"}, {"reason", "remote_actor_missing"}}) end
             log_line(probe, "candidate_scan", "summary", {{"remote_actor_found", #remote_actors > 0}, {"remote_actor_count", #remote_actors}, {"remote_actor_ambiguous", #remote_actors > 1}, {"candidate_count", candidates}, {"exact_candidate_count", exact}, {"ambiguous", exact > 1 or #remote_actors > 1}})
             local primary_remote_actor = #remote_actors == 1 and remote_actors[1].object or nil
-            local reply = { requester, probe, my_netid(), #remote_actors > 0, safe_object_id(primary_remote_actor), direct_local, safe_section(direct_obj), safe_parent_id(direct_obj), host_parent_netid, direct_match and #remote_actors <= 1, candidates, exact, #remote_actors > 1 and "ambiguous_remote_actor" or "read_only_diag" }
+            local reply = { requester, probe, my_netid(), #remote_actors > 0, safe_object_id(primary_remote_actor), direct_local, safe_section(direct_obj), safe_parent_id(direct_obj), host_parent_netid, direct_identity_match and #remote_actors <= 1, candidates, exact, #remote_actors > 1 and "ambiguous_remote_actor" or "read_only_diag" }
             GameManager:OnICustomScriptAction("magazines", "mags_diag_probe_reply", serialize_table_simple(reply), false, requester)
             log_line(probe, "host_reply_sent", "probe_reply", {{"target_netid", requester}, {"candidate_count", candidates}, {"exact_candidate_count", exact}, {"remote_actor_count", #remote_actors}})
             if direct_local ~= nil then
@@ -695,7 +719,6 @@ function install(magazines, game_manager)
         begin_unload_probe(obj)
         return original(obj, ...)
     end
-    wrapped_original = original
     wrapped_unload = new_wrapper
     magazines.func_unload_ammo = new_wrapper
     log_line("install:" .. tostring(now()), "install", "installed", {{"create_ammo_type", type(_G.create_ammo)}, {"same_create_ammo", _G.create_ammo == create_ammo_at_load}, {"wrapped", true}})
