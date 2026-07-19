@@ -8,7 +8,8 @@ local game_manager_ref = nil
 local create_ammo_at_load = _G.create_ammo
 local watchers = {}
 local owner_watcher_keys = {}
-local inventory_limit = 250
+local watcher_interval = 0.15
+local verbose_server_id_checks = false
 
 local function safe_try(fn)
     local ok, value = pcall(fn)
@@ -257,13 +258,15 @@ local function log_magazine_snapshot(probe, phase, event, obj, extra)
     log_roundtrip(probe, phase, event .. ":parent", safe_object_id(parent))
 end
 
+local item_record
+
 local function collect_inventory(owner, probe, phase, owner_label)
     local items, count = {}, 0
     local function cb(_, item)
         count = count + 1
         local is_mag = is_magazine_object(item)
         local is_ammo = is_ammo_object(item)
-        if is_mag or is_ammo or count <= inventory_limit then items[#items + 1] = item end
+        if is_mag or is_ammo then items[#items + 1] = item_record(item, is_mag, is_ammo) end
     end
     if owner and owner.iterate_inventory then
         local _, err = safe_value(function() owner:iterate_inventory(cb) end)
@@ -276,10 +279,12 @@ local function collect_inventory(owner, probe, phase, owner_label)
     return items, count
 end
 
-local function item_record(item)
-    local loaded_state = safe_loaded_state(item)
-    local is_mag = is_magazine_object(item)
-    local is_ammo = is_ammo_object(item)
+item_record = function(item, known_is_mag, known_is_ammo)
+    local is_mag = known_is_mag
+    if is_mag == nil then is_mag = is_magazine_object(item) end
+    local is_ammo = known_is_ammo
+    if is_ammo == nil then is_ammo = is_ammo_object(item) end
+    local loaded_state = is_mag and safe_loaded_state(item) or { status = "not_applicable" }
     local object_kind = "other"
     if is_mag then object_kind = "magazine"
     elseif is_ammo then object_kind = "ammo" end
@@ -302,8 +307,7 @@ end
 local function inventory_object_map(owner, probe, phase, owner_label, include_other)
     local map = {}
     if not owner then return map end
-    for _, item in ipairs(collect_inventory(owner, probe, phase, owner_label)) do
-        local rec = item_record(item)
+    for _, rec in ipairs(collect_inventory(owner, probe, phase, owner_label)) do
         if (include_other or rec.is_magazine or rec.is_ammo) and rec.local_id ~= nil then map[tostring(rec.local_id)] = rec end
     end
     return map
@@ -331,8 +335,8 @@ end
 local function dump_inventory(probe, phase, owner, owner_label)
     local items, seen = collect_inventory(owner, probe, phase, owner_label)
     local ammo, mags, ammos = {}, 0, 0
-    for _, item in ipairs(items) do
-        local rec = item_record(item)
+    for _, rec in ipairs(items) do
+        local item = rec.obj
         if rec.is_magazine or rec.is_ammo then
             if rec.is_magazine then mags = mags + 1 end
             if rec.is_ammo then ammos = ammos + 1 end
@@ -406,10 +410,11 @@ end
 local function watch_snapshot(w, object_map)
     local obj = w.local_id and object_by_local_id(w.local_id) or w.obj
     local loaded_state = safe_loaded_state(obj)
-    return join_fingerprint({safe_object_id(obj), safe_server_id(safe_object_id(obj)), safe_parent_id(obj), safe_parent_server_id(obj), loaded_state.status, loaded_state.status == "ok" and array_string(loaded_state.loaded) or "<unavailable>", inventory_fingerprint_from_map(object_map), select(2, ui_state())}, "|")
+    return join_fingerprint({safe_object_id(obj), safe_server_id(safe_object_id(obj)), safe_parent_id(obj), safe_parent_server_id(obj), loaded_state.status, loaded_state.status == "ok" and array_string(loaded_state.loaded) or "<unavailable>", inventory_fingerprint_from_map(object_map)}, "|")
 end
 
 local function schedule_server_id_checks(probe, obj, label)
+    if not verbose_server_id_checks then return end
     local id = safe_object_id(obj)
     for _, d in ipairs({0, 0.1, 0.5, 1.0}) do
         CreateTimeEvent("magdiag_netready", probe .. label .. tostring(id) .. tostring(d), d, function()
@@ -482,29 +487,35 @@ local function run_watcher_tick(key)
         if state.owner then dump_inventory(state.probe, "watch_change", state.owner, state.target) end
         state.last = fp
     end
-    if now() - state.start >= 15000 then log_line(state.probe, "watch_complete", "watcher_done", {{"target", state.target}, {"elapsed", now() - state.start}}); watchers[key] = nil end
+    if now() - state.start >= 15000 then log_line(state.probe, "watch_complete", "watcher_done", {{"target", state.target}, {"elapsed", now() - state.start}}); if state.dedupe_key then owner_watcher_keys[state.dedupe_key] = nil end; watchers[key] = nil end
 end
 
 local function schedule_watcher_tick(key)
-    CreateTimeEvent("magdiag", key, 0.15, function()
+    CreateTimeEvent("magdiag", key, watcher_interval, function()
         local state = watchers[key]
         if not state then return true end
         local ok = run_diagnostic(state.probe, "watch_change", "watcher_callback", function() run_watcher_tick(key) end)
         state = watchers[key]
         if not ok and state then
             state.error_count = (state.error_count or 0) + 1
-            if state.error_count >= 3 then log_line(state.probe, "watch_complete", "watcher_stopped_after_errors", {{"target", state.target}, {"error_count", state.error_count}}); watchers[key] = nil; return true end
+            if state.error_count >= 3 then
+                log_line(state.probe, "watch_complete", "watcher_stopped_after_errors", {{"target", state.target}, {"error_count", state.error_count}})
+                if state.dedupe_key then owner_watcher_keys[state.dedupe_key] = nil end
+                watchers[key] = nil
+                return true
+            end
         end
-        if watchers[key] then schedule_watcher_tick(key) end
-        return true
+        if not watchers[key] then return true end
+        ResetTimeEvent("magdiag", key, watcher_interval)
+        return false
     end)
 end
 
-local function start_watcher(probe, target, local_id, owner)
+local function start_watcher(probe, target, local_id, owner, dedupe_key)
     local key = probe .. ":" .. target
     local initial = owner and inventory_object_map(owner, probe, "watch_change", target) or single_object_map(local_id)
     local mags, ammo = object_map_counts(initial)
-    local w = { probe = probe, target = target, local_id = local_id, owner = owner, start = now(), objects = initial, error_count = 0 }
+    local w = { probe = probe, target = target, local_id = local_id, owner = owner, start = now(), objects = initial, error_count = 0, dedupe_key = dedupe_key }
     w.last = watch_snapshot(w, initial)
     watchers[key] = w
     log_line(probe, "watch_change", "watch_baseline", {{"target", target}, {"magazine_objects", mags}, {"ammo_objects", ammo}, {"fingerprint", w.last}})
@@ -520,7 +531,7 @@ local function start_owner_watcher(probe, target, owner)
         return false
     end
     owner_watcher_keys[dedupe_key] = target
-    start_watcher(probe, target, nil, owner)
+    start_watcher(probe, target, nil, owner, dedupe_key)
     return true
 end
 
@@ -538,9 +549,6 @@ local function begin_unload_probe(obj)
         local behavior, gui_shown = unload_config(probe, obj)
         log_line(probe, "pre_unload", "create_ammo_state", {{"create_ammo_type", type(_G.create_ammo)}, {"create_ammo", tostring(_G.create_ammo)}, {"same_as_module_load", _G.create_ammo == create_ammo_at_load}})
         log_magazine_snapshot(probe, "pre_unload", "magazine_state", obj)
-        log_local_actor(probe, "pre_unload")
-        dump_actor_map(probe, "actor_map", my_netid())
-        dump_inventory(probe, "inventory_scan", safe_parent(obj), "magazine_parent")
         send_probe(probe, obj, behavior, gui_shown)
         start_owner_watcher(probe, "client_actor_inventory", db and db.actor)
         local parent = safe_parent(obj)
@@ -603,15 +611,16 @@ local function install_handlers()
             for _, actor_rec in ipairs(remote_actors) do
                 local remote_actor = actor_rec.object
                 local actor_label = "remote_actor_inventory:" .. tostring(safe_object_id(remote_actor))
-                for _, item in ipairs(dump_inventory(probe, "inventory_scan", remote_actor, actor_label)) do
-                    if is_magazine_object(item) then
+                for _, candidate_rec in ipairs(dump_inventory(probe, "inventory_scan", remote_actor, actor_label)) do
+                    local item = candidate_rec.obj
+                    if candidate_rec.is_magazine then
                         candidates = candidates + 1
-                        local state = safe_loaded_state(item)
-                        local section_ok = section ~= nil and safe_section(item) ~= nil and safe_section(item) == section
+                        local state = candidate_rec.loaded_state
+                        local section_ok = section ~= nil and candidate_rec.section ~= nil and candidate_rec.section == section
                         local count_ok = state.status == "ok" and client_loaded_state.status == "ok" and #state.loaded == #client_loaded_state.loaded
                         local exact_ok = state.status == "ok" and client_loaded_state.status == "ok" and exact_array_equal(state.loaded, client_loaded_state.loaded)
                         if section_ok and exact_ok then exact = exact + 1 end
-                        log_line(probe, "candidate_scan", "magazine_candidate", {{"actor_record_key", actor_rec.key}, {"actor_local_id", safe_object_id(remote_actor)}, {"candidate_local_id", safe_object_id(item)}, {"candidate_server_id", safe_server_id(safe_object_id(item))}, {"section", safe_section(item)}, {"parent_local_id", safe_parent_id(item)}, {"mag_data_status", state.status}, {"mag_data_error", state.error}, {"loaded", state.status == "ok" and array_string(state.loaded) or "<unavailable>"}, {"section_match", section_ok}, {"loaded_count_match", count_ok}, {"exact_loaded_match", exact_ok}, {"reported_server_id_match", safe_server_id(safe_object_id(item)) ~= nil and client_server ~= nil and safe_server_id(safe_object_id(item)) == client_server}})
+                        log_line(probe, "candidate_scan", "magazine_candidate", {{"actor_record_key", actor_rec.key}, {"actor_local_id", safe_object_id(remote_actor)}, {"candidate_local_id", candidate_rec.local_id}, {"candidate_server_id", candidate_rec.server_id}, {"section", candidate_rec.section}, {"parent_local_id", candidate_rec.parent_local_id}, {"mag_data_status", state.status}, {"mag_data_error", state.error}, {"loaded", state.status == "ok" and array_string(state.loaded) or "<unavailable>"}, {"section_match", section_ok}, {"loaded_count_match", count_ok}, {"exact_loaded_match", exact_ok}, {"reported_server_id_match", candidate_rec.server_id ~= nil and client_server ~= nil and candidate_rec.server_id == client_server}})
                     end
                 end
                 start_owner_watcher(probe, actor_label, remote_actor)
@@ -622,7 +631,11 @@ local function install_handlers()
             local reply = { requester, probe, my_netid(), #remote_actors > 0, safe_object_id(primary_remote_actor), direct_local, safe_section(direct_obj), safe_parent_id(direct_obj), host_parent_netid, direct_match and #remote_actors <= 1, candidates, exact, #remote_actors > 1 and "ambiguous_remote_actor" or "read_only_diag" }
             GameManager:OnICustomScriptAction("magazines", "mags_diag_probe_reply", serialize_table_simple(reply), false, requester)
             log_line(probe, "host_reply_sent", "probe_reply", {{"target_netid", requester}, {"candidate_count", candidates}, {"exact_candidate_count", exact}, {"remote_actor_count", #remote_actors}})
-            start_watcher(probe, "direct_resolution", direct_local, nil)
+            if direct_local ~= nil then
+                start_watcher(probe, "direct_resolution", direct_local, nil)
+            else
+                log_line(probe, "watch_complete", "watcher_not_started", {{"target", "direct_resolution"}, {"reason", "direct_local_missing"}})
+            end
             local direct_parent = safe_parent(direct_obj)
             if direct_parent then start_owner_watcher(probe, "direct_parent_inventory:" .. tostring(safe_object_id(direct_parent)), direct_parent) end
             start_owner_watcher(probe, "host_actor_inventory", db and db.actor)
