@@ -1,0 +1,426 @@
+-- Read-only MagsRedux co-op diagnostics.  This module must never mutate gameplay state.
+local installed = false
+local magazines_ref = nil
+local game_manager_ref = nil
+local create_ammo_at_load = _G.create_ammo
+local watchers = {}
+local pending_server_id_checks = {}
+local actor_dump_fingerprints = {}
+local inventory_limit = 250
+
+local function safe_call(fn)
+    local ok, a, b, c = pcall(fn)
+    if ok then return a, b, c end
+    return "error:" .. tostring(a)
+end
+
+local function role()
+    return (IIsHost and IIsHost()) and "host" or "client"
+end
+
+local function now()
+    return safe_call(function() return time_global() end) or 0
+end
+
+local function my_netid()
+    if game_manager_ref and game_manager_ref.GetMySNETID then
+        return safe_call(function() return game_manager_ref:GetMySNETID() end)
+    end
+    return nil
+end
+
+local function scalar(v)
+    if v == nil then return "nil" end
+    local tv = type(v)
+    if tv == "boolean" then return v and "true" or "false" end
+    if tv == "number" or tv == "string" then return tostring(v) end
+    return "<" .. tv .. ">"
+end
+
+local function array_string(t)
+    if type(t) ~= "table" then return "[]" end
+    local out = {}
+    for i = 1, #t do out[#out + 1] = scalar(t[i]) end
+    return "[" .. table.concat(out, "|") .. "]"
+end
+
+local function log_line(probe, phase, event, fields)
+    local parts = {
+        "! MAGDIAG",
+        "role=" .. role(),
+        "probe=" .. scalar(probe or "none"),
+        "phase=" .. scalar(phase),
+        "event=" .. scalar(event),
+        "time=" .. scalar(now()),
+        "netid=" .. scalar(my_netid())
+    }
+    if fields then
+        for _, pair in ipairs(fields) do
+            parts[#parts + 1] = tostring(pair[1]) .. "=" .. scalar(pair[2])
+        end
+    end
+    printf(table.concat(parts, " "))
+end
+
+function safe_object_id(obj)
+    if not obj then return nil end
+    return safe_call(function() return obj:id() end)
+end
+
+function safe_server_id(local_id)
+    if local_id == nil or not game_manager_ref then return nil end
+    return safe_call(function() return game_manager_ref:GetServerIDByLocalID(local_id) end)
+end
+
+function safe_local_id(server_id)
+    if server_id == nil or not game_manager_ref then return nil end
+    return safe_call(function() return game_manager_ref:GetLocalIDByServerID(server_id) end)
+end
+
+function safe_section(obj)
+    if not obj then return nil end
+    return safe_call(function() return obj:section() end)
+end
+
+function safe_name(obj)
+    if not obj then return nil end
+    return safe_call(function() return obj:name() end)
+end
+
+function safe_parent(obj)
+    if not obj then return nil end
+    return safe_call(function() return obj:parent() end)
+end
+
+function safe_parent_id(obj)
+    local p = safe_parent(obj)
+    return safe_object_id(p)
+end
+
+function safe_parent_server_id(obj)
+    return safe_server_id(safe_parent_id(obj))
+end
+
+function safe_get_netid(obj)
+    if not obj or not obj.GetNetID then return nil end
+    return safe_call(function() return obj:GetNetID() end)
+end
+
+function safe_position(obj)
+    if not obj then return nil end
+    local p = safe_call(function() return obj:position() end)
+    if type(p) ~= "userdata" and type(p) ~= "table" then return p end
+    local x = safe_call(function() return p.x end)
+    local y = safe_call(function() return p.y end)
+    local z = safe_call(function() return p.z end)
+    return array_string({ x, y, z })
+end
+
+function safe_level_vertex(obj)
+    if not obj then return nil end
+    return safe_call(function() return obj:level_vertex_id() end)
+end
+
+function safe_game_vertex(obj)
+    if not obj then return nil end
+    return safe_call(function() return obj:game_vertex_id() end)
+end
+
+function safe_ammo_count(obj)
+    if not obj or not obj.ammo_get_count then return nil end
+    return safe_call(function() return obj:ammo_get_count() end)
+end
+
+function safe_mag_data(obj)
+    if not (obj and magazines_ref and magazines_ref.get_mag_data) then return nil end
+    local id = safe_object_id(obj)
+    if id == nil then return nil end
+    return safe_call(function() return magazines_ref.get_mag_data(id) end)
+end
+
+function safe_loaded_copy(obj)
+    local md = safe_mag_data(obj)
+    if type(md) ~= "table" or type(md.loaded) ~= "table" then return {} end
+    local out = {}
+    for i = 1, #md.loaded do out[i] = md.loaded[i] end
+    return out
+end
+
+function safe_object_flags(obj)
+    local f = {}
+    local function put(name, fn) f[#f + 1] = name .. ":" .. scalar(safe_call(fn)) end
+    put("IsActor", function() return IsActor and IsActor(obj) end)
+    put("IsStalker", function() return IsStalker and IsStalker(obj) end)
+    put("IsInvbox", function() return IsInvbox and IsInvbox(obj) end)
+    put("IsAmmo", function() return IsAmmo and IsAmmo(obj) end)
+    put("IsWeapon", function() return IsWeapon and IsWeapon(obj) end)
+    put("magazines.is_magazine", function() return magazines_ref and magazines_ref.is_magazine and magazines_ref.is_magazine(obj) end)
+    if obj and obj.alive then put("alive", function() return obj:alive() end) end
+    return table.concat(f, ",")
+end
+
+local function object_by_local_id(id)
+    if id == nil or not level or not level.object_by_id then return nil end
+    return safe_call(function() return level.object_by_id(id) end)
+end
+
+local function md_fields(obj)
+    local md = safe_mag_data(obj)
+    return type(md) == "table", type(md) == "table" and md.section or nil, type(md) == "table" and md.is_weapon or nil
+end
+
+local function log_roundtrip(probe, phase, label, local_id)
+    local sid = safe_server_id(local_id)
+    local rid = safe_local_id(sid)
+    log_line(probe, phase, "id_roundtrip", {{"label", label}, {"source_local_id", local_id}, {"server_id", sid}, {"server_id_missing", sid == nil}, {"roundtrip_local_id", rid}, {"roundtrip_ok", local_id ~= nil and rid == local_id}})
+end
+
+local function log_magazine_snapshot(probe, phase, event, obj, extra)
+    local parent = safe_parent(obj)
+    local has_md, md_section, md_is_weapon = md_fields(obj)
+    local loaded = safe_loaded_copy(obj)
+    local fields = {
+        {"object", obj and "object" or "nil"}, {"local_id", safe_object_id(obj)}, {"server_id", safe_server_id(safe_object_id(obj))},
+        {"section", safe_section(obj)}, {"name", safe_name(obj)}, {"parent", parent and "object" or "nil"},
+        {"parent_local_id", safe_object_id(parent)}, {"parent_server_id", safe_server_id(safe_object_id(parent))}, {"parent_netid", safe_get_netid(parent)},
+        {"parent_section", safe_section(parent)}, {"parent_flags", safe_object_flags(parent)}, {"is_magazine", magazines_ref and magazines_ref.is_magazine and safe_call(function() return magazines_ref.is_magazine(obj) end)},
+        {"mag_data", has_md}, {"mag_data_section", md_section}, {"mag_data_is_weapon", md_is_weapon}, {"loaded_count", #loaded}, {"loaded", array_string(loaded)}
+    }
+    if extra then for _, p in ipairs(extra) do fields[#fields + 1] = p end end
+    log_line(probe, phase, event, fields)
+    log_roundtrip(probe, phase, event .. ":magazine", safe_object_id(obj))
+    log_roundtrip(probe, phase, event .. ":parent", safe_object_id(parent))
+end
+
+local function collect_inventory(owner)
+    local items = {}; local count = 0
+    local function cb(_, item)
+        count = count + 1
+        local is_mag = magazines_ref and magazines_ref.is_magazine and safe_call(function() return magazines_ref.is_magazine(item) end)
+        local is_ammo = safe_call(function() return IsAmmo and IsAmmo(item) end)
+        if is_mag or is_ammo or count <= inventory_limit then items[#items + 1] = item end
+    end
+    if owner and owner.iterate_inventory then safe_call(function() owner:iterate_inventory(cb) end) end
+    if owner and owner.iterate_inventory_box then safe_call(function() owner:iterate_inventory_box(cb) end) end
+    return items, count
+end
+
+local function dump_inventory(probe, phase, owner, owner_label)
+    local items, seen = collect_inventory(owner)
+    local ammo = {}; local mags = 0; local ammos = 0
+    for _, item in ipairs(items) do
+        local is_mag = magazines_ref and magazines_ref.is_magazine and safe_call(function() return magazines_ref.is_magazine(item) end)
+        local is_ammo = safe_call(function() return IsAmmo and IsAmmo(item) end)
+        if is_mag or is_ammo then
+            if is_mag then mags = mags + 1 end; if is_ammo then ammos = ammos + 1 end
+            local loaded = is_mag and safe_loaded_copy(item) or {}
+            log_line(probe, phase, "inventory_item", {{"owner", owner_label}, {"owner_local_id", safe_object_id(owner)}, {"owner_netid", safe_get_netid(owner)}, {"item_local_id", safe_object_id(item)}, {"item_server_id", safe_server_id(safe_object_id(item))}, {"section", safe_section(item)}, {"parent_local_id", safe_parent_id(item)}, {"parent_server_id", safe_parent_server_id(item)}, {"flags", safe_object_flags(item)}, {"mag_data", md_fields(item)}, {"loaded", array_string(loaded)}, {"ammo_count", safe_ammo_count(item)}, {"box_size", safe_call(function() return SYS_GetParam(2, safe_section(item), "box_size") end)}, {"has_ammo_set_count", item and item.ammo_set_count ~= nil}})
+            if is_ammo then
+                local sec = safe_section(item) or "nil"; ammo[sec] = ammo[sec] or {ids = {}, sids = {}, counts = {}, total = 0}
+                local c = tonumber(safe_ammo_count(item)) or 0
+                table.insert(ammo[sec].ids, safe_object_id(item)); table.insert(ammo[sec].sids, safe_server_id(safe_object_id(item))); table.insert(ammo[sec].counts, c); ammo[sec].total = ammo[sec].total + c
+            end
+        end
+    end
+    for sec, data in pairs(ammo) do
+        log_line(probe, phase, "ammo_summary", {{"owner", owner_label}, {"section", sec}, {"objects", #data.ids}, {"local_ids", array_string(data.ids)}, {"server_ids", array_string(data.sids)}, {"counts", array_string(data.counts)}, {"total", data.total}})
+    end
+    log_line(probe, phase, "inventory_summary", {{"owner", owner_label}, {"seen", seen}, {"logged", #items}, {"magazines", mags}, {"ammo_objects", ammos}})
+    return items
+end
+
+local function dump_actor_map(probe, phase, requester_netid)
+    local matches = 0
+    if db and db.actors then
+        for k, rec in pairs(db.actors) do
+            local obj = type(rec) == "table" and rec.object or nil
+            if tonumber(type(rec) == "table" and rec.netid) == tonumber(requester_netid) then matches = matches + 1 end
+            log_line(probe, phase, "actor_record", {{"key", k}, {"record_type", type(rec)}, {"record_netid", type(rec) == "table" and rec.netid or nil}, {"object", obj and "object" or "nil"}, {"object_local_id", safe_object_id(obj)}, {"object_server_id", safe_server_id(safe_object_id(obj))}, {"object_getnetid", safe_get_netid(obj)}, {"section", safe_section(obj)}, {"name", safe_name(obj)}, {"alive", obj and obj.alive and safe_call(function() return obj:alive() end)}, {"has_iterate_inventory", obj and obj.iterate_inventory ~= nil}, {"position", safe_position(obj)}, {"level_vertex", safe_level_vertex(obj)}, {"game_vertex", safe_game_vertex(obj)}})
+        end
+    end
+    log_line(probe, phase, "actor_map_summary", {{"my_snetid", my_netid()}, {"db_actor_id", db and db.actor and safe_object_id(db.actor)}, {"requester_netid", requester_netid}, {"requester_record_matches", matches}})
+end
+
+local function log_local_actor(probe, phase)
+    local actor = db and db.actor
+    local items = dump_inventory(probe, phase, actor, "local_actor")
+    log_line(probe, phase, "local_actor", {{"local_id", safe_object_id(actor)}, {"server_id", safe_server_id(safe_object_id(actor))}, {"getnetid", safe_get_netid(actor)}, {"section", safe_section(actor)}, {"name", safe_name(actor)}, {"position", safe_position(actor)}, {"level_vertex", safe_level_vertex(actor)}, {"game_vertex", safe_game_vertex(actor)}, {"alive", actor and actor.alive and safe_call(function() return actor:alive() end)}, {"has_iterate_inventory", actor and actor.iterate_inventory ~= nil}, {"inventory_logged", #items}})
+    log_roundtrip(probe, phase, "local_actor", safe_object_id(actor))
+end
+
+local function ui_state()
+    local shown = safe_call(function() return ui_inventory and ui_inventory.GUI and ui_inventory.GUI:IsShown() end)
+    return ui_inventory and ui_inventory.GUI ~= nil, shown
+end
+
+local function unload_config(obj)
+    local gui_exists, gui_shown = ui_state()
+    local behavior = safe_call(function() return magazines_mcm and magazines_mcm.get_config and magazines_mcm.get_config("unload_behavior") end)
+    local fast = safe_call(function() local p = safe_parent(obj); return IsInvbox and IsInvbox(p) or not magazines_mcm or behavior == 1 end)
+    local delay = safe_call(function() return magazines_ref and magazines_ref.get_mag_time and magazines_ref.get_mag_time(safe_section(obj), true) end)
+    log_line(nil, "pre_unload", "ui_config", {{"magazines_mcm", magazines_mcm ~= nil}, {"unload_behavior", behavior}, {"fast_selection", fast}, {"ui_inventory_GUI", gui_exists}, {"gui_shown", gui_shown}, {"has_get_mag_time", magazines_ref and magazines_ref.get_mag_time ~= nil}, {"magazine_section", safe_section(obj)}, {"unload_delay", delay}})
+    return behavior, gui_shown
+end
+
+local function inventory_fingerprint(owner)
+    local parts = {}
+    for _, item in ipairs(collect_inventory(owner)) do
+        local is_mag = magazines_ref and magazines_ref.is_magazine and safe_call(function() return magazines_ref.is_magazine(item) end)
+        local is_ammo = safe_call(function() return IsAmmo and IsAmmo(item) end)
+        if is_mag or is_ammo then parts[#parts + 1] = table.concat({safe_object_id(item), safe_server_id(safe_object_id(item)), safe_section(item), safe_parent_id(item), safe_parent_server_id(item), array_string(safe_loaded_copy(item)), safe_ammo_count(item)}, ":") end
+    end
+    table.sort(parts)
+    return table.concat(parts, ";")
+end
+
+local function watch_snapshot(w)
+    local obj = w.local_id and object_by_local_id(w.local_id) or w.obj
+    return table.concat({safe_object_id(obj), safe_server_id(safe_object_id(obj)), safe_parent_id(obj), safe_parent_server_id(obj), array_string(safe_loaded_copy(obj)), inventory_fingerprint(w.owner or safe_parent(obj) or (db and db.actor)), scalar(select(2, ui_state()))}, "|")
+end
+
+local function start_watcher(probe, target, local_id, owner)
+    local key = probe .. ":" .. target
+    watchers[key] = { probe = probe, target = target, local_id = local_id, owner = owner, start = now(), last = nil }
+    CreateTimeEvent("magdiag", key, 0.15, function()
+        local w = watchers[key]
+        if not w or not db or not db.actor then watchers[key] = nil; return true end
+        local fp = watch_snapshot(w)
+        if fp ~= w.last then
+            log_line(probe, "watch_change", "fingerprint_changed", {{"target", target}, {"previous", w.last}, {"new", fp}, {"elapsed", now() - w.start}})
+            if local_id then log_magazine_snapshot(probe, "watch_change", "watch_magazine_state", object_by_local_id(local_id), {{"target", target}}) end
+            dump_inventory(probe, "watch_change", owner or db.actor, target)
+            w.last = fp
+        end
+        if now() - w.start >= 15000 then log_line(probe, "watch_complete", "watcher_done", {{"target", target}, {"elapsed", now() - w.start}}); watchers[key] = nil; return true end
+        return false
+    end)
+end
+
+local function schedule_server_id_checks(probe, obj, label)
+    local id = safe_object_id(obj)
+    for _, d in ipairs({0, 0.1, 0.5, 1.0}) do
+        CreateTimeEvent("magdiag_netready", probe .. label .. tostring(id) .. tostring(d), d, function()
+            local o = object_by_local_id(id)
+            log_line(probe, "watch_change", "server_id_check", {{"label", label}, {"delay", d}, {"local_id", id}, {"server_id", safe_server_id(id)}, {"parent_local_id", safe_parent_id(o)}, {"ammo_count", safe_ammo_count(o)}, {"section", safe_section(o)}})
+            return true
+        end)
+    end
+end
+
+local function send_probe(probe, obj, behavior, gui_shown)
+    if IIsHost and IIsHost() then return end
+    local payload = { probe, my_netid(), safe_object_id(obj), safe_server_id(safe_object_id(obj)), safe_section(obj), safe_parent_id(obj), safe_parent_server_id(obj), safe_get_netid(safe_parent(obj)), safe_loaded_copy(obj), behavior, gui_shown, now() }
+    GameManager:OnICustomScriptAction("magazines", "mags_diag_probe_request", serialize_table_simple(payload), true)
+    log_line(probe, "client_probe_sent", "probe_request", {{"client_mag_local_id", payload[3]}, {"client_mag_server_id", payload[4]}, {"loaded", array_string(payload[9])}})
+end
+
+local function begin_unload_probe(obj)
+    local probe = tostring(my_netid()) .. ":" .. tostring(now()) .. ":" .. tostring(safe_object_id(obj))
+    safe_call(function()
+        local behavior, gui_shown = unload_config(obj)
+        log_line(probe, "pre_unload", "create_ammo_state", {{"create_ammo_type", type(_G.create_ammo)}, {"create_ammo", tostring(_G.create_ammo)}, {"same_as_module_load", _G.create_ammo == create_ammo_at_load}})
+        log_magazine_snapshot(probe, "pre_unload", "magazine_state", obj)
+        log_local_actor(probe, "pre_unload")
+        dump_actor_map(probe, "actor_map", my_netid())
+        dump_inventory(probe, "inventory_scan", safe_parent(obj), "magazine_parent")
+        send_probe(probe, obj, behavior, gui_shown)
+        start_watcher(probe, "client_magazine", safe_object_id(obj), db and db.actor)
+        schedule_server_id_checks(probe, obj, "probe_magazine")
+    end)
+end
+
+local function find_remote_actor(requester_netid)
+    if not (db and db.actors) then return nil end
+    for _, rec in pairs(db.actors) do
+        if type(rec) == "table" and tonumber(rec.netid) == tonumber(requester_netid) then return rec.object end
+    end
+    return nil
+end
+
+function mags_diag_probe_request(data)
+    magazines.mags_diag_probe_request(data)
+end
+
+function mags_diag_probe_reply(data)
+    magazines.mags_diag_probe_reply(data)
+end
+
+local function install_handlers()
+    magazines_ref.mags_diag_probe_request = function(data)
+        safe_call(function()
+            if type(data) ~= "table" and deserialize_table_simple then data = deserialize_table_simple(data) end
+            local probe, requester, client_local, client_server, section, parent_local, parent_server, parent_netid, loaded = data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8], data[9]
+            log_line(probe, "host_probe_received", "probe_request", {{"requester_netid", requester}, {"client_mag_local_id", client_local}, {"client_mag_server_id", client_server}, {"client_section", section}, {"client_parent_local_id", parent_local}, {"client_parent_server_id", parent_server}, {"client_parent_netid", parent_netid}, {"client_loaded", array_string(loaded)}})
+            log_local_actor(probe, "host_probe_received")
+            dump_actor_map(probe, "actor_map", requester)
+            local direct_local = safe_local_id(client_server)
+            local direct_obj = object_by_local_id(direct_local)
+            log_magazine_snapshot(probe, "direct_resolution", "direct_object", direct_obj, {{"received_client_local_id", client_local}, {"received_client_server_id", client_server}, {"host_local_by_server", direct_local}})
+            local direct_loaded = safe_loaded_copy(direct_obj)
+            local direct_match = safe_section(direct_obj) == section and array_string(direct_loaded) == array_string(loaded) and tonumber(safe_get_netid(safe_parent(direct_obj))) == tonumber(parent_netid)
+            log_line(probe, "direct_resolution", "verdict", {{"client_section", section}, {"host_section", safe_section(direct_obj)}, {"client_loaded", array_string(loaded)}, {"host_loaded", array_string(direct_loaded)}, {"client_parent_netid", parent_netid}, {"host_parent_netid", safe_get_netid(safe_parent(direct_obj))}, {"direct_resolution_match", direct_match}})
+            local remote_actor = find_remote_actor(requester)
+            local candidates = 0; local exact = 0
+            local candidate_ids = {}
+            if remote_actor then
+                for _, item in ipairs(dump_inventory(probe, "inventory_scan", remote_actor, "remote_actor")) do
+                    local is_mag = magazines_ref.is_magazine and safe_call(function() return magazines_ref.is_magazine(item) end)
+                    if is_mag then
+                        candidates = candidates + 1
+                        local iloaded = safe_loaded_copy(item)
+                        local exact_match = safe_section(item) == section and array_string(iloaded) == array_string(loaded)
+                        if exact_match then exact = exact + 1 end
+                        candidate_ids[#candidate_ids + 1] = safe_object_id(item)
+                        log_line(probe, "candidate_scan", "magazine_candidate", {{"candidate_local_id", safe_object_id(item)}, {"candidate_server_id", safe_server_id(safe_object_id(item))}, {"section", safe_section(item)}, {"parent_local_id", safe_parent_id(item)}, {"mag_data", md_fields(item)}, {"loaded", array_string(iloaded)}, {"section_match", safe_section(item) == section}, {"loaded_count_match", #iloaded == #(loaded or {})}, {"exact_loaded_match", array_string(iloaded) == array_string(loaded)}, {"reported_server_id_match", safe_server_id(safe_object_id(item)) == client_server}})
+                    end
+                end
+            end
+            log_line(probe, "candidate_scan", "summary", {{"remote_actor_found", remote_actor ~= nil}, {"remote_actor_local_id", safe_object_id(remote_actor)}, {"remote_actor_server_id", safe_server_id(safe_object_id(remote_actor))}, {"candidate_count", candidates}, {"exact_candidate_count", exact}, {"ambiguous", exact > 1}})
+            local reply = { requester, probe, my_netid(), remote_actor ~= nil, safe_object_id(remote_actor), direct_local, safe_section(direct_obj), safe_parent_id(direct_obj), safe_get_netid(safe_parent(direct_obj)), direct_match, candidates, exact, "read_only_diag" }
+            GameManager:OnICustomScriptAction("magazines", "mags_diag_probe_reply", serialize_table_simple(reply), false, requester)
+            log_line(probe, "host_reply_sent", "probe_reply", {{"target_netid", requester}, {"candidate_count", candidates}, {"exact_candidate_count", exact}})
+            start_watcher(probe, "direct_resolution", direct_local, remote_actor)
+            start_watcher(probe, "remote_actor_inventory", nil, remote_actor)
+            start_watcher(probe, "host_actor_inventory", nil, db and db.actor)
+            for _, cid in ipairs(candidate_ids) do start_watcher(probe, "remote_actor_candidate:" .. tostring(cid), cid, remote_actor) end
+            if direct_obj then schedule_server_id_checks(probe, direct_obj, "direct_resolution") end
+        end)
+    end
+    magazines_ref.mags_diag_probe_reply = function(data)
+        safe_call(function()
+            if type(data) ~= "table" and deserialize_table_simple then data = deserialize_table_simple(data) end
+            log_line(data[2], "client_reply_received", "probe_reply", {{"target_netid", data[1]}, {"host_my_snetid", data[3]}, {"remote_actor_found", data[4]}, {"remote_actor_local_id", data[5]}, {"direct_local_id", data[6]}, {"direct_section", data[7]}, {"direct_parent_local_id", data[8]}, {"direct_parent_netid", data[9]}, {"direct_resolution_match", data[10]}, {"candidate_count", data[11]}, {"exact_candidate_count", data[12]}, {"summary", data[13]}})
+        end)
+    end
+end
+
+local function dump_later(phase, netid, delay)
+    CreateTimeEvent("magdiag_actor_map", phase .. tostring(netid) .. tostring(delay), delay, function()
+        local probe = "connection:" .. tostring(netid) .. ":" .. tostring(now())
+        dump_actor_map(probe, "actor_map", netid)
+        return true
+    end)
+end
+
+function install(magazines, game_manager)
+    if installed then return end
+    installed = true
+    magazines_ref = magazines
+    game_manager_ref = game_manager
+    local existing_unload = magazines.func_unload_ammo
+    install_handlers()
+    magazines.func_unload_ammo = function(obj, ...)
+        safe_call(function() begin_unload_probe(obj) end)
+        return existing_unload(obj, ...)
+    end
+    log_line("install:" .. tostring(now()), "install", "installed", {{"create_ammo_type", type(_G.create_ammo)}, {"same_create_ammo", _G.create_ammo == create_ammo_at_load}, {"wrapped", true}})
+    if RegisterScriptCallback then
+        RegisterScriptCallback("on_game_load", function() log_line("game_load:" .. tostring(now()), "game_load", "callback", nil); dump_actor_map("game_load:" .. tostring(now()), "actor_map", my_netid()) end)
+        RegisterScriptCallback("actor_on_first_update", function() log_line("first_update:" .. tostring(now()), "game_load", "actor_on_first_update", nil) end)
+        RegisterScriptCallback("actor_on_item_take", function(obj) log_line("item_take:" .. tostring(now()), "inventory_scan", "actor_on_item_take", {{"item_local_id", safe_object_id(obj)}, {"item_server_id", safe_server_id(safe_object_id(obj))}, {"section", safe_section(obj)}}) end)
+        RegisterScriptCallback("onmp_player_connected", function(netid, nick) log_line("connection:" .. tostring(netid) .. ":" .. tostring(now()), "player_connected", "client_callback", {{"player_netid", netid}, {"nick", nick}}); for _, d in ipairs({0, 0.5, 1, 2, 5}) do dump_later("connected", netid, d) end end)
+        RegisterScriptCallback("onmp_player_connected_server", function(netid, nick) log_line("connection:" .. tostring(netid) .. ":" .. tostring(now()), "player_connected", "server_callback", {{"player_netid", netid}, {"nick", nick}}); for _, d in ipairs({0, 0.5, 1, 2, 5}) do dump_later("connected_server", netid, d) end end)
+        RegisterScriptCallback("onmp_player_disconnected", function(netid, nick) log_line("connection:" .. tostring(netid) .. ":" .. tostring(now()), "player_disconnected", "client_callback", {{"player_netid", netid}, {"nick", nick}}); for _, d in ipairs({0, 0.5, 1, 2, 5}) do dump_later("disconnected", netid, d) end end)
+        RegisterScriptCallback("onmp_player_disconnected_server", function(netid, nick) log_line("connection:" .. tostring(netid) .. ":" .. tostring(now()), "player_disconnected", "server_callback", {{"player_netid", netid}, {"nick", nick}}); for _, d in ipairs({0, 0.5, 1, 2, 5}) do dump_later("disconnected_server", netid, d) end end)
+    end
+end
