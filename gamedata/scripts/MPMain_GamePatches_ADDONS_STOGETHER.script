@@ -677,18 +677,35 @@ function Patch()
                 return false
             end
 
-            mag_data.loaded = copy_loaded(loaded)
-            magazines.set_mag_data(magazine:id(), mag_data)
-            magazines.timed_refresh()
+            local ok_apply, apply_err = pcall(function()
+                mag_data.loaded = copy_loaded(loaded)
 
-            mags_mp_log(
-                "state applied mag=%s remaining=%s",
-                tostring(magazine_server_id),
-                tostring(#mag_data.loaded)
-            )
+                magazines.set_mag_data(
+                    magazine:id(),
+                    mag_data
+                )
 
-            if on_applied then
-                on_applied()
+                magazines.timed_refresh()
+
+                mags_mp_log(
+                    "state applied mag=%s remaining=%s",
+                    tostring(magazine_server_id),
+                    tostring(#mag_data.loaded)
+                )
+
+                if on_applied then
+                    on_applied()
+                end
+            end)
+
+            if not ok_apply then
+                mags_mp_log(
+                    "state apply runtime error mag=%s error=%s",
+                    tostring(magazine_server_id),
+                    tostring(apply_err)
+                )
+
+                return false
             end
 
             return true
@@ -744,21 +761,42 @@ function Patch()
                     tostring(request_sequence)
                 )
 
-                local ok, err = pcall(
-                    magazines.unload_operation_result,
-                    payload
+                local ack_event_id =
+                    "mags_unload_local_ack_"
+                    .. tostring(magazine_server_id)
+                    .. "_"
+                    .. tostring(request_sequence)
+
+                CreateTimeEvent(
+                    "mag_redux",
+                    ack_event_id,
+                    0.01,
+                    function()
+                        local ok, err = pcall(
+                            magazines.unload_operation_result,
+                            payload
+                        )
+
+                        if not ok then
+                            mags_mp_log(
+                                "local ACK failed mag=%s seq=%s error=%s",
+                                tostring(magazine_server_id),
+                                tostring(request_sequence),
+                                tostring(err)
+                            )
+
+                            cancel_local_unload(
+                                magazine_server_id,
+                                "local ACK failed: "
+                                    .. tostring(err)
+                            )
+                        end
+
+                        return true
+                    end
                 )
 
-                if not ok then
-                    mags_mp_log(
-                        "local ACK failed mag=%s seq=%s error=%s",
-                        tostring(magazine_server_id),
-                        tostring(request_sequence),
-                        tostring(err)
-                    )
-                end
-
-                return ok
+                return true
             end
 
             local ok, err = pcall(function()
@@ -978,6 +1016,15 @@ function Patch()
             )
 
             if parent_kind == "actor" then
+                if IsInvbox(parent)
+                or (
+                    IsStalker(parent)
+                    and not parent:alive()
+                )
+                then
+                    return false, "actor_kind_mismatch"
+                end
+
                 return true
             end
 
@@ -1341,19 +1388,24 @@ function Patch()
             end
 
             local delay = magazines.get_mag_time(magazine:section(), true)
+            local request_sequence = session.sequence + 1
+            local step_event_id =
+                session.event_id
+                .. "_"
+                .. tostring(request_sequence)
 
             mags_mp_log(
                 "next step scheduled mag=%s requester=%s seq=%s expected=%s delay=%s",
                 tostring(magazine_server_id),
                 tostring(session.requester_netid),
-                tostring(session.sequence + 1),
+                tostring(request_sequence),
                 tostring(session.expected_count),
                 tostring(delay)
             )
 
             CreateTimeEvent(
                 "mag_redux",
-                session.event_id,
+                step_event_id,
                 delay,
                 function()
                     local ok, finished = pcall(function()
