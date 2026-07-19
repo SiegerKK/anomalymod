@@ -7,6 +7,7 @@ local magazines_ref = nil
 local game_manager_ref = nil
 local create_ammo_at_load = _G.create_ammo
 local watchers = {}
+local owner_watcher_keys = {}
 local inventory_limit = 250
 
 local function safe_try(fn)
@@ -279,8 +280,12 @@ local function item_record(item)
     local loaded_state = safe_loaded_state(item)
     local is_mag = is_magazine_object(item)
     local is_ammo = is_ammo_object(item)
+    local object_kind = "other"
+    if is_mag then object_kind = "magazine"
+    elseif is_ammo then object_kind = "ammo" end
     return {
         obj = item,
+        object_kind = object_kind,
         local_id = safe_object_id(item),
         server_id = safe_server_id(safe_object_id(item)),
         section = safe_section(item),
@@ -294,12 +299,12 @@ local function item_record(item)
     }
 end
 
-local function inventory_object_map(owner, probe, phase, owner_label)
+local function inventory_object_map(owner, probe, phase, owner_label, include_other)
     local map = {}
     if not owner then return map end
     for _, item in ipairs(collect_inventory(owner, probe, phase, owner_label)) do
         local rec = item_record(item)
-        if (rec.is_magazine or rec.is_ammo) and rec.local_id ~= nil then map[tostring(rec.local_id)] = rec end
+        if (include_other or rec.is_magazine or rec.is_ammo) and rec.local_id ~= nil then map[tostring(rec.local_id)] = rec end
     end
     return map
 end
@@ -419,24 +424,42 @@ end
 
 local function log_delta(probe, target, prev, cur)
     prev = prev or {}
-    for id, rec in pairs(cur or {}) do
+    cur = cur or {}
+    for id, rec in pairs(cur) do
         local old = prev[id]
         if not old then
-            local event = rec.is_ammo and "ammo_object_added" or "magazine_object_added"
-            log_line(probe, "watch_change", event, {{"target", target}, {"local_id", rec.local_id}, {"server_id", rec.server_id}, {"section", rec.section}, {"parent_local_id", rec.parent_local_id}, {"count", rec.ammo_count}, {"mag_data_status", rec.loaded_state.status}, {"loaded", rec.loaded_state.status == "ok" and array_string(rec.loaded_state.loaded) or "<unavailable>"}})
+            local event = "other_object_added"
+            if rec.object_kind == "ammo" then event = "ammo_object_added"
+            elseif rec.object_kind == "magazine" then event = "magazine_object_added" end
+            log_line(probe, "watch_change", event, {{"target", target}, {"object_kind", rec.object_kind}, {"local_id", rec.local_id}, {"server_id", rec.server_id}, {"section", rec.section}, {"parent_local_id", rec.parent_local_id}, {"count", rec.ammo_count}, {"mag_data_status", rec.loaded_state.status}, {"loaded", rec.loaded_state.status == "ok" and array_string(rec.loaded_state.loaded) or "<unavailable>"}})
             if rec.is_ammo and rec.obj then schedule_server_id_checks(probe, rec.obj, "new_ammo:" .. tostring(rec.local_id)) end
         else
-            if old.server_id == nil and rec.server_id ~= nil then log_line(probe, "watch_change", "server_id_assigned", {{"target", target}, {"local_id", rec.local_id}, {"old_server_id", old.server_id}, {"new_server_id", rec.server_id}}) end
-            if old.server_id ~= rec.server_id then log_line(probe, "watch_change", "server_id_changed", {{"target", target}, {"local_id", rec.local_id}, {"old_server_id", old.server_id}, {"new_server_id", rec.server_id}}) end
-            if old.section ~= rec.section then log_line(probe, "watch_change", "section_changed", {{"target", target}, {"local_id", rec.local_id}, {"old_section", old.section}, {"new_section", rec.section}}) end
-            if old.server_id ~= rec.server_id or old.section ~= rec.section then log_line(probe, "watch_change", "object_identity_changed", {{"target", target}, {"local_id", rec.local_id}, {"old_server_id", old.server_id}, {"new_server_id", rec.server_id}, {"old_section", old.section}, {"new_section", rec.section}}) end
+            local identity_changed = false
+            if old.server_id == nil and rec.server_id ~= nil then
+                log_line(probe, "watch_change", "server_id_assigned", {{"target", target}, {"local_id", rec.local_id}, {"old_server_id", old.server_id}, {"new_server_id", rec.server_id}})
+            elseif old.server_id ~= nil and rec.server_id == nil then
+                log_line(probe, "watch_change", "server_id_lost", {{"target", target}, {"local_id", rec.local_id}, {"old_server_id", old.server_id}, {"new_server_id", rec.server_id}})
+            elseif old.server_id ~= nil and rec.server_id ~= nil and old.server_id ~= rec.server_id then
+                log_line(probe, "watch_change", "server_id_changed", {{"target", target}, {"local_id", rec.local_id}, {"old_server_id", old.server_id}, {"new_server_id", rec.server_id}})
+                identity_changed = true
+            end
+            if old.section ~= rec.section then
+                log_line(probe, "watch_change", "section_changed", {{"target", target}, {"local_id", rec.local_id}, {"old_section", old.section}, {"new_section", rec.section}})
+                identity_changed = true
+            end
+            if identity_changed then log_line(probe, "watch_change", "object_identity_changed", {{"target", target}, {"object_kind", rec.object_kind}, {"local_id", rec.local_id}, {"old_server_id", old.server_id}, {"new_server_id", rec.server_id}, {"old_section", old.section}, {"new_section", rec.section}}) end
             if old.parent_local_id ~= rec.parent_local_id or old.parent_server_id ~= rec.parent_server_id then log_line(probe, "watch_change", "parent_changed", {{"target", target}, {"local_id", rec.local_id}, {"old_parent_local_id", old.parent_local_id}, {"new_parent_local_id", rec.parent_local_id}, {"old_parent_server_id", old.parent_server_id}, {"new_parent_server_id", rec.parent_server_id}}) end
             if rec.is_ammo and old.ammo_count ~= rec.ammo_count then log_line(probe, "watch_change", "ammo_count_changed", {{"target", target}, {"local_id", rec.local_id}, {"section", rec.section}, {"old_count", old.ammo_count}, {"new_count", rec.ammo_count}}) end
             if rec.is_magazine and (old.loaded_state.status ~= rec.loaded_state.status or old.loaded_fp ~= rec.loaded_fp) then log_line(probe, "watch_change", "magazine_loaded_changed", {{"target", target}, {"local_id", rec.local_id}, {"old_mag_data_status", old.loaded_state.status}, {"new_mag_data_status", rec.loaded_state.status}, {"old_loaded", old.loaded_fp}, {"new_loaded", rec.loaded_fp}}) end
         end
     end
     for id, rec in pairs(prev or {}) do
-        if not cur[id] then log_line(probe, "watch_change", rec.is_ammo and "ammo_object_removed" or "magazine_object_removed", {{"target", target}, {"local_id", rec.local_id}, {"server_id", rec.server_id}, {"section", rec.section}, {"count", rec.ammo_count}}) end
+        if not cur[id] then
+            local event = "other_object_removed"
+            if rec.object_kind == "ammo" then event = "ammo_object_removed"
+            elseif rec.object_kind == "magazine" then event = "magazine_object_removed" end
+            log_line(probe, "watch_change", event, {{"target", target}, {"object_kind", rec.object_kind}, {"local_id", rec.local_id}, {"server_id", rec.server_id}, {"section", rec.section}, {"count", rec.ammo_count}})
+        end
     end
 end
 
@@ -444,6 +467,37 @@ local function build_watcher_map(w)
     if w.owner then return inventory_object_map(w.owner, w.probe, "watch_change", w.target) end
     if w.local_id then return single_object_map(w.local_id) end
     return {}
+end
+
+local function run_watcher_tick(key)
+    local state = watchers[key]
+    if not state or not db or not db.actor then watchers[key] = nil; return end
+    local current_objects = build_watcher_map(state)
+    local fp = watch_snapshot(state, current_objects)
+    log_delta(state.probe, state.target, state.objects, current_objects)
+    state.objects = current_objects
+    if fp ~= state.last then
+        log_line(state.probe, "watch_change", "fingerprint_changed", {{"target", state.target}, {"previous", state.last}, {"new", fp}, {"elapsed", now() - state.start}})
+        if state.local_id then log_magazine_snapshot(state.probe, "watch_change", "watch_object_state", object_by_local_id(state.local_id), {{"target", state.target}}) end
+        if state.owner then dump_inventory(state.probe, "watch_change", state.owner, state.target) end
+        state.last = fp
+    end
+    if now() - state.start >= 15000 then log_line(state.probe, "watch_complete", "watcher_done", {{"target", state.target}, {"elapsed", now() - state.start}}); watchers[key] = nil end
+end
+
+local function schedule_watcher_tick(key)
+    CreateTimeEvent("magdiag", key, 0.15, function()
+        local state = watchers[key]
+        if not state then return true end
+        local ok = run_diagnostic(state.probe, "watch_change", "watcher_callback", function() run_watcher_tick(key) end)
+        state = watchers[key]
+        if not ok and state then
+            state.error_count = (state.error_count or 0) + 1
+            if state.error_count >= 3 then log_line(state.probe, "watch_complete", "watcher_stopped_after_errors", {{"target", state.target}, {"error_count", state.error_count}}); watchers[key] = nil; return true end
+        end
+        if watchers[key] then schedule_watcher_tick(key) end
+        return true
+    end)
 end
 
 local function start_watcher(probe, target, local_id, owner)
@@ -454,34 +508,20 @@ local function start_watcher(probe, target, local_id, owner)
     w.last = watch_snapshot(w, initial)
     watchers[key] = w
     log_line(probe, "watch_change", "watch_baseline", {{"target", target}, {"magazine_objects", mags}, {"ammo_objects", ammo}, {"fingerprint", w.last}})
-    CreateTimeEvent("magdiag", key, 0.15, function()
-        local done = false
-        local ok = run_diagnostic(probe, "watch_change", "watcher_callback", function()
-            local state = watchers[key]
-            if not state or not db or not db.actor then watchers[key] = nil; done = true; return end
-            local current_objects = build_watcher_map(state)
-            local fp = watch_snapshot(state, current_objects)
-            log_delta(probe, target, state.objects, current_objects)
-            state.objects = current_objects
-            if fp ~= state.last then
-                log_line(probe, "watch_change", "fingerprint_changed", {{"target", target}, {"previous", state.last}, {"new", fp}, {"elapsed", now() - state.start}})
-                if local_id then log_magazine_snapshot(probe, "watch_change", "watch_magazine_state", object_by_local_id(local_id), {{"target", target}}) end
-                if owner then dump_inventory(probe, "watch_change", owner, target) end
-                state.last = fp
-            end
-            if now() - state.start >= 15000 then log_line(probe, "watch_complete", "watcher_done", {{"target", target}, {"elapsed", now() - state.start}}); watchers[key] = nil; done = true end
-        end)
-        if not ok then
-            local state = watchers[key]
-            if state then
-                state.error_count = (state.error_count or 0) + 1
-                if state.error_count >= 3 then log_line(probe, "watch_complete", "watcher_stopped_after_errors", {{"target", target}, {"error_count", state.error_count}}); watchers[key] = nil; done = true end
-            else
-                done = true
-            end
-        end
-        return done
-    end)
+    schedule_watcher_tick(key)
+end
+
+local function start_owner_watcher(probe, target, owner)
+    if not owner then return false end
+    local owner_id = safe_object_id(owner)
+    local dedupe_key = probe .. ":owner:" .. tostring(owner_id)
+    if owner_watcher_keys[dedupe_key] then
+        log_line(probe, "watch_change", "watcher_deduped", {{"target", target}, {"existing_target", owner_watcher_keys[dedupe_key]}, {"owner_local_id", owner_id}})
+        return false
+    end
+    owner_watcher_keys[dedupe_key] = target
+    start_watcher(probe, target, nil, owner)
+    return true
 end
 
 local function send_probe(probe, obj, behavior, gui_shown)
@@ -502,7 +542,9 @@ local function begin_unload_probe(obj)
         dump_actor_map(probe, "actor_map", my_netid())
         dump_inventory(probe, "inventory_scan", safe_parent(obj), "magazine_parent")
         send_probe(probe, obj, behavior, gui_shown)
-        start_watcher(probe, "client_actor_inventory", nil, db and db.actor)
+        start_owner_watcher(probe, "client_actor_inventory", db and db.actor)
+        local parent = safe_parent(obj)
+        if parent and safe_object_id(parent) ~= safe_object_id(db and db.actor) then start_owner_watcher(probe, "client_parent_inventory:" .. tostring(safe_object_id(parent)), parent) end
         start_watcher(probe, "client_magazine", safe_object_id(obj), nil)
         schedule_server_id_checks(probe, obj, "probe_magazine")
     end)
@@ -572,7 +614,7 @@ local function install_handlers()
                         log_line(probe, "candidate_scan", "magazine_candidate", {{"actor_record_key", actor_rec.key}, {"actor_local_id", safe_object_id(remote_actor)}, {"candidate_local_id", safe_object_id(item)}, {"candidate_server_id", safe_server_id(safe_object_id(item))}, {"section", safe_section(item)}, {"parent_local_id", safe_parent_id(item)}, {"mag_data_status", state.status}, {"mag_data_error", state.error}, {"loaded", state.status == "ok" and array_string(state.loaded) or "<unavailable>"}, {"section_match", section_ok}, {"loaded_count_match", count_ok}, {"exact_loaded_match", exact_ok}, {"reported_server_id_match", safe_server_id(safe_object_id(item)) ~= nil and client_server ~= nil and safe_server_id(safe_object_id(item)) == client_server}})
                     end
                 end
-                start_watcher(probe, actor_label, nil, remote_actor)
+                start_owner_watcher(probe, actor_label, remote_actor)
             end
             if #remote_actors == 0 then log_line(probe, "watch_complete", "watcher_not_started", {{"target", "remote_actor_inventory"}, {"reason", "remote_actor_missing"}}) end
             log_line(probe, "candidate_scan", "summary", {{"remote_actor_found", #remote_actors > 0}, {"remote_actor_count", #remote_actors}, {"remote_actor_ambiguous", #remote_actors > 1}, {"candidate_count", candidates}, {"exact_candidate_count", exact}, {"ambiguous", exact > 1 or #remote_actors > 1}})
@@ -581,7 +623,9 @@ local function install_handlers()
             GameManager:OnICustomScriptAction("magazines", "mags_diag_probe_reply", serialize_table_simple(reply), false, requester)
             log_line(probe, "host_reply_sent", "probe_reply", {{"target_netid", requester}, {"candidate_count", candidates}, {"exact_candidate_count", exact}, {"remote_actor_count", #remote_actors}})
             start_watcher(probe, "direct_resolution", direct_local, nil)
-            start_watcher(probe, "host_actor_inventory", nil, db and db.actor)
+            local direct_parent = safe_parent(direct_obj)
+            if direct_parent then start_owner_watcher(probe, "direct_parent_inventory:" .. tostring(safe_object_id(direct_parent)), direct_parent) end
+            start_owner_watcher(probe, "host_actor_inventory", db and db.actor)
             if direct_obj then schedule_server_id_checks(probe, direct_obj, "direct_resolution") end
         end)
     end
@@ -598,7 +642,7 @@ local function install_handlers()
 end
 
 local function dump_later(probe, phase, netid, delay)
-    CreateTimeEvent("magdiag_actor_map", phase .. tostring(netid) .. tostring(delay), delay, function()
+    CreateTimeEvent("magdiag_actor_map", probe .. ":" .. phase .. ":" .. tostring(delay), delay, function()
         run_diagnostic(probe, "actor_map", "connection_dump", function()
             log_line(probe, phase, "delayed_actor_map", {{"player_netid", netid}, {"delay", delay}})
             dump_actor_map(probe, "actor_map", netid)
@@ -633,11 +677,13 @@ function install(magazines, game_manager)
     install_handlers()
     install_callbacks()
     if magazines.func_unload_ammo == wrapped_unload then return end
-    wrapped_original = magazines.func_unload_ammo
-    wrapped_unload = function(obj, ...)
+    local original = magazines.func_unload_ammo
+    local new_wrapper = function(obj, ...)
         begin_unload_probe(obj)
-        return wrapped_original(obj, ...)
+        return original(obj, ...)
     end
-    magazines.func_unload_ammo = wrapped_unload
+    wrapped_original = original
+    wrapped_unload = new_wrapper
+    magazines.func_unload_ammo = new_wrapper
     log_line("install:" .. tostring(now()), "install", "installed", {{"create_ammo_type", type(_G.create_ammo)}, {"same_create_ammo", _G.create_ammo == create_ammo_at_load}, {"wrapped", true}})
 end
