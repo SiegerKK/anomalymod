@@ -80,7 +80,6 @@ local OLDGRAREWARD = raid_utils and raid_utils.give_task_reward
 -- Magazines
 local OLDUNJECMAGS = magazines and magazines.func_unload_ammo
 local OLDEJECTMAGS = magazines and magazines.eject_magazine
-local ORIGINAL_CREATE_AMMO = create_ammo
 
 -- Loot claim
 local OLDLRCLAIMSP = grok_loot_claim and grok_loot_claim.npc_on_death_callback
@@ -592,19 +591,76 @@ function Patch()
             end
         end
 
+        local function host_actor_for_netid(netid)
+            if not netid then
+                return nil
+            end
+
+            if same_netid(netid, GameManager:GetMySNETID()) then
+                return db.actor
+            end
+
+            for object_id, record in pairs(db.actors or {}) do
+                if record
+                and record.object
+                and same_netid(record.netid, netid)
+                then
+                    mags_mp_log(
+                        "remote actor resolved requester=%s actor=%s record=%s",
+                        tostring(netid),
+                        tostring(record.object:id()),
+                        tostring(object_id)
+                    )
+                    return record.object
+                end
+            end
+
+            return nil
+        end
+
+        local function host_find_existing_partial_ammo(parent, ammo_section, box_size)
+            local found
+
+            local function itr_box(_, item)
+                if found
+                or not item
+                or item:section() ~= ammo_section
+                or not item.ammo_get_count
+                or not item.ammo_set_count
+                then
+                    return
+                end
+
+                local count = item:ammo_get_count()
+
+                if count < box_size then
+                    found = item
+                end
+            end
+
+            pcall(function()
+                if IsInvbox(parent) then
+                    parent:iterate_inventory_box(itr_box)
+                else
+                    parent:iterate_inventory(itr_box)
+                end
+            end)
+
+            return found
+        end
+
         local function host_find_credit_box(parent, ammo_section, host_session)
             local credit = host_session
                 and host_session.ammo_boxes
                 and host_session.ammo_boxes[ammo_section]
 
             if not credit
-            or not credit.server_id
+            or not credit.local_id
             then
                 return nil, nil
             end
 
-            local local_id = GameManager:GetLocalIDByServerID(credit.server_id)
-            local ammo_obj = local_id and level.object_by_id(local_id)
+            local ammo_obj = level.object_by_id(credit.local_id)
 
             if not ammo_obj
             or ammo_obj:section() ~= ammo_section
@@ -622,11 +678,14 @@ function Patch()
                 return nil, nil
             end
 
+            credit.count = current_count
             return ammo_obj, credit
         end
 
         local function host_credit_one_round(parent, ammo_section, host_session)
-            if not host_session then
+            if not host_session
+            or not parent
+            then
                 return false, nil
             end
 
@@ -645,27 +704,53 @@ function Patch()
                 host_session
             )
 
+            if not ammo_obj then
+                ammo_obj = host_find_existing_partial_ammo(
+                    parent,
+                    ammo_section,
+                    box_size
+                )
+
+                if ammo_obj then
+                    local local_id = ammo_obj:id()
+                    credit = {
+                        local_id = local_id,
+                        server_id = GameManager:GetServerIDByLocalID(local_id),
+                        count = ammo_obj:ammo_get_count(),
+                        box_size = box_size
+                    }
+                    host_session.ammo_boxes[ammo_section] = credit
+                end
+            end
+
             if ammo_obj and credit then
                 local old_count = ammo_obj:ammo_get_count()
                 local new_count = old_count + 1
-                ammo_obj:ammo_set_count(new_count)
 
-                credit.count = new_count
+                if new_count > box_size then
+                    host_session.ammo_boxes[ammo_section] = nil
+                    ammo_obj = nil
+                    credit = nil
+                else
+                    ammo_obj:ammo_set_count(new_count)
 
-                local server_id = credit.server_id
+                    credit.count = new_count
+                    credit.server_id = GameManager:GetServerIDByLocalID(credit.local_id)
 
-                return true, {
-                    ammo_server_id = server_id,
-                    old_count = old_count,
-                    new_count = new_count,
-                    created_new = false,
-                    rollback = function()
-                        pcall(function()
-                            ammo_obj:ammo_set_count(old_count)
-                        end)
-                        credit.count = old_count
-                    end
-                }
+                    return true, {
+                        ammo_server_id = credit.server_id,
+                        ammo_local_id = credit.local_id,
+                        old_count = old_count,
+                        new_count = new_count,
+                        created_new = false,
+                        rollback = function()
+                            pcall(function()
+                                ammo_obj:ammo_set_count(old_count)
+                            end)
+                            credit.count = old_count
+                        end
+                    }
+                end
             end
 
             local created_ids = {}
@@ -682,9 +767,10 @@ function Patch()
             end
 
             local created_id = created_ids[1]
-            local server_id = GameManager:GetServerIDByLocalID(created_id) or created_id
+            local server_id = GameManager:GetServerIDByLocalID(created_id)
 
             host_session.ammo_boxes[ammo_section] = {
+                local_id = created_id,
                 server_id = server_id,
                 count = 1,
                 box_size = box_size
@@ -692,13 +778,14 @@ function Patch()
 
             return true, {
                 ammo_server_id = server_id,
+                ammo_local_id = created_id,
                 old_count = 0,
                 new_count = 1,
                 created_new = true,
                 rollback = function()
                     host_release_created_ammo({ created_id })
                     if host_session.ammo_boxes[ammo_section]
-                    and host_session.ammo_boxes[ammo_section].server_id == server_id
+                    and host_session.ammo_boxes[ammo_section].local_id == created_id
                     then
                         host_session.ammo_boxes[ammo_section] = nil
                     end
@@ -770,7 +857,13 @@ function Patch()
             return ok
         end
 
-        local function apply_authoritative_mag_state(magazine_server_id, loaded, attempt, on_applied)
+        local function apply_authoritative_mag_state(
+            magazine_server_id,
+            loaded,
+            attempt,
+            on_applied,
+            on_failed
+        )
             attempt = attempt or 1
 
             local local_id = GameManager:GetLocalIDByServerID(magazine_server_id)
@@ -787,7 +880,8 @@ function Patch()
                                 magazine_server_id,
                                 loaded,
                                 attempt + 1,
-                                on_applied
+                                on_applied,
+                                on_failed
                             )
 
                             return true
@@ -801,6 +895,10 @@ function Patch()
                     "state apply failed: magazine missing mag=%s",
                     tostring(magazine_server_id)
                 )
+
+                if on_failed then
+                    on_failed("magazine_missing")
+                end
 
                 return false
             end
@@ -818,7 +916,8 @@ function Patch()
                                 magazine_server_id,
                                 loaded,
                                 attempt + 1,
-                                on_applied
+                                on_applied,
+                                on_failed
                             )
 
                             return true
@@ -832,6 +931,10 @@ function Patch()
                     "state apply failed: mag data missing mag=%s",
                     tostring(magazine_server_id)
                 )
+
+                if on_failed then
+                    on_failed("mag_data_missing")
+                end
 
                 return false
             end
@@ -863,6 +966,10 @@ function Patch()
                     tostring(magazine_server_id),
                     tostring(apply_err)
                 )
+
+                if on_failed then
+                    on_failed(tostring(apply_err))
+                end
 
                 return false
             end
@@ -905,7 +1012,9 @@ function Patch()
                 request_sequence,
                 success and true or false,
                 error_code or "",
-                copy_loaded(authoritative_loaded),
+                type(authoritative_loaded) == "table"
+                    and copy_loaded(authoritative_loaded)
+                    or false,
                 mode,
                 ammo_section
             }
@@ -987,7 +1096,7 @@ function Patch()
                 tostring(mode),
                 tostring(success),
                 tostring(error_code),
-                tostring(#(authoritative_loaded or {}))
+                tostring(type(authoritative_loaded) == "table" and #authoritative_loaded or "nil")
             )
 
             return ok
@@ -1001,15 +1110,15 @@ function Patch()
             or not mag_data
             or type(mag_data.loaded) ~= "table"
             then
-                return false, "invalid_state"
+                return false, "invalid_state", get_authoritative_loaded_safe(magazine)
             end
 
             if #mag_data.loaded == 0 then
-                return false, "already_empty"
+                return false, "already_empty", copy_loaded(mag_data.loaded)
             end
 
             if #mag_data.loaded ~= expected_round_count then
-                return false, "stale_count"
+                return false, "stale_count", copy_loaded(mag_data.loaded)
             end
 
             local original_loaded = copy_loaded(mag_data.loaded)
@@ -1018,7 +1127,7 @@ function Patch()
             if type(ammo_section) ~= "string"
             or ammo_section == ""
             then
-                return false, "invalid_ammo"
+                return false, "invalid_ammo", copy_loaded(mag_data.loaded)
             end
 
             local credited, credit = host_credit_one_round(
@@ -1028,7 +1137,7 @@ function Patch()
             )
 
             if not credited then
-                return false, "ammo_credit_failed"
+                return false, "ammo_credit_failed", copy_loaded(mag_data.loaded)
             end
 
             stack.pop(mag_data.loaded)
@@ -1050,7 +1159,7 @@ function Patch()
                     magazine:id(),
                     mag_data
                 )
-                return false, "save_failed"
+                return false, "save_failed", copy_loaded(mag_data.loaded)
             end
 
             sync_credited_ammo(credit)
@@ -1158,11 +1267,15 @@ function Patch()
             return true, nil, {}, nil
         end
 
-        local function execute_host_remote_unload_step(shadow, expected_round_count)
+        local function execute_host_remote_unload_step(
+            shadow,
+            expected_round_count,
+            parent
+        )
             if not shadow
             or type(shadow.loaded) ~= "table"
             then
-                return false, "invalid_shadow"
+                return false, "invalid_shadow", {}
             end
 
             if #shadow.loaded == 0 then
@@ -1173,6 +1286,7 @@ function Patch()
                 return false, "stale_count", copy_loaded(shadow.loaded)
             end
 
+            local original_loaded = copy_loaded(shadow.loaded)
             local ammo_section = shadow.loaded[#shadow.loaded]
 
             if type(ammo_section) ~= "string"
@@ -1181,9 +1295,76 @@ function Patch()
                 return false, "invalid_ammo", copy_loaded(shadow.loaded)
             end
 
-            stack.pop(shadow.loaded)
+            local credited, credit = host_credit_one_round(
+                parent,
+                ammo_section,
+                shadow
+            )
 
-            return true, nil, copy_loaded(shadow.loaded), ammo_section
+            if not credited then
+                return false, "ammo_credit_failed", copy_loaded(shadow.loaded)
+            end
+
+            stack.pop(shadow.loaded)
+            sync_credited_ammo(credit)
+
+            return true, nil, copy_loaded(shadow.loaded), ammo_section, credit
+        end
+
+        local function execute_host_remote_unload_all(
+            shadow,
+            expected_round_count,
+            parent
+        )
+            if not shadow
+            or type(shadow.loaded) ~= "table"
+            then
+                return false, "invalid_shadow", {}
+            end
+
+            if #shadow.loaded == 0 then
+                return false, "already_empty", copy_loaded(shadow.loaded)
+            end
+
+            if #shadow.loaded ~= expected_round_count then
+                return false, "stale_count", copy_loaded(shadow.loaded)
+            end
+
+            local rollback = {}
+            local last_ammo_section
+
+            while #shadow.loaded > 0 do
+                local ammo_section = shadow.loaded[#shadow.loaded]
+
+                if type(ammo_section) ~= "string"
+                or ammo_section == ""
+                then
+                    for i = #rollback, 1, -1 do
+                        pcall(rollback[i])
+                    end
+                    return false, "invalid_ammo", copy_loaded(shadow.loaded)
+                end
+
+                local credited, credit = host_credit_one_round(
+                    parent,
+                    ammo_section,
+                    shadow
+                )
+
+                if not credited then
+                    for i = #rollback, 1, -1 do
+                        pcall(rollback[i])
+                    end
+                    return false, "ammo_credit_failed", copy_loaded(shadow.loaded)
+                end
+
+                rollback[#rollback + 1] = credit.rollback
+                stack.pop(shadow.loaded)
+                sync_credited_ammo(credit)
+                last_ammo_section = ammo_section
+            end
+
+            return true, nil, copy_loaded(shadow.loaded), last_ammo_section, nil
         end
 
         local function validate_unload_parent(
@@ -1394,6 +1575,28 @@ function Patch()
                     return
                 end
 
+                local requester_actor = host_actor_for_netid(requester_netid)
+
+                if not requester_actor then
+                    send_unload_result(
+                        requester_netid,
+                        magazine_server_id,
+                        request_sequence,
+                        false,
+                        "remote_actor_missing",
+                        copy_loaded(shadow.loaded),
+                        mode
+                    )
+                    return
+                end
+
+                mags_mp_log(
+                    "remote actor parent requester=%s actor=%s session=%s",
+                    tostring(requester_netid),
+                    tostring(requester_actor:id()),
+                    tostring(session_id)
+                )
+
                 if unload_in_progress[result_key] then
                     send_unload_result(
                         requester_netid,
@@ -1410,9 +1613,18 @@ function Patch()
                 unload_in_progress[result_key] = true
 
                 local ok, result_success, result_error, result_loaded, result_ammo = pcall(function()
+                    if mode == "all" then
+                        return execute_host_remote_unload_all(
+                            shadow,
+                            expected_round_count,
+                            requester_actor
+                        )
+                    end
+
                     return execute_host_remote_unload_step(
                         shadow,
-                        expected_round_count
+                        expected_round_count,
+                        requester_actor
                     )
                 end)
 
@@ -1450,6 +1662,10 @@ function Patch()
                     tostring(ammo_section),
                     tostring(#(loaded or {}))
                 )
+
+                if success and type(loaded) == "table" and #loaded == 0 then
+                    host_remote_sessions[shadow_key] = nil
+                end
 
                 send_unload_result(
                     requester_netid,
@@ -1577,11 +1793,15 @@ function Patch()
                 sequence = request_sequence,
                 success = success and true or false,
                 error_code = error_code or "",
-                loaded = copy_loaded(loaded),
+                loaded = type(loaded) == "table" and copy_loaded(loaded) or nil,
                 mode = mode,
                 expected_count = expected_round_count,
                 ammo_section = ammo_section
             }
+
+            if success and (mode == "all" or (type(loaded) == "table" and #loaded == 0)) then
+                host_unload_sessions[result_key] = nil
+            end
 
             send_unload_result(
                 requester_netid,
@@ -1646,6 +1866,27 @@ function Patch()
             end
 
             local session = local_unload_sessions[magazine_server_id]
+            local remote_session_id = session and session.session_id
+            local remote_initial_loaded = session and session.initial_loaded
+
+            if owner_scope == "remote_actor"
+            and not remote_session_id
+            then
+                local mag_data = magazines.get_mag_data(obj:id())
+
+                if not mag_data
+                or type(mag_data.loaded) ~= "table"
+                then
+                    return false
+                end
+
+                remote_session_id = tostring(requester_netid)
+                    .. ":"
+                    .. tostring(time_global())
+                    .. ":"
+                    .. tostring(obj:id())
+                remote_initial_loaded = copy_loaded(mag_data.loaded)
+            end
 
             local payload = {
                 magazine_server_id,
@@ -1656,8 +1897,8 @@ function Patch()
                 expected_round_count,
                 mode,
                 owner_scope,
-                session and session.session_id,
-                session and session.initial_loaded
+                remote_session_id,
+                remote_initial_loaded
             }
 
             if IIsHost() then
@@ -1710,17 +1951,50 @@ function Patch()
                     and active.awaiting_ack
                     and active.sequence == sequence
                     then
+                        active.ack_retries = (active.ack_retries or 0) + 1
+
                         mags_mp_log(
-                            "ACK timeout mag=%s requester=%s seq=%s expected=%s",
+                            "ACK timeout mag=%s requester=%s seq=%s expected=%s retry=%s",
                             tostring(magazine_server_id),
                             tostring(active.requester_netid),
                             tostring(sequence),
-                            tostring(active.expected_count)
+                            tostring(active.expected_count),
+                            tostring(active.ack_retries)
                         )
-                        cancel_local_unload(
-                            magazine_server_id,
-                            "host timeout"
-                        )
+
+                        if active.ack_retries <= 3 then
+                            local current_local_id =
+                                GameManager:GetLocalIDByServerID(
+                                    magazine_server_id
+                                )
+                            local current_magazine =
+                                current_local_id
+                                and level.object_by_id(current_local_id)
+
+                            if current_magazine then
+                                send_unload_request(
+                                    current_magazine,
+                                    sequence,
+                                    active.expected_count,
+                                    "step"
+                                )
+
+                                start_unload_ack_timeout(
+                                    magazine_server_id,
+                                    sequence
+                                )
+                            else
+                                cancel_local_unload(
+                                    magazine_server_id,
+                                    "magazine missing"
+                                )
+                            end
+                        else
+                            cancel_local_unload(
+                                magazine_server_id,
+                                "host timeout"
+                            )
+                        end
                     end
 
                     return true
@@ -1836,6 +2110,7 @@ function Patch()
 
                         active.sequence = active.sequence + 1
                         active.awaiting_ack = true
+                        active.ack_retries = 0
 
                         local sent = send_unload_request(
                             current_magazine,
@@ -1873,73 +2148,6 @@ function Patch()
             )
         end
 
-        local function local_credit_one_round(session, ammo_section)
-            if not session
-            or type(ammo_section) ~= "string"
-            or ammo_section == ""
-            or not db.actor
-            then
-                return false
-            end
-
-            session.ammo_boxes = session.ammo_boxes or {}
-
-            local box_size = SYS_GetParam(2, ammo_section, "box_size", 1)
-            box_size = tonumber(box_size) or 1
-            if box_size < 1 then box_size = 1 end
-
-            local credit = session.ammo_boxes[ammo_section]
-            local ammo_obj
-
-            if credit and credit.local_id then
-                ammo_obj = level.object_by_id(credit.local_id)
-            end
-
-            if ammo_obj
-            and ammo_obj:parent()
-            and ammo_obj:parent():id() == db.actor:id()
-            and ammo_obj.ammo_get_count
-            and ammo_obj.ammo_set_count
-            and ammo_obj:ammo_get_count() < box_size
-            then
-                local new_count = ammo_obj:ammo_get_count() + 1
-                ammo_obj:ammo_set_count(new_count)
-                credit.count = new_count
-                return true, new_count, false
-            end
-
-            local created = ORIGINAL_CREATE_AMMO and ORIGINAL_CREATE_AMMO(
-                ammo_section,
-                db.actor:position(),
-                db.actor:level_vertex_id(),
-                db.actor:game_vertex_id(),
-                db.actor:id(),
-                1
-            )
-
-            if type(created) ~= "table" then
-                return false
-            end
-
-            local created_id
-            for _, obj in pairs(created) do
-                created_id = get_created_object_id(obj)
-                if created_id then break end
-            end
-
-            if not created_id then
-                return false
-            end
-
-            session.ammo_boxes[ammo_section] = {
-                local_id = created_id,
-                count = 1,
-                box_size = box_size
-            }
-
-            return true, 1, true
-        end
-
         magazines.unload_operation_result = function(data)
             if type(data) ~= "table" then
                 return
@@ -1958,9 +2166,10 @@ function Patch()
             local sequence = tonumber(data[3])
             local success = data[4] and true or false
             local error_code = tostring(data[5] or "")
-            local loaded = data[6] or {}
+            local loaded = data[6]
             local mode = data[7]
             local ammo_section = data[8]
+            local loaded_count = type(loaded) == "table" and #loaded or "nil"
 
             mags_mp_log(
                 "ACK received target=%s mag=%s seq=%s mode=%s success=%s error=%s remaining=%s",
@@ -1970,7 +2179,7 @@ function Patch()
                 tostring(mode),
                 tostring(success),
                 tostring(error_code),
-                tostring(#loaded)
+                tostring(loaded_count)
             )
 
             local session = local_unload_sessions[magazine_server_id]
@@ -1992,7 +2201,15 @@ function Patch()
                 if type(loaded) == "table" then
                     apply_authoritative_mag_state(
                         magazine_server_id,
-                        loaded
+                        loaded,
+                        nil,
+                        nil,
+                        function(reason)
+                            cancel_local_unload(
+                                magazine_server_id,
+                                "state_apply_failed:"..tostring(reason)
+                            )
+                        end
                     )
                 end
 
@@ -2005,27 +2222,11 @@ function Patch()
 
             local function after_state_applied()
                 if mode == "step_remote_actor" then
-                    local active = local_unload_sessions[magazine_server_id]
-                    local credited, count, created_new = local_credit_one_round(
-                        active,
-                        ammo_section
-                    )
-
-                    if not credited then
-                        cancel_local_unload(
-                            magazine_server_id,
-                            "ammo_credit_failed"
-                        )
-                        return
-                    end
-
                     mags_mp_log(
-                        "client ammo box %s mag=%s seq=%s ammo=%s count=%s",
-                        created_new and "created" or "incremented",
+                        "remote actor ammo credited by host mag=%s seq=%s ammo=%s",
                         tostring(magazine_server_id),
                         tostring(sequence),
-                        tostring(ammo_section),
-                        tostring(count)
+                        tostring(ammo_section)
                     )
                 end
 
@@ -2042,7 +2243,7 @@ function Patch()
                     tostring(magazine_server_id),
                     tostring(sequence),
                     tostring(mode),
-                    tostring(#loaded)
+                    tostring(type(loaded) == "table" and #loaded or "nil")
                 )
 
                 CreateTimeEvent(
@@ -2067,7 +2268,7 @@ function Patch()
                     return
                 end
 
-                active.expected_count = #loaded
+                active.expected_count = type(loaded) == "table" and #loaded or 0
 
                 if active.expected_count == 0 then
                     mags_mp_log(
@@ -2100,7 +2301,13 @@ function Patch()
                 magazine_server_id,
                 loaded,
                 nil,
-                after_state_applied
+                after_state_applied,
+                function(reason)
+                    cancel_local_unload(
+                        magazine_server_id,
+                        "state_apply_failed:"..tostring(reason)
+                    )
+                end
             )
 
             if applied == false then
