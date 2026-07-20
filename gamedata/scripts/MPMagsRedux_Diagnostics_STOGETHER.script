@@ -1,5 +1,4 @@
 -- Read-only MagsRedux co-op diagnostics. This module must never mutate gameplay state.
-local callbacks_registered = false
 local handlers_registered = false
 local wrapped_unload = nil
 local magazines_ref = nil
@@ -112,6 +111,38 @@ local function run_diagnostic(probe, phase, operation, fn)
     return ok
 end
 
+local function send_diagnostic_action(probe, phase, function_name, payload, only_host, target)
+    if not game_manager_ref then
+        log_line(probe, phase, "rpc_not_sent", {{"rpc", function_name}, {"reason", "game_manager_missing"}})
+        return false
+    end
+    if not game_manager_ref.OnICustomScriptAction then
+        log_line(probe, phase, "rpc_not_sent", {{"rpc", function_name}, {"reason", "action_method_missing"}})
+        return false
+    end
+    if not serialize_table_simple then
+        log_line(probe, phase, "rpc_not_sent", {{"rpc", function_name}, {"reason", "serializer_missing"}})
+        return false
+    end
+
+    local ok, ignored, err = safe_try(function()
+        local serialized = serialize_table_simple(payload)
+        if target ~= nil then
+            game_manager_ref:OnICustomScriptAction("magazines", function_name, serialized, only_host, target)
+        else
+            game_manager_ref:OnICustomScriptAction("magazines", function_name, serialized, only_host)
+        end
+    end)
+
+    if not ok then
+        log_line(probe, phase, "rpc_not_sent", {{"rpc", function_name}, {"reason", "send_failed"}, {"error", err}})
+        return false
+    end
+
+    log_line(probe, phase, "rpc_sent", {{"rpc", function_name}, {"only_host", only_host}, {"target", target}})
+    return true
+end
+
 local function safe_object_id(obj)
     if not obj then return nil end
     return safe_value(function() return obj:id() end)
@@ -215,31 +246,56 @@ end
 
 local function safe_object_flags(obj)
     local flags = {}
-    local function put(name, fn)
-        local value, err = safe_bool(fn)
+    local function append_bool(name, value, err)
         flags[#flags + 1] = name .. ":" .. tostring(value)
         if err then flags[#flags + 1] = name .. "_error:" .. err end
     end
-    put("IsActor", function() return IsActor and IsActor(obj) end)
-    put("IsStalker", function() return IsStalker and IsStalker(obj) end)
-    put("IsInvbox", function() return IsInvbox and IsInvbox(obj) end)
-    put("IsAmmo", function() return IsAmmo and IsAmmo(obj) end)
-    put("IsWeapon", function() return IsWeapon and IsWeapon(obj) end)
-    put("magazines.is_magazine", function() return magazines_ref and magazines_ref.is_magazine and magazines_ref.is_magazine(obj) end)
-    if obj and obj.alive then put("alive", function() return obj:alive() end) end
+
+    local is_actor, actor_err = safe_bool(function() return IsActor and IsActor(obj) end)
+    local is_stalker, stalker_err = safe_bool(function() return IsStalker and IsStalker(obj) end)
+    local is_invbox, invbox_err = safe_bool(function() return IsInvbox and IsInvbox(obj) end)
+    local is_ammo, ammo_err = safe_bool(function() return IsAmmo and IsAmmo(obj) end)
+    local is_weapon, weapon_err = safe_bool(function() return IsWeapon and IsWeapon(obj) end)
+    local is_magazine, magazine_err = safe_bool(function() return magazines_ref and magazines_ref.is_magazine and magazines_ref.is_magazine(obj) end)
+
+    append_bool("IsActor", is_actor, actor_err)
+    append_bool("IsStalker", is_stalker, stalker_err)
+    append_bool("IsInvbox", is_invbox, invbox_err)
+    append_bool("IsAmmo", is_ammo, ammo_err)
+    append_bool("IsWeapon", is_weapon, weapon_err)
+    append_bool("magazines.is_magazine", is_magazine, magazine_err)
+
+    if (is_actor == true or is_stalker == true) and obj and obj.alive then
+        local alive, alive_err = safe_bool(function() return obj:alive() end)
+        append_bool("alive", alive, alive_err)
+    end
+
     return table.concat(flags, ",")
 end
 
 local function object_kind_for_parent(obj)
-    if not obj then return "nil", nil, false end
+    if not obj then return "nil", nil, false, nil end
     local is_actor = safe_bool(function() return IsActor and IsActor(obj) end)
     local is_stalker = safe_bool(function() return IsStalker and IsStalker(obj) end)
     local is_invbox = safe_bool(function() return IsInvbox and IsInvbox(obj) end)
-    local alive = obj.alive and safe_bool(function() return obj:alive() end) or nil
-    if (is_actor or is_stalker) and (alive == nil or alive == true) then return "live_actor", alive, true end
-    if is_actor or is_stalker then return "corpse", alive, false end
-    if is_invbox then return "invbox", alive, false end
-    return "world_or_other", alive, false
+
+    if is_actor == true or is_stalker == true then
+        local alive, alive_err = nil, nil
+        if obj.alive then alive, alive_err = safe_bool(function() return obj:alive() end) end
+        if alive_err then return "actor_unknown_alive", alive, true, alive_err end
+        if alive == false then return "corpse", alive, false, nil end
+        if alive == true then return "live_actor", alive, true, nil end
+        return "actor_unknown_alive", alive, true, nil
+    end
+
+    if is_invbox == true then return "invbox", nil, false, nil end
+    return "world_or_other", nil, false, nil
+end
+
+local function safe_alive_if_actor(obj)
+    local _, alive, actor_like, alive_err = object_kind_for_parent(obj)
+    if actor_like then return alive, alive_err end
+    return nil, nil
 end
 
 local function log_roundtrip(probe, phase, label, local_id)
@@ -462,7 +518,7 @@ local function dump_actor_map(probe, phase, requester_netid)
                 local rec_netid_num = tonumber(rec_netid)
                 local requester_netid_num = tonumber(requester_netid)
                 if rec_netid_num ~= nil and requester_netid_num ~= nil and rec_netid_num == requester_netid_num then matches = matches + 1 end
-                log_line(probe, phase, "actor_record", {{"key", k}, {"record_type", type(rec)}, {"record_netid", type(rec) == "table" and rec.netid or nil}, {"object", obj and "object" or "nil"}, {"object_local_id", safe_object_id(obj)}, {"object_server_id", safe_server_id(safe_object_id(obj))}, {"object_getnetid", safe_get_netid(obj)}, {"section", safe_section(obj)}, {"name", safe_name(obj)}, {"alive", obj and obj.alive and safe_bool(function() return obj:alive() end)}, {"has_iterate_inventory", obj and obj.iterate_inventory ~= nil}, {"position", safe_position(obj)}, {"level_vertex", safe_level_vertex(obj)}, {"game_vertex", safe_game_vertex(obj)}})
+                log_line(probe, phase, "actor_record", {{"key", k}, {"record_type", type(rec)}, {"record_netid", type(rec) == "table" and rec.netid or nil}, {"object", obj and "object" or "nil"}, {"object_local_id", safe_object_id(obj)}, {"object_server_id", safe_server_id(safe_object_id(obj))}, {"object_getnetid", safe_get_netid(obj)}, {"section", safe_section(obj)}, {"name", safe_name(obj)}, {"alive", safe_alive_if_actor(obj)}, {"has_iterate_inventory", obj and obj.iterate_inventory ~= nil}, {"position", safe_position(obj)}, {"level_vertex", safe_level_vertex(obj)}, {"game_vertex", safe_game_vertex(obj)}})
             end
         end
         log_line(probe, phase, "actor_map_summary", {{"my_snetid", my_netid()}, {"db_actor_id", db and db.actor and safe_object_id(db.actor)}, {"requester_netid", requester_netid}, {"requester_record_matches", matches}})
@@ -471,7 +527,7 @@ end
 
 local function log_local_actor(probe, phase)
     local actor = db and db.actor
-    log_line(probe, phase, "local_actor", {{"local_id", safe_object_id(actor)}, {"server_id", safe_server_id(safe_object_id(actor))}, {"getnetid", safe_get_netid(actor)}, {"section", safe_section(actor)}, {"name", safe_name(actor)}, {"position", safe_position(actor)}, {"level_vertex", safe_level_vertex(actor)}, {"game_vertex", safe_game_vertex(actor)}, {"alive", actor and actor.alive and safe_bool(function() return actor:alive() end)}, {"has_iterate_inventory", actor and actor.iterate_inventory ~= nil}})
+    log_line(probe, phase, "local_actor", {{"local_id", safe_object_id(actor)}, {"server_id", safe_server_id(safe_object_id(actor))}, {"getnetid", safe_get_netid(actor)}, {"section", safe_section(actor)}, {"name", safe_name(actor)}, {"position", safe_position(actor)}, {"level_vertex", safe_level_vertex(actor)}, {"game_vertex", safe_game_vertex(actor)}, {"alive", safe_alive_if_actor(actor)}, {"has_iterate_inventory", actor and actor.iterate_inventory ~= nil}})
     log_roundtrip(probe, phase, "local_actor", safe_object_id(actor))
 end
 
@@ -680,17 +736,29 @@ local function send_probe(probe, obj, behavior, gui_shown)
     local parent = safe_parent(obj)
     local client_parent_kind = object_kind_for_parent(parent)
     local payload = { rpc_value(probe), rpc_value(my_netid()), rpc_value(safe_object_id(obj)), rpc_value(safe_server_id(safe_object_id(obj))), rpc_value(safe_section(obj)), rpc_value(safe_parent_id(obj)), rpc_value(safe_parent_server_id(obj)), rpc_value(safe_get_netid(parent)), rpc_value(loaded_state.status == "ok" and loaded_state.loaded or nil), rpc_value(behavior), rpc_value(gui_shown), rpc_value(now()), rpc_value(loaded_state.status), rpc_value(loaded_state.error), rpc_value(client_parent_kind) }
-    GameManager:OnICustomScriptAction("magazines", "mags_diag_probe_request", serialize_table_simple(payload), true)
-    log_line(probe, "client_probe_sent", "probe_request", {{"client_mag_local_id", payload[3]}, {"client_mag_server_id", payload[4]}, {"mag_data_status", loaded_state.status}, {"loaded", loaded_state.status == "ok" and array_string(payload[9]) or "<unavailable>"}})
+    local sent = send_diagnostic_action(probe, "client_probe_sent", "mags_diag_probe_request", payload, true)
+    log_line(probe, "client_probe_sent", "probe_request", {{"sent", sent}, {"client_mag_local_id", payload[3]}, {"client_mag_server_id", payload[4]}, {"mag_data_status", loaded_state.status}, {"loaded", loaded_state.status == "ok" and array_string(payload[9]) or "<unavailable>"}})
 end
 
 local function begin_unload_probe(obj)
     local probe = tostring(my_netid()) .. ":" .. tostring(now()) .. ":" .. tostring(safe_object_id(obj))
-    run_diagnostic(probe, "pre_unload", "begin_unload_probe", function()
-        local behavior, gui_shown = unload_config(probe, obj)
+    local behavior = nil
+    local gui_shown = nil
+
+    run_diagnostic(probe, "pre_unload", "read_unload_config", function()
+        behavior, gui_shown = unload_config(probe, obj)
         log_line(probe, "pre_unload", "create_ammo_state", {{"create_ammo_type", type(_G.create_ammo)}, {"create_ammo", tostring(_G.create_ammo)}, {"same_as_module_load", _G.create_ammo == create_ammo_at_load}})
+    end)
+
+    run_diagnostic(probe, "pre_unload", "initial_magazine_snapshot", function()
         log_magazine_snapshot(probe, "pre_unload", "magazine_state", obj)
+    end)
+
+    run_diagnostic(probe, "client_probe_sent", "send_probe", function()
         send_probe(probe, obj, behavior, gui_shown)
+    end)
+
+    run_diagnostic(probe, "watch_change", "start_client_watchers", function()
         start_owner_watcher(probe, "client_actor_inventory", db and db.actor)
         local parent = safe_parent(obj)
         if parent and safe_object_id(parent) ~= safe_object_id(db and db.actor) then start_owner_watcher(probe, "client_parent_inventory:" .. tostring(safe_object_id(parent)), parent) end
@@ -699,19 +767,61 @@ local function begin_unload_probe(obj)
     end)
 end
 
-local function find_remote_actors(requester_netid)
-    local result = {}
+local function find_remote_actors(probe, requester_netid)
+    local matches = {}
+    local unique = {}
+    local seen = {}
+    local stats = {
+        matching_record_count = 0,
+        unique_remote_actor_count = 0,
+        object_getnetid_match_count = 0,
+        record_netid_fallback_match_count = 0,
+        netid_conflict_count = 0
+    }
+    local requester_num = tonumber(requester_netid)
+
     if db and db.actors then
         for key, rec in pairs(db.actors) do
-            local rec_netid_num = type(rec) == "table" and tonumber(rec.netid) or nil
-            local requester_netid_num = tonumber(requester_netid)
-            if type(rec) == "table" and rec_netid_num ~= nil and requester_netid_num ~= nil and rec_netid_num == requester_netid_num and rec.object then
-                result[#result + 1] = { key = key, object = rec.object }
+            local obj = type(rec) == "table" and rec.object or nil
+            local record_netid = type(rec) == "table" and rec.netid or nil
+            local object_netid = safe_get_netid(obj)
+            local object_netid_num = tonumber(object_netid)
+            local record_netid_num = tonumber(record_netid)
+            local object_netid_match = requester_num ~= nil and object_netid_num ~= nil and requester_num == object_netid_num
+            local record_netid_match = requester_num ~= nil and record_netid_num ~= nil and requester_num == record_netid_num
+            local netid_conflict = object_netid_num ~= nil and record_netid_num ~= nil and object_netid_num ~= record_netid_num
+            local selected_match_method = "none"
+
+            if object_netid_match then
+                selected_match_method = "object_getnetid"
+                stats.object_getnetid_match_count = stats.object_getnetid_match_count + 1
+            elseif object_netid == nil and record_netid_match then
+                selected_match_method = "record_netid_fallback"
+                stats.record_netid_fallback_match_count = stats.record_netid_fallback_match_count + 1
+            end
+            if netid_conflict then stats.netid_conflict_count = stats.netid_conflict_count + 1 end
+
+            log_line(probe, "candidate_scan", "actor_match_evidence", {{"actor_record_key", key}, {"record_netid", record_netid}, {"object_getnetid", object_netid}, {"requester_netid", requester_netid}, {"object_netid_numeric", object_netid_num ~= nil}, {"record_netid_numeric", record_netid_num ~= nil}, {"object_netid_match", object_netid_match}, {"record_netid_match", record_netid_match}, {"selected_match_method", selected_match_method}, {"netid_conflict", netid_conflict}})
+
+            if selected_match_method ~= "none" and obj then
+                stats.matching_record_count = stats.matching_record_count + 1
+                local local_id = safe_object_id(obj)
+                local unique_key = local_id ~= nil and ("local:" .. tostring(local_id)) or ("record:" .. tostring(key))
+                if seen[unique_key] then
+                    log_line(probe, "candidate_scan", "actor_record_duplicate", {{"actor_record_key", key}, {"duplicate_of", seen[unique_key]}, {"actor_local_id", local_id}, {"match_method", selected_match_method}})
+                else
+                    seen[unique_key] = key
+                    unique[#unique + 1] = { key = key, object = obj, match_method = selected_match_method, record_netid = record_netid, object_netid = object_netid }
+                end
+                matches[#matches + 1] = { key = key, object = obj, match_method = selected_match_method, record_netid = record_netid, object_netid = object_netid }
             end
         end
     end
-    table.sort(result, function(a, b) return tostring(a.key) < tostring(b.key) end)
-    return result
+
+    table.sort(unique, function(a, b) return tostring(a.key) < tostring(b.key) end)
+    stats.unique_remote_actor_count = #unique
+    stats.record_ambiguous = stats.matching_record_count > stats.unique_remote_actor_count
+    return unique, stats, matches
 end
 
 function mags_diag_probe_request(data)
@@ -758,7 +868,7 @@ local function install_handlers()
             local object_server_match = client_server ~= nil and direct_local ~= nil and direct_server == client_server
             local direct_object_resolution_ok = direct_local ~= nil and direct_obj ~= nil and object_server_match
             local section_match = section ~= nil and safe_section(direct_obj) ~= nil and section == safe_section(direct_obj)
-            local host_parent_kind, host_parent_alive, host_parent_is_live_actor = object_kind_for_parent(host_parent)
+            local host_parent_kind, host_parent_alive, host_parent_is_live_actor, host_parent_alive_error = object_kind_for_parent(host_parent)
             local parent_match_method = "none"
             local parent_identity_match = false
             local client_parent_netid_num = tonumber(parent_netid)
@@ -773,12 +883,12 @@ local function install_handlers()
             end
             local direct_identity_match = direct_object_resolution_ok and section_match and parent_identity_match
             local direct_state_match = client_loaded_state.status == "ok" and host_loaded_state.status == "ok" and exact_array_equal(client_loaded_state.loaded, host_loaded_state.loaded)
-            log_line(probe, "direct_resolution", "verdict", {{"client_section", section}, {"host_section", safe_section(direct_obj)}, {"section_match", section_match}, {"client_server_id", client_server}, {"host_direct_server_id", direct_server}, {"object_server_match", object_server_match}, {"direct_object_resolution_ok", direct_object_resolution_ok}, {"client_mag_data_status", client_loaded_state.status}, {"host_mag_data_status", host_loaded_state.status}, {"client_loaded", client_loaded_state.status == "ok" and array_string(client_loaded_state.loaded) or "<unavailable>"}, {"host_loaded", host_loaded_state.status == "ok" and array_string(host_loaded_state.loaded) or "<unavailable>"}, {"direct_state_match", direct_state_match}, {"client_parent_netid", parent_netid}, {"host_parent_netid", host_parent_netid}, {"client_parent_server_id", client_parent_server}, {"host_parent_server_id", host_parent_server}, {"client_parent_kind", client_parent_kind}, {"host_parent_kind", host_parent_kind}, {"parent_kind_match", client_parent_kind == host_parent_kind}, {"host_parent_alive", host_parent_alive}, {"parent_match_method", parent_match_method}, {"parent_netid_numeric", client_parent_netid_num ~= nil and host_parent_netid_num ~= nil}, {"parent_server_evidence_match", parent_server_evidence_match}, {"parent_identity_match", parent_identity_match}, {"direct_identity_match", direct_identity_match}})
-            local remote_actors = find_remote_actors(requester)
+            log_line(probe, "direct_resolution", "verdict", {{"client_section", section}, {"host_section", safe_section(direct_obj)}, {"section_match", section_match}, {"client_server_id", client_server}, {"host_direct_server_id", direct_server}, {"object_server_match", object_server_match}, {"direct_object_resolution_ok", direct_object_resolution_ok}, {"client_mag_data_status", client_loaded_state.status}, {"host_mag_data_status", host_loaded_state.status}, {"client_loaded", client_loaded_state.status == "ok" and array_string(client_loaded_state.loaded) or "<unavailable>"}, {"host_loaded", host_loaded_state.status == "ok" and array_string(host_loaded_state.loaded) or "<unavailable>"}, {"direct_state_match", direct_state_match}, {"client_parent_netid", parent_netid}, {"host_parent_netid", host_parent_netid}, {"client_parent_server_id", client_parent_server}, {"host_parent_server_id", host_parent_server}, {"client_parent_kind", client_parent_kind}, {"host_parent_kind", host_parent_kind}, {"parent_kind_match", client_parent_kind == host_parent_kind}, {"host_parent_alive", host_parent_alive}, {"host_parent_alive_error", host_parent_alive_error}, {"parent_match_method", parent_match_method}, {"parent_netid_numeric", client_parent_netid_num ~= nil and host_parent_netid_num ~= nil}, {"parent_server_evidence_match", parent_server_evidence_match}, {"parent_identity_match", parent_identity_match}, {"direct_identity_match", direct_identity_match}})
+            local remote_actors, remote_actor_stats = find_remote_actors(probe, requester)
             local candidates, possible_candidates, strong_identity_candidates, state_candidates, server_id_candidates = 0, 0, 0, 0, 0
             local candidate_scan_performed = #remote_actors > 0
             local candidate_snapshots_complete = candidate_scan_performed
-            log_line(probe, "candidate_scan", "remote_actor_matches", {{"requester_netid", requester}, {"match_count", #remote_actors}, {"remote_actor_ambiguous", #remote_actors > 1}})
+            log_line(probe, "candidate_scan", "remote_actor_matches", {{"requester_netid", requester}, {"matching_record_count", remote_actor_stats.matching_record_count}, {"unique_remote_actor_count", remote_actor_stats.unique_remote_actor_count}, {"object_getnetid_match_count", remote_actor_stats.object_getnetid_match_count}, {"record_netid_fallback_match_count", remote_actor_stats.record_netid_fallback_match_count}, {"netid_conflict_count", remote_actor_stats.netid_conflict_count}, {"remote_actor_ambiguous", remote_actor_stats.unique_remote_actor_count > 1}, {"record_ambiguous", remote_actor_stats.record_ambiguous}})
             for _, actor_rec in ipairs(remote_actors) do
                 local remote_actor = actor_rec.object
                 local actor_label = "remote_actor_inventory:" .. tostring(safe_object_id(remote_actor))
@@ -800,20 +910,20 @@ local function install_handlers()
                         if candidate_server_id_match then server_id_candidates = server_id_candidates + 1 end
                         if candidate_state_match then state_candidates = state_candidates + 1 end
                         if candidate_strong_identity_match then strong_identity_candidates = strong_identity_candidates + 1 end
-                        log_line(probe, "candidate_scan", "magazine_candidate", {{"actor_record_key", actor_rec.key}, {"actor_local_id", safe_object_id(remote_actor)}, {"candidate_local_id", candidate_rec.local_id}, {"candidate_server_id", candidate_rec.server_id}, {"section", candidate_rec.section}, {"parent_local_id", candidate_rec.parent_local_id}, {"parent_server_id", candidate_rec.parent_server_id}, {"mag_data_status", state.status}, {"mag_data_error", state.error}, {"loaded", state.status == "ok" and array_string(state.loaded) or "<unavailable>"}, {"candidate_owner_match", candidate_owner_match}, {"candidate_section_match", candidate_section_match}, {"candidate_parent_match", candidate_parent_match}, {"candidate_server_id_match", candidate_server_id_match}, {"candidate_possible_match", candidate_possible_match}, {"candidate_strong_identity_match", candidate_strong_identity_match}, {"candidate_state_match", candidate_state_match}})
+                        log_line(probe, "candidate_scan", "magazine_candidate", {{"actor_record_key", actor_rec.key}, {"actor_match_method", actor_rec.match_method}, {"actor_record_netid", actor_rec.record_netid}, {"actor_object_netid", actor_rec.object_netid}, {"actor_local_id", safe_object_id(remote_actor)}, {"candidate_local_id", candidate_rec.local_id}, {"candidate_server_id", candidate_rec.server_id}, {"section", candidate_rec.section}, {"parent_local_id", candidate_rec.parent_local_id}, {"parent_server_id", candidate_rec.parent_server_id}, {"mag_data_status", state.status}, {"mag_data_error", state.error}, {"loaded", state.status == "ok" and array_string(state.loaded) or "<unavailable>"}, {"candidate_owner_match", candidate_owner_match}, {"candidate_section_match", candidate_section_match}, {"candidate_parent_match", candidate_parent_match}, {"candidate_server_id_match", candidate_server_id_match}, {"candidate_possible_match", candidate_possible_match}, {"candidate_strong_identity_match", candidate_strong_identity_match}, {"candidate_state_match", candidate_state_match}})
                     end
                 end
                 start_owner_watcher(probe, actor_label, remote_actor, remote_baseline)
             end
             if #remote_actors == 0 then log_line(probe, "watch_complete", "watcher_not_started", {{"target", "remote_actor_inventory"}, {"reason", "remote_actor_missing"}}) end
             local candidate_result_reliable = candidate_scan_performed and candidate_snapshots_complete
-            local possible_candidate_ambiguous = possible_candidates > 1 or #remote_actors > 1
-            local strong_identity_ambiguous = strong_identity_candidates > 1 or #remote_actors > 1
-            log_line(probe, "candidate_scan", "summary", {{"remote_actor_found", #remote_actors > 0}, {"remote_actor_count", #remote_actors}, {"remote_actor_ambiguous", #remote_actors > 1}, {"candidate_scan_performed", candidate_scan_performed}, {"candidate_count", candidates}, {"possible_candidate_count", possible_candidates}, {"strong_identity_candidate_count", strong_identity_candidates}, {"state_candidate_count", state_candidates}, {"server_id_candidate_count", server_id_candidates}, {"snapshot_complete", candidate_snapshots_complete}, {"result_reliable", candidate_result_reliable}, {"reason", candidate_scan_performed and nil or "remote_actor_missing"}, {"possible_candidate_ambiguous", possible_candidate_ambiguous}, {"strong_identity_ambiguous", strong_identity_ambiguous}})
+            local possible_candidate_ambiguous = possible_candidates > 1 or remote_actor_stats.unique_remote_actor_count > 1
+            local strong_identity_ambiguous = strong_identity_candidates > 1 or remote_actor_stats.unique_remote_actor_count > 1
+            log_line(probe, "candidate_scan", "summary", {{"remote_actor_found", #remote_actors > 0}, {"matching_record_count", remote_actor_stats.matching_record_count}, {"unique_remote_actor_count", remote_actor_stats.unique_remote_actor_count}, {"remote_actor_ambiguous", remote_actor_stats.unique_remote_actor_count > 1}, {"record_ambiguous", remote_actor_stats.record_ambiguous}, {"candidate_scan_performed", candidate_scan_performed}, {"candidate_count", candidates}, {"possible_candidate_count", possible_candidates}, {"strong_identity_candidate_count", strong_identity_candidates}, {"state_candidate_count", state_candidates}, {"server_id_candidate_count", server_id_candidates}, {"snapshot_complete", candidate_snapshots_complete}, {"result_reliable", candidate_result_reliable}, {"reason", candidate_scan_performed and nil or "remote_actor_missing"}, {"possible_candidate_ambiguous", possible_candidate_ambiguous}, {"strong_identity_ambiguous", strong_identity_ambiguous}})
             local primary_remote_actor = #remote_actors == 1 and remote_actors[1].object or nil
-            local reply = { rpc_value(requester), rpc_value(probe), rpc_value(my_netid()), #remote_actors > 0, rpc_value(safe_object_id(primary_remote_actor)), rpc_value(direct_local), rpc_value(safe_section(direct_obj)), rpc_value(safe_parent_id(direct_obj)), rpc_value(host_parent_netid), direct_identity_match and #remote_actors <= 1, candidates, possible_candidates, strong_identity_candidates, state_candidates, server_id_candidates, direct_object_resolution_ok, direct_identity_match, direct_state_match, rpc_value(parent_match_method), candidate_result_reliable, "read_only_diag" }
-            GameManager:OnICustomScriptAction("magazines", "mags_diag_probe_reply", serialize_table_simple(reply), false, requester)
-            log_line(probe, "host_reply_sent", "probe_reply", {{"target_netid", requester}, {"candidate_count", candidates}, {"possible_candidate_count", possible_candidates}, {"strong_identity_candidate_count", strong_identity_candidates}, {"state_candidate_count", state_candidates}, {"server_id_candidate_count", server_id_candidates}, {"candidate_scan_performed", candidate_scan_performed}, {"snapshot_complete", candidate_snapshots_complete}, {"result_reliable", candidate_result_reliable}, {"remote_actor_count", #remote_actors}})
+            local reply = { rpc_value(requester), rpc_value(probe), rpc_value(my_netid()), #remote_actors > 0, rpc_value(safe_object_id(primary_remote_actor)), rpc_value(direct_local), rpc_value(safe_section(direct_obj)), rpc_value(safe_parent_id(direct_obj)), rpc_value(host_parent_netid), direct_identity_match and remote_actor_stats.unique_remote_actor_count <= 1, candidates, possible_candidates, strong_identity_candidates, state_candidates, server_id_candidates, direct_object_resolution_ok, direct_identity_match, direct_state_match, rpc_value(parent_match_method), candidate_result_reliable, "read_only_diag" }
+            send_diagnostic_action(probe, "host_reply_sent", "mags_diag_probe_reply", reply, false, requester)
+            log_line(probe, "host_reply_sent", "probe_reply", {{"target_netid", requester}, {"candidate_count", candidates}, {"possible_candidate_count", possible_candidates}, {"strong_identity_candidate_count", strong_identity_candidates}, {"state_candidate_count", state_candidates}, {"server_id_candidate_count", server_id_candidates}, {"candidate_scan_performed", candidate_scan_performed}, {"snapshot_complete", candidate_snapshots_complete}, {"result_reliable", candidate_result_reliable}, {"matching_record_count", remote_actor_stats.matching_record_count}, {"unique_remote_actor_count", remote_actor_stats.unique_remote_actor_count}})
             if direct_local ~= nil then
                 start_watcher(probe, "direct_resolution", direct_local, nil)
             else
@@ -839,41 +949,10 @@ local function install_handlers()
     end
 end
 
-local function dump_later(probe, phase, netid, delay)
-    CreateTimeEvent("magdiag_actor_map", probe .. ":" .. phase .. ":" .. tostring(delay), delay, function()
-        run_diagnostic(probe, "actor_map", "connection_dump", function()
-            log_line(probe, phase, "delayed_actor_map", {{"player_netid", netid}, {"delay", delay}})
-            dump_actor_map(probe, "actor_map", netid)
-        end)
-        return true
-    end)
-end
-
-local function schedule_connection_dumps(phase, event_name, netid, nick)
-    local probe = "connection:" .. tostring(netid) .. ":" .. tostring(now())
-    log_line(probe, phase, event_name, {{"player_netid", netid}, {"nick", nick}})
-    for _, d in ipairs({0, 0.5, 1, 2, 5}) do dump_later(probe, phase, netid, d) end
-end
-
-local function install_callbacks()
-    if callbacks_registered then return end
-    callbacks_registered = true
-    if RegisterScriptCallback then
-        RegisterScriptCallback("on_game_load", function() local probe = "game_load:" .. tostring(now()); run_diagnostic(probe, "game_load", "on_game_load", function() log_line(probe, "game_load", "callback", nil); dump_actor_map(probe, "actor_map", my_netid()) end) end)
-        RegisterScriptCallback("actor_on_first_update", function() local probe = "first_update:" .. tostring(now()); run_diagnostic(probe, "game_load", "actor_on_first_update", function() log_line(probe, "game_load", "actor_on_first_update", nil) end) end)
-        RegisterScriptCallback("actor_on_item_take", function(obj) local probe = "item_take:" .. tostring(now()); run_diagnostic(probe, "inventory_scan", "actor_on_item_take", function() log_line(probe, "inventory_scan", "actor_on_item_take", {{"item_local_id", safe_object_id(obj)}, {"item_server_id", safe_server_id(safe_object_id(obj))}, {"section", safe_section(obj)}}) end) end)
-        RegisterScriptCallback("onmp_player_connected", function(netid, nick) schedule_connection_dumps("player_connected", "client_callback", netid, nick) end)
-        RegisterScriptCallback("onmp_player_connected_server", function(netid, nick) schedule_connection_dumps("player_connected", "server_callback", netid, nick) end)
-        RegisterScriptCallback("onmp_player_disconnected", function(netid, nick) schedule_connection_dumps("player_disconnected", "client_callback", netid, nick) end)
-        RegisterScriptCallback("onmp_player_disconnected_server", function(netid, nick) schedule_connection_dumps("player_disconnected", "server_callback", netid, nick) end)
-    end
-end
-
 function install(magazines, game_manager)
     magazines_ref = magazines
     game_manager_ref = game_manager
     install_handlers()
-    install_callbacks()
     if magazines.func_unload_ammo == wrapped_unload then return end
     local original = magazines.func_unload_ammo
     local new_wrapper = function(obj, ...)
