@@ -66,6 +66,11 @@ local function rpc_value(value)
     return value
 end
 
+local function rpc_decode(value)
+    if value == "<nil>" then return nil end
+    return value
+end
+
 local function array_string(t)
     if type(t) ~= "table" then return "<nil>" end
     local out = {}
@@ -286,7 +291,7 @@ local function collect_inventory(owner, probe, phase, owner_label)
             meta.state_read_errors = meta.state_read_errors + read_errors
             if rec.local_id == nil then
                 meta.snapshot_complete = false
-                log_line(probe, phase or "inventory_scan", "untracked_inventory_item", {{"owner", owner_label}, {"section", rec.section}, {"object_kind", rec.object_kind}, {"read_errors", read_errors}})
+                log_line(probe, phase or "inventory_scan", "untracked_inventory_item", {{"owner", owner_label}, {"section", rec.section}, {"object_kind", rec.object_kind}, {"read_errors", read_errors}, {"read_error_fields", rec.read_error_fields}})
             end
             local key = tostring(rec.local_id or ("unknown:" .. tostring(count)))
             if not seen_ids[key] then
@@ -315,11 +320,13 @@ local function collect_inventory(owner, probe, phase, owner_label)
     if use_box_iter then
         meta.scan_method = "iterate_inventory_box"
         meta.iterator_missing = false
-        _, err = safe_value(function() owner:iterate_inventory_box(cb) end)
+        local ignored
+        ignored, err = safe_value(function() owner:iterate_inventory_box(cb) end)
     elseif owner.iterate_inventory then
         meta.scan_method = "iterate_inventory"
         meta.iterator_missing = false
-        _, err = safe_value(function() owner:iterate_inventory(cb) end)
+        local ignored
+        ignored, err = safe_value(function() owner:iterate_inventory(cb) end)
     else
         meta.iterator_error = meta.iterator_error or "iterator_missing"
         return items, count, meta
@@ -349,10 +356,12 @@ end
 
 item_record = function(item, known_is_mag, known_is_ammo)
     local read_errors = 0
-    local function read(fn)
-        local ok, value = safe_try(fn)
+    local read_error_fields = {}
+    local function read(name, fn)
+        local ok, value, err = safe_try(fn)
         if ok then return value end
         read_errors = read_errors + 1
+        read_error_fields[#read_error_fields + 1] = name .. ":" .. tostring(err)
         return nil
     end
 
@@ -361,25 +370,28 @@ item_record = function(item, known_is_mag, known_is_ammo)
     local is_ammo = known_is_ammo
     if is_ammo == nil then is_ammo = is_ammo_object(item) end
 
-    local local_id = item and read(function() return item:id() end) or nil
+    local local_id = item and read("local_id", function() return item:id() end) or nil
     local server_id = nil
     if local_id ~= nil and game_manager_ref then
-        server_id = read(function() return game_manager_ref:GetServerIDByLocalID(local_id) end)
+        server_id = read("server_id", function() return game_manager_ref:GetServerIDByLocalID(local_id) end)
     end
-    local section = item and read(function() return item:section() end) or nil
-    local parent = item and read(function() return item:parent() end) or nil
-    local parent_local_id = parent and read(function() return parent:id() end) or nil
+    local section = item and read("section", function() return item:section() end) or nil
+    local parent = item and read("parent", function() return item:parent() end) or nil
+    local parent_local_id = parent and read("parent_local_id", function() return parent:id() end) or nil
     local parent_server_id = nil
     if parent_local_id ~= nil and game_manager_ref then
-        parent_server_id = read(function() return game_manager_ref:GetServerIDByLocalID(parent_local_id) end)
+        parent_server_id = read("parent_server_id", function() return game_manager_ref:GetServerIDByLocalID(parent_local_id) end)
     end
 
     local loaded_state = is_mag and safe_loaded_state(item) or { status = "not_applicable" }
-    if loaded_state.status == "error" then read_errors = read_errors + 1 end
+    if loaded_state.status == "error" then
+        read_errors = read_errors + 1
+        read_error_fields[#read_error_fields + 1] = "mag_data:" .. tostring(loaded_state.error)
+    end
 
     local ammo_count = nil
     if item and item.ammo_get_count then
-        ammo_count = read(function() return item:ammo_get_count() end)
+        ammo_count = read("ammo_count", function() return item:ammo_get_count() end)
     end
 
     local object_kind = "other"
@@ -398,7 +410,8 @@ item_record = function(item, known_is_mag, known_is_ammo)
         loaded_state = loaded_state,
         loaded_fp = loaded_state.status == "ok" and array_string(loaded_state.loaded) or "<" .. loaded_state.status .. ">",
         ammo_count = ammo_count,
-        state_read_errors = read_errors
+        state_read_errors = read_errors,
+        read_error_fields = array_string(read_error_fields)
     }, read_errors
 end
 
@@ -420,7 +433,7 @@ local function dump_inventory(probe, phase, owner, owner_label, snapshot)
         if rec.is_magazine or rec.is_ammo then
             if rec.is_magazine then mags = mags + 1 end
             if rec.is_ammo then ammos = ammos + 1 end
-            log_line(probe, phase, "inventory_item", {{"owner", owner_label}, {"owner_local_id", safe_object_id(owner)}, {"owner_netid", safe_get_netid(owner)}, {"item_local_id", rec.local_id}, {"item_server_id", rec.server_id}, {"section", rec.section}, {"parent_local_id", rec.parent_local_id}, {"parent_server_id", rec.parent_server_id}, {"flags", safe_object_flags(item)}, {"mag_data_status", rec.loaded_state.status}, {"mag_data_error", rec.loaded_state.error}, {"loaded", rec.loaded_state.status == "ok" and array_string(rec.loaded_state.loaded) or "<unavailable>"}, {"ammo_count", rec.ammo_count}, {"box_size", safe_value(function() return SYS_GetParam(2, rec.section, "box_size") end)}, {"has_ammo_set_count", item and item.ammo_set_count ~= nil}})
+            log_line(probe, phase, "inventory_item", {{"owner", owner_label}, {"owner_local_id", safe_object_id(owner)}, {"owner_netid", safe_get_netid(owner)}, {"item_local_id", rec.local_id}, {"item_server_id", rec.server_id}, {"section", rec.section}, {"parent_local_id", rec.parent_local_id}, {"parent_server_id", rec.parent_server_id}, {"flags", safe_object_flags(item)}, {"mag_data_status", rec.loaded_state.status}, {"mag_data_error", rec.loaded_state.error}, {"loaded", rec.loaded_state.status == "ok" and array_string(rec.loaded_state.loaded) or "<unavailable>"}, {"ammo_count", rec.ammo_count}, {"box_size", safe_value(function() return SYS_GetParam(2, rec.section, "box_size") end)}, {"has_ammo_set_count", item and item.ammo_set_count ~= nil}, {"state_read_errors", rec.state_read_errors}, {"read_error_fields", rec.read_error_fields}})
             if rec.is_ammo then
                 local sec = rec.section or "nil"
                 ammo[sec] = ammo[sec] or {ids = {}, sids = {}, counts = {}, total = 0}
@@ -666,7 +679,7 @@ local function send_probe(probe, obj, behavior, gui_shown)
     local loaded_state = safe_loaded_state(obj)
     local parent = safe_parent(obj)
     local client_parent_kind = object_kind_for_parent(parent)
-    local payload = { probe, my_netid(), safe_object_id(obj), safe_server_id(safe_object_id(obj)), safe_section(obj), safe_parent_id(obj), safe_parent_server_id(obj), safe_get_netid(parent), loaded_state.status == "ok" and loaded_state.loaded or nil, behavior, gui_shown, now(), loaded_state.status, loaded_state.error, client_parent_kind }
+    local payload = { rpc_value(probe), rpc_value(my_netid()), rpc_value(safe_object_id(obj)), rpc_value(safe_server_id(safe_object_id(obj))), rpc_value(safe_section(obj)), rpc_value(safe_parent_id(obj)), rpc_value(safe_parent_server_id(obj)), rpc_value(safe_get_netid(parent)), rpc_value(loaded_state.status == "ok" and loaded_state.loaded or nil), rpc_value(behavior), rpc_value(gui_shown), rpc_value(now()), rpc_value(loaded_state.status), rpc_value(loaded_state.error), rpc_value(client_parent_kind) }
     GameManager:OnICustomScriptAction("magazines", "mags_diag_probe_request", serialize_table_simple(payload), true)
     log_line(probe, "client_probe_sent", "probe_request", {{"client_mag_local_id", payload[3]}, {"client_mag_server_id", payload[4]}, {"mag_data_status", loaded_state.status}, {"loaded", loaded_state.status == "ok" and array_string(payload[9]) or "<unavailable>"}})
 end
@@ -718,10 +731,20 @@ local function install_handlers()
             if type(data) ~= "table" and deserialize_table_simple then data = deserialize_table_simple(data) end
             probe = data[1]
             if not (IIsHost and IIsHost()) then log_line(probe, "host_probe_received", "wrong_role", nil); return end
-            local requester, client_local, client_server, section, client_parent_server, parent_netid, loaded, client_loaded_status = data[2], data[3], data[4], data[5], data[7], data[8], data[9], data[13] or (type(data[9]) == "table" and "ok" or "missing")
-            local client_loaded_state = { status = client_loaded_status, loaded = type(loaded) == "table" and loaded or nil, error = data[14] }
+            local requester = rpc_decode(data[2])
+            local client_local = rpc_decode(data[3])
+            local client_server = rpc_decode(data[4])
+            local section = rpc_decode(data[5])
+            local client_parent_local = rpc_decode(data[6])
+            local client_parent_server = rpc_decode(data[7])
+            local parent_netid = rpc_decode(data[8])
+            local loaded = rpc_decode(data[9])
+            local client_loaded_status = rpc_decode(data[13]) or (type(loaded) == "table" and "ok" or "missing")
+            local client_loaded_error = rpc_decode(data[14])
+            local client_parent_kind = rpc_decode(data[15]) or "unknown"
+            local client_loaded_state = { status = client_loaded_status, loaded = type(loaded) == "table" and loaded or nil, error = client_loaded_error }
             if client_loaded_state.status == "ok" and type(client_loaded_state.loaded) ~= "table" then client_loaded_state.status = "invalid_loaded" end
-            log_line(probe, "host_probe_received", "probe_request", {{"requester_netid", requester}, {"client_mag_local_id", client_local}, {"client_mag_server_id", client_server}, {"client_section", section}, {"client_parent_local_id", data[6]}, {"client_parent_server_id", data[7]}, {"client_parent_netid", parent_netid}, {"client_mag_data_status", client_loaded_state.status}, {"client_parent_kind", data[15]}, {"client_loaded", client_loaded_state.status == "ok" and array_string(client_loaded_state.loaded) or "<unavailable>"}})
+            log_line(probe, "host_probe_received", "probe_request", {{"requester_netid", requester}, {"client_mag_local_id", client_local}, {"client_mag_server_id", client_server}, {"client_section", section}, {"client_parent_local_id", client_parent_local}, {"client_parent_server_id", client_parent_server}, {"client_parent_netid", parent_netid}, {"client_mag_data_status", client_loaded_state.status}, {"client_parent_kind", client_parent_kind}, {"client_loaded", client_loaded_state.status == "ok" and array_string(client_loaded_state.loaded) or "<unavailable>"}})
             log_local_actor(probe, "host_probe_received")
             dump_actor_map(probe, "actor_map", requester)
             local direct_local = safe_local_id(client_server)
@@ -736,7 +759,6 @@ local function install_handlers()
             local direct_object_resolution_ok = direct_local ~= nil and direct_obj ~= nil and object_server_match
             local section_match = section ~= nil and safe_section(direct_obj) ~= nil and section == safe_section(direct_obj)
             local host_parent_kind, host_parent_alive, host_parent_is_live_actor = object_kind_for_parent(host_parent)
-            local client_parent_kind = data[15] or "unknown"
             local parent_match_method = "none"
             local parent_identity_match = false
             local client_parent_netid_num = tonumber(parent_netid)
@@ -807,12 +829,12 @@ local function install_handlers()
         local probe = type(data) == "table" and data[2] or "client_reply:unknown"
         run_diagnostic(probe, "client_reply_received", "probe_reply_handler", function()
             if type(data) ~= "table" and deserialize_table_simple then data = deserialize_table_simple(data) end
-            local target = data[1]
+            local target = rpc_decode(data[1])
             local target_num = tonumber(target)
             local my_netid_num = tonumber(my_netid())
             local target_match = target_num ~= nil and my_netid_num ~= nil and target_num == my_netid_num
             if not target_match then log_line(data[2], "client_reply_received", "wrong_target", {{"target_netid", target}, {"my_snetid", my_netid()}}); return end
-            log_line(data[2], "client_reply_received", "probe_reply", {{"target_netid", target}, {"host_my_snetid", data[3]}, {"remote_actor_found", data[4]}, {"remote_actor_local_id", data[5]}, {"direct_local_id", data[6]}, {"direct_section", data[7]}, {"direct_parent_local_id", data[8]}, {"direct_parent_netid", data[9]}, {"direct_identity_unambiguous", data[10]}, {"candidate_count", data[11]}, {"possible_candidate_count", data[12]}, {"strong_identity_candidate_count", data[13]}, {"state_candidate_count", data[14]}, {"server_id_candidate_count", data[15]}, {"direct_object_resolution_ok", data[16]}, {"direct_identity_match", data[17]}, {"direct_state_match", data[18]}, {"parent_match_method", data[19]}, {"snapshot_complete", data[20]}, {"summary", data[21]}})
+            log_line(data[2], "client_reply_received", "probe_reply", {{"target_netid", target}, {"host_my_snetid", data[3]}, {"remote_actor_found", data[4]}, {"remote_actor_local_id", data[5]}, {"direct_local_id", data[6]}, {"direct_section", data[7]}, {"direct_parent_local_id", data[8]}, {"direct_parent_netid", data[9]}, {"direct_identity_unambiguous", data[10]}, {"candidate_count", data[11]}, {"possible_candidate_count", data[12]}, {"strong_identity_candidate_count", data[13]}, {"state_candidate_count", data[14]}, {"server_id_candidate_count", data[15]}, {"direct_object_resolution_ok", data[16]}, {"direct_identity_match", data[17]}, {"direct_state_match", data[18]}, {"parent_match_method", data[19]}, {"candidate_result_reliable", data[20]}, {"summary", data[21]}})
         end)
     end
 end
