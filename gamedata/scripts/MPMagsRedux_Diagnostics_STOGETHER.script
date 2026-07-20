@@ -61,6 +61,11 @@ local function log_escape(value)
     return text:gsub("\\", "\\\\"):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub(" ", "\\s")
 end
 
+local function rpc_value(value)
+    if value == nil then return "<nil>" end
+    return value
+end
+
 local function array_string(t)
     if type(t) ~= "table" then return "<nil>" end
     local out = {}
@@ -264,6 +269,7 @@ local function collect_inventory(owner, probe, phase, owner_label)
     local meta = {
         magazine_classification_errors = 0,
         ammo_classification_errors = 0,
+        state_read_errors = 0,
         snapshot_complete = false,
         scan_method = "none",
         iterator_missing = true,
@@ -276,11 +282,16 @@ local function collect_inventory(owner, probe, phase, owner_label)
         if mag_err then meta.magazine_classification_errors = meta.magazine_classification_errors + 1; meta.snapshot_complete = false end
         if ammo_err then meta.ammo_classification_errors = meta.ammo_classification_errors + 1; meta.snapshot_complete = false end
         if is_mag or is_ammo then
-            local item_id = safe_object_id(item)
-            local key = tostring(item_id or ("unknown:" .. tostring(count)))
+            local rec, read_errors = item_record(item, is_mag, is_ammo)
+            meta.state_read_errors = meta.state_read_errors + read_errors
+            if rec.local_id == nil then
+                meta.snapshot_complete = false
+                log_line(probe, phase or "inventory_scan", "untracked_inventory_item", {{"owner", owner_label}, {"section", rec.section}, {"object_kind", rec.object_kind}, {"read_errors", read_errors}})
+            end
+            local key = tostring(rec.local_id or ("unknown:" .. tostring(count)))
             if not seen_ids[key] then
                 seen_ids[key] = true
-                items[#items + 1] = item_record(item, is_mag, is_ammo)
+                items[#items + 1] = rec
             end
         end
     end
@@ -319,7 +330,7 @@ local function collect_inventory(owner, probe, phase, owner_label)
         meta.iterator_error = err
         log_line(probe, phase or "inventory_scan", "diagnostic_error", {{"operation", meta.scan_method}, {"error", err}, {"owner", owner_label}, {"owner_local_id", safe_object_id(owner)}})
     else
-        meta.snapshot_complete = meta.iterator_error == nil and meta.magazine_classification_errors == 0 and meta.ammo_classification_errors == 0
+        meta.snapshot_complete = meta.iterator_error == nil and meta.magazine_classification_errors == 0 and meta.ammo_classification_errors == 0 and meta.state_read_errors == 0
     end
 
     return items, count, meta
@@ -328,7 +339,7 @@ end
 local function snapshot_from_records(records, seen, meta)
     local map = {}
     for _, rec in ipairs(records or {}) do if rec.local_id ~= nil then map[tostring(rec.local_id)] = rec end end
-    return { records = records or {}, map = map, seen = seen or 0, meta = meta or { snapshot_complete = false, scan_method = "none", iterator_missing = true, magazine_classification_errors = 0, ammo_classification_errors = 0 } }
+    return { records = records or {}, map = map, seen = seen or 0, meta = meta or { snapshot_complete = false, scan_method = "none", iterator_missing = true, magazine_classification_errors = 0, ammo_classification_errors = 0, state_read_errors = 0 } }
 end
 
 local function snapshot_owner(owner, probe, phase, owner_label)
@@ -337,28 +348,58 @@ local function snapshot_owner(owner, probe, phase, owner_label)
 end
 
 item_record = function(item, known_is_mag, known_is_ammo)
+    local read_errors = 0
+    local function read(fn)
+        local ok, value = safe_try(fn)
+        if ok then return value end
+        read_errors = read_errors + 1
+        return nil
+    end
+
     local is_mag = known_is_mag
     if is_mag == nil then is_mag = is_magazine_object(item) end
     local is_ammo = known_is_ammo
     if is_ammo == nil then is_ammo = is_ammo_object(item) end
+
+    local local_id = item and read(function() return item:id() end) or nil
+    local server_id = nil
+    if local_id ~= nil and game_manager_ref then
+        server_id = read(function() return game_manager_ref:GetServerIDByLocalID(local_id) end)
+    end
+    local section = item and read(function() return item:section() end) or nil
+    local parent = item and read(function() return item:parent() end) or nil
+    local parent_local_id = parent and read(function() return parent:id() end) or nil
+    local parent_server_id = nil
+    if parent_local_id ~= nil and game_manager_ref then
+        parent_server_id = read(function() return game_manager_ref:GetServerIDByLocalID(parent_local_id) end)
+    end
+
     local loaded_state = is_mag and safe_loaded_state(item) or { status = "not_applicable" }
+    if loaded_state.status == "error" then read_errors = read_errors + 1 end
+
+    local ammo_count = nil
+    if item and item.ammo_get_count then
+        ammo_count = read(function() return item:ammo_get_count() end)
+    end
+
     local object_kind = "other"
     if is_mag then object_kind = "magazine"
     elseif is_ammo then object_kind = "ammo" end
     return {
         obj = item,
         object_kind = object_kind,
-        local_id = safe_object_id(item),
-        server_id = safe_server_id(safe_object_id(item)),
-        section = safe_section(item),
-        parent_local_id = safe_parent_id(item),
-        parent_server_id = safe_parent_server_id(item),
+        local_id = local_id,
+        server_id = server_id,
+        section = section,
+        parent_local_id = parent_local_id,
+        parent_server_id = parent_server_id,
         is_magazine = is_mag,
         is_ammo = is_ammo,
         loaded_state = loaded_state,
         loaded_fp = loaded_state.status == "ok" and array_string(loaded_state.loaded) or "<" .. loaded_state.status .. ">",
-        ammo_count = safe_ammo_count(item)
-    }
+        ammo_count = ammo_count,
+        state_read_errors = read_errors
+    }, read_errors
 end
 
 local function object_map_counts(map)
@@ -394,7 +435,7 @@ local function dump_inventory(probe, phase, owner, owner_label, snapshot)
     for sec, data in pairs(ammo) do
         log_line(probe, phase, "ammo_summary", {{"owner", owner_label}, {"section", sec}, {"objects", #data.ids}, {"local_ids", array_string(data.ids)}, {"server_ids", array_string(data.sids)}, {"counts", array_string(data.counts)}, {"total", data.total}})
     end
-    log_line(probe, phase, "inventory_summary", {{"owner", owner_label}, {"seen", seen}, {"logged", #items}, {"magazines", mags}, {"ammo_objects", ammos}, {"snapshot_complete", meta and meta.snapshot_complete}, {"scan_method", meta and meta.scan_method}, {"iterator_missing", meta and meta.iterator_missing}, {"iterator_error", meta and meta.iterator_error}, {"magazine_classification_errors", meta and meta.magazine_classification_errors}, {"ammo_classification_errors", meta and meta.ammo_classification_errors}})
+    log_line(probe, phase, "inventory_summary", {{"owner", owner_label}, {"seen", seen}, {"logged", #items}, {"magazines", mags}, {"ammo_objects", ammos}, {"snapshot_complete", meta and meta.snapshot_complete}, {"scan_method", meta and meta.scan_method}, {"iterator_missing", meta and meta.iterator_missing}, {"iterator_error", meta and meta.iterator_error}, {"magazine_classification_errors", meta and meta.magazine_classification_errors}, {"ammo_classification_errors", meta and meta.ammo_classification_errors}, {"state_read_errors", meta and meta.state_read_errors}})
     return snapshot
 end
 
@@ -447,10 +488,11 @@ local function inventory_fingerprint_from_map(map)
     return table.concat(parts, ";")
 end
 
-local function watch_snapshot(w, object_map)
-    local obj = w.local_id and object_by_local_id(w.local_id) or w.obj
-    local loaded_state = safe_loaded_state(obj)
-    return join_fingerprint({safe_object_id(obj), safe_server_id(safe_object_id(obj)), safe_parent_id(obj), safe_parent_server_id(obj), loaded_state.status, loaded_state.status == "ok" and array_string(loaded_state.loaded) or "<unavailable>", inventory_fingerprint_from_map(object_map)}, "|")
+local function watch_snapshot(w, snapshot)
+    local object_map = snapshot and snapshot.map or {}
+    local rec = nil
+    if w.local_id and snapshot and snapshot.records then rec = snapshot.records[1] end
+    return join_fingerprint({rec and rec.local_id, rec and rec.server_id, rec and rec.parent_local_id, rec and rec.parent_server_id, rec and rec.loaded_state and rec.loaded_state.status, rec and rec.loaded_fp, inventory_fingerprint_from_map(object_map)}, "|")
 end
 
 local function schedule_server_id_checks(probe, obj, label)
@@ -514,7 +556,7 @@ local direct_snapshot
 local function build_watcher_snapshot(w)
     if w.owner then return snapshot_owner(w.owner, w.probe, "watch_change", w.target) end
     if w.local_id then return direct_snapshot(w.local_id) end
-    return snapshot_from_records({}, 0, { snapshot_complete = true, magazine_classification_errors = 0, ammo_classification_errors = 0 })
+    return snapshot_from_records({}, 0, { snapshot_complete = true, magazine_classification_errors = 0, ammo_classification_errors = 0, state_read_errors = 0 })
 end
 
 local function stop_watcher(key, reason)
@@ -529,16 +571,19 @@ local function run_watcher_tick(key)
     if not state or not db or not db.actor then stop_watcher(key, "missing_actor_or_state"); return end
     local current_snapshot = build_watcher_snapshot(state)
     local current_objects = current_snapshot.map
-    local fp = watch_snapshot(state, current_objects)
+    local fp = watch_snapshot(state, current_snapshot)
     if state.snapshot_meta and state.snapshot_meta.snapshot_complete ~= current_snapshot.meta.snapshot_complete then
-        log_line(state.probe, "watch_change", "snapshot_completeness_changed", {{"target", state.target}, {"old_complete", state.snapshot_meta.snapshot_complete}, {"new_complete", current_snapshot.meta.snapshot_complete}, {"magazine_classification_errors", current_snapshot.meta.magazine_classification_errors}, {"ammo_classification_errors", current_snapshot.meta.ammo_classification_errors}})
+        log_line(state.probe, "watch_change", "snapshot_completeness_changed", {{"target", state.target}, {"old_complete", state.snapshot_meta.snapshot_complete}, {"new_complete", current_snapshot.meta.snapshot_complete}, {"magazine_classification_errors", current_snapshot.meta.magazine_classification_errors}, {"ammo_classification_errors", current_snapshot.meta.ammo_classification_errors}, {"state_read_errors", current_snapshot.meta.state_read_errors}})
     end
     log_delta(state.probe, state.target, state.objects, current_objects, state.snapshot_meta, current_snapshot.meta)
     state.objects = current_objects
     state.snapshot_meta = current_snapshot.meta
     if fp ~= state.last then
         log_line(state.probe, "watch_change", "fingerprint_changed", {{"target", state.target}, {"previous", state.last}, {"new", fp}, {"elapsed", now() - state.start}})
-        if state.local_id then log_magazine_snapshot(state.probe, "watch_change", "watch_object_state", object_by_local_id(state.local_id), {{"target", state.target}}) end
+        if state.local_id then
+            local rec = current_snapshot.records and current_snapshot.records[1] or nil
+            log_line(state.probe, "watch_change", "watch_object_state", {{"target", state.target}, {"object_kind", rec and rec.object_kind}, {"local_id", rec and rec.local_id}, {"server_id", rec and rec.server_id}, {"section", rec and rec.section}, {"parent_local_id", rec and rec.parent_local_id}, {"parent_server_id", rec and rec.parent_server_id}, {"mag_data_status", rec and rec.loaded_state and rec.loaded_state.status}, {"loaded", rec and rec.loaded_state and rec.loaded_state.status == "ok" and array_string(rec.loaded_state.loaded) or "<unavailable>"}, {"snapshot_complete", current_snapshot.meta and current_snapshot.meta.snapshot_complete}})
+        end
         if state.owner then dump_inventory(state.probe, "watch_change", state.owner, state.target, current_snapshot) end
         state.last = fp
     end
@@ -567,26 +612,28 @@ end
 
 direct_snapshot = function(local_id)
     if local_id == nil or not (level and level.object_by_id) then
-        return snapshot_from_records({}, 0, { snapshot_complete = false, lookup_error = "level.object_by_id unavailable", magazine_classification_errors = 0, ammo_classification_errors = 0 })
+        return snapshot_from_records({}, 0, { snapshot_complete = false, lookup_error = "level.object_by_id unavailable", magazine_classification_errors = 0, ammo_classification_errors = 0, state_read_errors = 1 })
     end
     local ok, obj, err = safe_try(function() return level.object_by_id(local_id) end)
     if not ok then
-        return snapshot_from_records({}, 0, { snapshot_complete = false, lookup_error = err, magazine_classification_errors = 0, ammo_classification_errors = 0 })
+        return snapshot_from_records({}, 0, { snapshot_complete = false, lookup_error = err, magazine_classification_errors = 0, ammo_classification_errors = 0, state_read_errors = 1 })
     end
     if not obj then
-        return snapshot_from_records({}, 0, { snapshot_complete = true, object_missing = true, magazine_classification_errors = 0, ammo_classification_errors = 0 })
+        return snapshot_from_records({}, 0, { snapshot_complete = true, object_missing = true, magazine_classification_errors = 0, ammo_classification_errors = 0, state_read_errors = 0 })
     end
     local is_mag, mag_err = is_magazine_object(obj)
     local is_ammo, ammo_err = is_ammo_object(obj)
+    local rec, read_errors = item_record(obj, is_mag, is_ammo)
     local meta = {
-        snapshot_complete = mag_err == nil and ammo_err == nil,
+        snapshot_complete = mag_err == nil and ammo_err == nil and read_errors == 0,
         object_missing = false,
         scan_method = "direct_lookup",
         iterator_missing = false,
         magazine_classification_errors = mag_err and 1 or 0,
-        ammo_classification_errors = ammo_err and 1 or 0
+        ammo_classification_errors = ammo_err and 1 or 0,
+        state_read_errors = read_errors
     }
-    return snapshot_from_records({ item_record(obj, is_mag, is_ammo) }, 1, meta)
+    return snapshot_from_records({ rec }, 1, meta)
 end
 
 local function start_watcher(probe, target, local_id, owner, dedupe_key, baseline_snapshot)
@@ -595,9 +642,9 @@ local function start_watcher(probe, target, local_id, owner, dedupe_key, baselin
     local initial = initial_snapshot.map
     local mags, ammo = object_map_counts(initial)
     local w = { probe = probe, target = target, local_id = local_id, owner = owner, start = now(), objects = initial, snapshot_meta = initial_snapshot.meta, error_count = 0, dedupe_key = dedupe_key }
-    w.last = watch_snapshot(w, initial)
+    w.last = watch_snapshot(w, initial_snapshot)
     watchers[key] = w
-    log_line(probe, "watch_change", "watch_baseline", {{"target", target}, {"magazine_objects", mags}, {"ammo_objects", ammo}, {"snapshot_complete", initial_snapshot.meta and initial_snapshot.meta.snapshot_complete}, {"magazine_classification_errors", initial_snapshot.meta and initial_snapshot.meta.magazine_classification_errors}, {"ammo_classification_errors", initial_snapshot.meta and initial_snapshot.meta.ammo_classification_errors}, {"fingerprint", w.last}})
+    log_line(probe, "watch_change", "watch_baseline", {{"target", target}, {"magazine_objects", mags}, {"ammo_objects", ammo}, {"snapshot_complete", initial_snapshot.meta and initial_snapshot.meta.snapshot_complete}, {"magazine_classification_errors", initial_snapshot.meta and initial_snapshot.meta.magazine_classification_errors}, {"ammo_classification_errors", initial_snapshot.meta and initial_snapshot.meta.ammo_classification_errors}, {"state_read_errors", initial_snapshot.meta and initial_snapshot.meta.state_read_errors}, {"fingerprint", w.last}})
     schedule_watcher_tick(key)
 end
 
@@ -706,8 +753,9 @@ local function install_handlers()
             local direct_state_match = client_loaded_state.status == "ok" and host_loaded_state.status == "ok" and exact_array_equal(client_loaded_state.loaded, host_loaded_state.loaded)
             log_line(probe, "direct_resolution", "verdict", {{"client_section", section}, {"host_section", safe_section(direct_obj)}, {"section_match", section_match}, {"client_server_id", client_server}, {"host_direct_server_id", direct_server}, {"object_server_match", object_server_match}, {"direct_object_resolution_ok", direct_object_resolution_ok}, {"client_mag_data_status", client_loaded_state.status}, {"host_mag_data_status", host_loaded_state.status}, {"client_loaded", client_loaded_state.status == "ok" and array_string(client_loaded_state.loaded) or "<unavailable>"}, {"host_loaded", host_loaded_state.status == "ok" and array_string(host_loaded_state.loaded) or "<unavailable>"}, {"direct_state_match", direct_state_match}, {"client_parent_netid", parent_netid}, {"host_parent_netid", host_parent_netid}, {"client_parent_server_id", client_parent_server}, {"host_parent_server_id", host_parent_server}, {"client_parent_kind", client_parent_kind}, {"host_parent_kind", host_parent_kind}, {"parent_kind_match", client_parent_kind == host_parent_kind}, {"host_parent_alive", host_parent_alive}, {"parent_match_method", parent_match_method}, {"parent_netid_numeric", client_parent_netid_num ~= nil and host_parent_netid_num ~= nil}, {"parent_server_evidence_match", parent_server_evidence_match}, {"parent_identity_match", parent_identity_match}, {"direct_identity_match", direct_identity_match}})
             local remote_actors = find_remote_actors(requester)
-            local candidates, possible_candidates, strong_identity_candidates, state_candidates, server_id_candidates = 0, 0, 0, 0
-            local candidate_snapshots_complete = true
+            local candidates, possible_candidates, strong_identity_candidates, state_candidates, server_id_candidates = 0, 0, 0, 0, 0
+            local candidate_scan_performed = #remote_actors > 0
+            local candidate_snapshots_complete = candidate_scan_performed
             log_line(probe, "candidate_scan", "remote_actor_matches", {{"requester_netid", requester}, {"match_count", #remote_actors}, {"remote_actor_ambiguous", #remote_actors > 1}})
             for _, actor_rec in ipairs(remote_actors) do
                 local remote_actor = actor_rec.object
@@ -736,11 +784,14 @@ local function install_handlers()
                 start_owner_watcher(probe, actor_label, remote_actor, remote_baseline)
             end
             if #remote_actors == 0 then log_line(probe, "watch_complete", "watcher_not_started", {{"target", "remote_actor_inventory"}, {"reason", "remote_actor_missing"}}) end
-            log_line(probe, "candidate_scan", "summary", {{"remote_actor_found", #remote_actors > 0}, {"remote_actor_count", #remote_actors}, {"remote_actor_ambiguous", #remote_actors > 1}, {"candidate_count", candidates}, {"possible_candidate_count", possible_candidates}, {"strong_identity_candidate_count", strong_identity_candidates}, {"state_candidate_count", state_candidates}, {"server_id_candidate_count", server_id_candidates}, {"snapshot_complete", candidate_snapshots_complete}, {"result_reliable", candidate_snapshots_complete}, {"ambiguous", strong_identity_candidates > 1 or #remote_actors > 1}})
+            local candidate_result_reliable = candidate_scan_performed and candidate_snapshots_complete
+            local possible_candidate_ambiguous = possible_candidates > 1 or #remote_actors > 1
+            local strong_identity_ambiguous = strong_identity_candidates > 1 or #remote_actors > 1
+            log_line(probe, "candidate_scan", "summary", {{"remote_actor_found", #remote_actors > 0}, {"remote_actor_count", #remote_actors}, {"remote_actor_ambiguous", #remote_actors > 1}, {"candidate_scan_performed", candidate_scan_performed}, {"candidate_count", candidates}, {"possible_candidate_count", possible_candidates}, {"strong_identity_candidate_count", strong_identity_candidates}, {"state_candidate_count", state_candidates}, {"server_id_candidate_count", server_id_candidates}, {"snapshot_complete", candidate_snapshots_complete}, {"result_reliable", candidate_result_reliable}, {"reason", candidate_scan_performed and nil or "remote_actor_missing"}, {"possible_candidate_ambiguous", possible_candidate_ambiguous}, {"strong_identity_ambiguous", strong_identity_ambiguous}})
             local primary_remote_actor = #remote_actors == 1 and remote_actors[1].object or nil
-            local reply = { requester, probe, my_netid(), #remote_actors > 0, safe_object_id(primary_remote_actor), direct_local, safe_section(direct_obj), safe_parent_id(direct_obj), host_parent_netid, direct_identity_match and #remote_actors <= 1, candidates, possible_candidates, strong_identity_candidates, state_candidates, server_id_candidates, direct_object_resolution_ok, direct_identity_match, direct_state_match, parent_match_method, candidate_snapshots_complete, "read_only_diag" }
+            local reply = { rpc_value(requester), rpc_value(probe), rpc_value(my_netid()), #remote_actors > 0, rpc_value(safe_object_id(primary_remote_actor)), rpc_value(direct_local), rpc_value(safe_section(direct_obj)), rpc_value(safe_parent_id(direct_obj)), rpc_value(host_parent_netid), direct_identity_match and #remote_actors <= 1, candidates, possible_candidates, strong_identity_candidates, state_candidates, server_id_candidates, direct_object_resolution_ok, direct_identity_match, direct_state_match, rpc_value(parent_match_method), candidate_result_reliable, "read_only_diag" }
             GameManager:OnICustomScriptAction("magazines", "mags_diag_probe_reply", serialize_table_simple(reply), false, requester)
-            log_line(probe, "host_reply_sent", "probe_reply", {{"target_netid", requester}, {"candidate_count", candidates}, {"possible_candidate_count", possible_candidates}, {"strong_identity_candidate_count", strong_identity_candidates}, {"state_candidate_count", state_candidates}, {"server_id_candidate_count", server_id_candidates}, {"snapshot_complete", candidate_snapshots_complete}, {"remote_actor_count", #remote_actors}})
+            log_line(probe, "host_reply_sent", "probe_reply", {{"target_netid", requester}, {"candidate_count", candidates}, {"possible_candidate_count", possible_candidates}, {"strong_identity_candidate_count", strong_identity_candidates}, {"state_candidate_count", state_candidates}, {"server_id_candidate_count", server_id_candidates}, {"candidate_scan_performed", candidate_scan_performed}, {"snapshot_complete", candidate_snapshots_complete}, {"result_reliable", candidate_result_reliable}, {"remote_actor_count", #remote_actors}})
             if direct_local ~= nil then
                 start_watcher(probe, "direct_resolution", direct_local, nil)
             else
