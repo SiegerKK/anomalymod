@@ -510,6 +510,7 @@ function Patch()
                 end, obj)
             end
         end
+        MPMagsRedux_Diagnostics_STOGETHER.install(magazines, GameManager)
         -- Load ammo functos
         magazines.fast_load_magazine = function (obj, ammo_obj, load_one)
             if not (obj and obj:parent() and ammo_obj and ammo_obj:parent()) then return end
